@@ -53,7 +53,17 @@ func ValidateConfig(config ThinkingConfig, modelInfo *registry.ModelInfo, fromFo
 		return &config, nil
 	}
 
-	allowClampUnsupported := isBudgetBasedProvider(fromFormat) && isLevelBasedProvider(toFormat)
+	// allowClampUnsupported determines whether to clamp unsupported levels instead of returning an error.
+	// This applies when crossing provider families (e.g., openai→gemini, claude→gemini) and the target
+	// model supports discrete levels. Same-family conversions require strict validation.
+	toCapability := detectModelCapability(modelInfo)
+	toHasLevelSupport := toCapability == CapabilityLevelOnly || toCapability == CapabilityHybrid
+	allowClampUnsupported := toHasLevelSupport && !isSameProviderFamily(fromFormat, toFormat)
+
+	// strictBudget determines whether to enforce strict budget range validation.
+	// This applies when: (1) config comes from request body (not suffix), (2) source format is known,
+	// and (3) source and target are in the same provider family. Cross-family or suffix-based configs
+	// are clamped instead of rejected to improve interoperability.
 	strictBudget := !fromSuffix && fromFormat != "" && isSameProviderFamily(fromFormat, toFormat)
 	budgetDerivedFromLevel := false
 
@@ -352,11 +362,21 @@ func isGeminiFamily(provider string) bool {
 	}
 }
 
+func isOpenAIFamily(provider string) bool {
+	switch provider {
+	case "openai", "openai-response", "codex":
+		return true
+	default:
+		return false
+	}
+}
+
 func isSameProviderFamily(from, to string) bool {
 	if from == to {
 		return true
 	}
-	return isGeminiFamily(from) && isGeminiFamily(to)
+	return (isGeminiFamily(from) && isGeminiFamily(to)) ||
+		(isOpenAIFamily(from) && isOpenAIFamily(to))
 }
 
 func abs(x int) int {
