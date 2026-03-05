@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // ConvertCodexResponseToOpenAIResponses converts OpenAI Chat Completions streaming chunks
@@ -15,15 +14,6 @@ import (
 func ConvertCodexResponseToOpenAIResponses(ctx context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
 		rawJSON = bytes.TrimSpace(rawJSON[5:])
-		if typeResult := gjson.GetBytes(rawJSON, "type"); typeResult.Exists() {
-			typeStr := typeResult.String()
-			if typeStr == "response.created" || typeStr == "response.in_progress" || typeStr == "response.completed" {
-				if gjson.GetBytes(rawJSON, "response.instructions").Exists() {
-					instructions := gjson.GetBytes(originalRequestRawJSON, "instructions").String()
-					rawJSON, _ = sjson.SetBytes(rawJSON, "response.instructions", instructions)
-				}
-			}
-		}
 		out := fmt.Sprintf("data: %s", string(rawJSON))
 		return []string{out}
 	}
@@ -39,10 +29,5 @@ func ConvertCodexResponseToOpenAIResponsesNonStream(_ context.Context, modelName
 		return ""
 	}
 	responseResult := rootResult.Get("response")
-	template := responseResult.Raw
-	if responseResult.Get("instructions").Exists() {
-		instructions := gjson.GetBytes(originalRequestRawJSON, "instructions").String()
-		template, _ = sjson.Set(template, "instructions", instructions)
-	}
-	return template
+	return responseResult.Raw
 }
