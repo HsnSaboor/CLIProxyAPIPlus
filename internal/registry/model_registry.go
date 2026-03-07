@@ -173,7 +173,7 @@ func LookupModelInfo(modelID string, provider ...string) *ModelInfo {
 	if info := GetGlobalRegistry().GetModelInfo(modelID, p); info != nil {
 		return cloneModelInfo(info)
 	}
-	return LookupStaticModelInfo(modelID)
+	return cloneModelInfo(LookupStaticModelInfo(modelID))
 }
 
 // SetHook sets an optional hook for observing model registration changes.
@@ -490,7 +490,6 @@ func (r *ModelRegistry) removeModelRegistration(clientID, modelID, provider stri
 	registration.LastUpdated = now
 	if registration.QuotaExceededClients != nil {
 		delete(registration.QuotaExceededClients, clientID)
-		r.invalidateAvailableModelsCacheLocked()
 	}
 	if registration.SuspendedClients != nil {
 		delete(registration.SuspendedClients, clientID)
@@ -842,11 +841,32 @@ func cloneModelMaps(models []map[string]any) []map[string]any {
 		}
 		copyModel := make(map[string]any, len(model))
 		for key, value := range model {
-			copyModel[key] = value
+			copyModel[key] = cloneModelMapValue(value)
 		}
 		cloned = append(cloned, copyModel)
 	}
 	return cloned
+}
+
+func cloneModelMapValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		copyMap := make(map[string]any, len(typed))
+		for key, entry := range typed {
+			copyMap[key] = cloneModelMapValue(entry)
+		}
+		return copyMap
+	case []any:
+		copySlice := make([]any, len(typed))
+		for i, entry := range typed {
+			copySlice[i] = cloneModelMapValue(entry)
+		}
+		return copySlice
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return value
+	}
 }
 
 // GetAvailableModelsByProvider returns models available for the given provider identifier.
@@ -1298,10 +1318,3 @@ func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 	}
 	return result
 }
-
-
-
-
-
-
-
