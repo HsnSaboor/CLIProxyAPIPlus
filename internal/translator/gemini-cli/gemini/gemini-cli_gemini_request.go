@@ -261,10 +261,7 @@ func fixCLIToolResponse(input string) (string, error) {
 					log.Warnf("failed to parse function response")
 					continue
 				}
-				raw := response.Raw
-				if ri < len(group.CallNames) {
-					raw = backfillFunctionResponseName(raw, group.CallNames[ri])
-				}
+				raw := backfillFunctionResponseName(response.Raw, group.CallNames[ri])
 				functionResponseContent, _ = sjson.SetRaw(functionResponseContent, "parts.-1", raw)
 			}
 

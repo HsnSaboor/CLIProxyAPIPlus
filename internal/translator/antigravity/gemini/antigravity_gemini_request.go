@@ -305,11 +305,7 @@ func fixCLIToolResponse(input string) (string, error) {
 
 			functionResponseContent := `{"parts":[],"role":"function"}`
 			for ri, response := range groupResponses {
-				fallbackName := ""
-				if ri < len(group.CallNames) {
-					fallbackName = group.CallNames[ri]
-				}
-				partRaw := parseFunctionResponseRaw(response, fallbackName)
+				partRaw := parseFunctionResponseRaw(response, group.CallNames[ri])
 				if partRaw != "" {
 					functionResponseContent, _ = sjson.SetRaw(functionResponseContent, "parts.-1", partRaw)
 				}
