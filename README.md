@@ -158,8 +158,7 @@ Browser extension for one-stop management of New API-compatible relay site accou
 
 Shadow AI is an AI assistant tool designed specifically for restricted environments. It provides a stealthy operation
 mode without windows or traces, and enables cross-device AI Q&A interaction and control via the local area network (
-LAN).
-Essentially, it is an automated collaboration layer of "screen/audio capture + AI inference + low-friction delivery",
+LAN). Essentially, it is an automated collaboration layer of "screen/audio capture + AI inference + low-friction delivery",
 helping users to immersively use AI assistants across applications on controlled devices or in restricted environments.
 
 > [!NOTE]  
