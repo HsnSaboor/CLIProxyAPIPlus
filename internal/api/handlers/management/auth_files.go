@@ -333,10 +333,19 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
-					fileData["priority"] = int(pv.Int())
+					switch pv.Type {
+					case gjson.Number:
+						fileData["priority"] = int(pv.Int())
+					case gjson.String:
+						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
+							fileData["priority"] = parsed
+						}
+					}
 				}
-				if nv := gjson.GetBytes(data, "note"); nv.Exists() && strings.TrimSpace(nv.String()) != "" {
-					fileData["note"] = strings.TrimSpace(nv.String())
+				if nv := gjson.GetBytes(data, "note"); nv.Exists() {
+					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
+						fileData["note"] = trimmed
+					}
 				}
 			}
 
@@ -427,11 +436,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["priority"] = parsed
 		}
 	}
-	// Expose note from Metadata.
-	if note, ok := auth.Metadata["note"].(string); ok {
-		if trimmed := strings.TrimSpace(note); trimmed != "" {
-			entry["note"] = trimmed
-		}
+	// Expose note from Attributes (set by synthesizer from JSON "note" field).
+	if note := strings.TrimSpace(authAttribute(auth, "note")); note != "" {
+		entry["note"] = note
 	}
 	return entry
 }
@@ -912,26 +919,32 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		targetAuth.ProxyURL = *req.ProxyURL
 		changed = true
 	}
-	if req.Priority != nil {
+	if req.Priority != nil || req.Note != nil {
 		if targetAuth.Metadata == nil {
 			targetAuth.Metadata = make(map[string]any)
 		}
-		if *req.Priority == 0 {
-			delete(targetAuth.Metadata, "priority")
-		} else {
-			targetAuth.Metadata["priority"] = *req.Priority
+		if targetAuth.Attributes == nil {
+			targetAuth.Attributes = make(map[string]string)
 		}
-		changed = true
-	}
-	if req.Note != nil {
-		if targetAuth.Metadata == nil {
-			targetAuth.Metadata = make(map[string]any)
+
+		if req.Priority != nil {
+			if *req.Priority == 0 {
+				delete(targetAuth.Metadata, "priority")
+				delete(targetAuth.Attributes, "priority")
+			} else {
+				targetAuth.Metadata["priority"] = *req.Priority
+				targetAuth.Attributes["priority"] = strconv.Itoa(*req.Priority)
+			}
 		}
-		trimmedNote := strings.TrimSpace(*req.Note)
-		if trimmedNote == "" {
-			delete(targetAuth.Metadata, "note")
-		} else {
-			targetAuth.Metadata["note"] = trimmedNote
+		if req.Note != nil {
+			trimmedNote := strings.TrimSpace(*req.Note)
+			if trimmedNote == "" {
+				delete(targetAuth.Metadata, "note")
+				delete(targetAuth.Attributes, "note")
+			} else {
+				targetAuth.Metadata["note"] = trimmedNote
+				targetAuth.Attributes["note"] = trimmedNote
+			}
 		}
 		changed = true
 	}

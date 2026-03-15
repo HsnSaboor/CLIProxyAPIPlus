@@ -229,6 +229,10 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		if priorityVal, hasPriority := primary.Attributes["priority"]; hasPriority && priorityVal != "" {
 			attrs["priority"] = priorityVal
 		}
+		// Propagate note from primary auth to virtual auths
+		if noteVal, hasNote := primary.Attributes["note"]; hasNote && noteVal != "" {
+			attrs["note"] = noteVal
+		}
 		metadataCopy := map[string]any{
 			"email":             email,
 			"project_id":        projectID,
