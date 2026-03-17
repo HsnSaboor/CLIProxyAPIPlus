@@ -1,9 +1,12 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,6 +14,33 @@ import (
 
 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 )
+
+// PostAuthHook defines a function that is called after an Auth record is created
+// but before it is persisted to storage. This allows for modification of the
+// Auth record (e.g., injecting metadata) based on external context.
+type PostAuthHook func(context.Context, *Auth) error
+
+// RequestInfo holds information extracted from the HTTP request.
+// It is injected into the context passed to PostAuthHook.
+type RequestInfo struct {
+	Query   url.Values
+	Headers http.Header
+}
+
+type requestInfoKey struct{}
+
+// WithRequestInfo returns a new context with the given RequestInfo attached.
+func WithRequestInfo(ctx context.Context, info *RequestInfo) context.Context {
+	return context.WithValue(ctx, requestInfoKey{}, info)
+}
+
+// GetRequestInfo retrieves the RequestInfo from the context, if present.
+func GetRequestInfo(ctx context.Context) *RequestInfo {
+	if val, ok := ctx.Value(requestInfoKey{}).(*RequestInfo); ok {
+		return val
+	}
+	return nil
+}
 
 // Auth encapsulates the runtime state and metadata associated with a single credential.
 type Auth struct {
@@ -132,7 +162,60 @@ func stableAuthIndex(seed string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// EnsureIndex returns a stable index derived from the auth file name or API key.
+func (a *Auth) indexSeed() string {
+	if a == nil {
+		return ""
+	}
+
+	if fileName := strings.TrimSpace(a.FileName); fileName != "" {
+		return "file:" + fileName
+	}
+
+	providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+	compatName := ""
+	baseURL := ""
+	apiKey := ""
+	source := ""
+	if a.Attributes != nil {
+		if value := strings.TrimSpace(a.Attributes["provider_key"]); value != "" {
+			providerKey = strings.ToLower(value)
+		}
+		compatName = strings.ToLower(strings.TrimSpace(a.Attributes["compat_name"]))
+		baseURL = strings.TrimSpace(a.Attributes["base_url"])
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+		source = strings.TrimSpace(a.Attributes["source"])
+	}
+
+	proxyURL := strings.TrimSpace(a.ProxyURL)
+	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || apiKey != "" || source != ""
+	if providerKey != "" && hasCredentialIdentity {
+		parts := []string{"provider=" + providerKey}
+		if compatName != "" {
+			parts = append(parts, "compat="+compatName)
+		}
+		if baseURL != "" {
+			parts = append(parts, "base="+baseURL)
+		}
+		if proxyURL != "" {
+			parts = append(parts, "proxy="+proxyURL)
+		}
+		if apiKey != "" {
+			parts = append(parts, "api_key="+apiKey)
+		}
+		if source != "" {
+			parts = append(parts, "source="+source)
+		}
+		return "config:" + strings.Join(parts, "\x00")
+	}
+
+	if id := strings.TrimSpace(a.ID); id != "" {
+		return "id:" + id
+	}
+
+	return ""
+}
+
+// EnsureIndex returns a stable index derived from the auth file name or credential identity.
 func (a *Auth) EnsureIndex() string {
 	if a == nil {
 		return ""
@@ -141,20 +224,9 @@ func (a *Auth) EnsureIndex() string {
 		return a.Index
 	}
 
-	seed := strings.TrimSpace(a.FileName)
-	if seed != "" {
-		seed = "file:" + seed
-	} else if a.Attributes != nil {
-		if apiKey := strings.TrimSpace(a.Attributes["api_key"]); apiKey != "" {
-			seed = "api_key:" + apiKey
-		}
-	}
+	seed := a.indexSeed()
 	if seed == "" {
-		if id := strings.TrimSpace(a.ID); id != "" {
-			seed = "id:" + id
-		} else {
-			return ""
-		}
+		return ""
 	}
 
 	idx := stableAuthIndex(seed)
@@ -211,6 +283,23 @@ func (a *Auth) DisableCoolingOverride() (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+// ToolPrefixDisabled returns whether the proxy_ tool name prefix should be
+// skipped for this auth. When true, tool names are sent to Anthropic unchanged.
+// The value is read from metadata key "tool_prefix_disabled" (or "tool-prefix-disabled").
+func (a *Auth) ToolPrefixDisabled() bool {
+	if a == nil || a.Metadata == nil {
+		return false
+	}
+	for _, key := range []string{"tool_prefix_disabled", "tool-prefix-disabled"} {
+		if val, ok := a.Metadata[key]; ok {
+			if parsed, okParse := parseBoolAny(val); okParse {
+				return parsed
+			}
+		}
+	}
+	return false
 }
 
 // RequestRetryOverride returns the auth-file scoped request_retry override when present.

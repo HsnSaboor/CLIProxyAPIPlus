@@ -1,7 +1,7 @@
 package responses
 
 import (
-	"bytes"
+	"encoding/json"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
@@ -12,7 +12,7 @@ import (
 const geminiResponsesThoughtSignature = "skip_thought_signature_validator"
 
 func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
-	rawJSON := bytes.Clone(inputRawJSON)
+	rawJSON := inputRawJSON
 
 	// Note: modelName and stream parameters are part of the fixed method signature
 	_ = modelName // Unused but required by interface
@@ -27,7 +27,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 	if instructions := root.Get("instructions"); instructions.Exists() {
 		systemInstr := `{"parts":[{"text":""}]}`
 		systemInstr, _ = sjson.Set(systemInstr, "parts.0.text", instructions.String())
-		out, _ = sjson.SetRaw(out, "system_instruction", systemInstr)
+		out, _ = sjson.SetRaw(out, "systemInstruction", systemInstr)
 	}
 
 	// Convert input messages to Gemini contents format
@@ -118,20 +118,30 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 			switch itemType {
 			case "message":
 				if strings.EqualFold(itemRole, "system") {
-					if contentArray := item.Get("content"); contentArray.Exists() && contentArray.IsArray() {
-						var builder strings.Builder
-						contentArray.ForEach(func(_, contentItem gjson.Result) bool {
-							text := contentItem.Get("text").String()
-							if builder.Len() > 0 && text != "" {
-								builder.WriteByte('\n')
-							}
-							builder.WriteString(text)
-							return true
-						})
-						if !gjson.Get(out, "system_instruction").Exists() {
-							systemInstr := `{"parts":[{"text":""}]}`
-							systemInstr, _ = sjson.Set(systemInstr, "parts.0.text", builder.String())
-							out, _ = sjson.SetRaw(out, "system_instruction", systemInstr)
+					if contentArray := item.Get("content"); contentArray.Exists() {
+						systemInstr := ""
+						if systemInstructionResult := gjson.Get(out, "systemInstruction"); systemInstructionResult.Exists() {
+							systemInstr = systemInstructionResult.Raw
+						} else {
+							systemInstr = `{"parts":[]}`
+						}
+
+						if contentArray.IsArray() {
+							contentArray.ForEach(func(_, contentItem gjson.Result) bool {
+								part := `{"text":""}`
+								text := contentItem.Get("text").String()
+								part, _ = sjson.Set(part, "text", text)
+								systemInstr, _ = sjson.SetRaw(systemInstr, "parts.-1", part)
+								return true
+							})
+						} else if contentArray.Type == gjson.String {
+							part := `{"text":""}`
+							part, _ = sjson.Set(part, "text", contentArray.String())
+							systemInstr, _ = sjson.SetRaw(systemInstr, "parts.-1", part)
+						}
+
+						if systemInstr != `{"parts":[]}` {
+							out, _ = sjson.SetRaw(out, "systemInstruction", systemInstr)
 						}
 					}
 					continue
@@ -228,6 +238,33 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 									partJSON, _ = sjson.Set(partJSON, "inline_data.data", data)
 								}
 							}
+						case "input_audio":
+							audioData := contentItem.Get("data").String()
+							audioFormat := contentItem.Get("format").String()
+							if audioData != "" {
+								audioMimeMap := map[string]string{
+									"mp3":       "audio/mpeg",
+									"wav":       "audio/wav",
+									"ogg":       "audio/ogg",
+									"flac":      "audio/flac",
+									"aac":       "audio/aac",
+									"webm":      "audio/webm",
+									"pcm16":     "audio/pcm",
+									"g711_ulaw": "audio/basic",
+									"g711_alaw": "audio/basic",
+								}
+								mimeType := "audio/wav"
+								if audioFormat != "" {
+									if mapped, ok := audioMimeMap[audioFormat]; ok {
+										mimeType = mapped
+									} else {
+										mimeType = "audio/" + audioFormat
+									}
+								}
+								partJSON = `{"inline_data":{"mime_type":"","data":""}}`
+								partJSON, _ = sjson.Set(partJSON, "inline_data.mime_type", mimeType)
+								partJSON, _ = sjson.Set(partJSON, "inline_data.data", audioData)
+							}
 						}
 
 						if partJSON != "" {
@@ -237,8 +274,22 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					})
 
 					flush()
-				}
+				} else if contentArray.Type == gjson.String {
+					effRole := "user"
+					if itemRole != "" {
+						switch strings.ToLower(itemRole) {
+						case "assistant", "model":
+							effRole = "model"
+						default:
+							effRole = strings.ToLower(itemRole)
+						}
+					}
 
+					one := `{"role":"","parts":[{"text":""}]}`
+					one, _ = sjson.Set(one, "role", effRole)
+					one, _ = sjson.Set(one, "parts.0.text", contentArray.String())
+					out, _ = sjson.SetRaw(out, "contents.-1", one)
+				}
 			case "function_call":
 				// Handle function calls - convert to model message with functionCall
 				name := item.Get("name").String()
@@ -290,7 +341,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 				// Set the raw JSON output directly (preserves string encoding)
 				if outputRaw != "" && outputRaw != "null" {
 					output := gjson.Parse(outputRaw)
-					if output.Type == gjson.JSON {
+					if output.Type == gjson.JSON && json.Valid([]byte(output.Raw)) {
 						functionResponse, _ = sjson.SetRaw(functionResponse, "functionResponse.response.result", output.Raw)
 					} else {
 						functionResponse, _ = sjson.Set(functionResponse, "functionResponse.response.result", outputRaw)
@@ -331,22 +382,7 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 					funcDecl, _ = sjson.Set(funcDecl, "description", desc.String())
 				}
 				if params := tool.Get("parameters"); params.Exists() {
-					// Convert parameter types from OpenAI format to Gemini format
-					cleaned := params.Raw
-					// Convert type values to uppercase for Gemini
-					paramsResult := gjson.Parse(cleaned)
-					if properties := paramsResult.Get("properties"); properties.Exists() {
-						properties.ForEach(func(key, value gjson.Result) bool {
-							if propType := value.Get("type"); propType.Exists() {
-								upperType := strings.ToUpper(propType.String())
-								cleaned, _ = sjson.Set(cleaned, "properties."+key.String()+".type", upperType)
-							}
-							return true
-						})
-					}
-					// Set the overall type to OBJECT
-					cleaned, _ = sjson.Set(cleaned, "type", "OBJECT")
-					funcDecl, _ = sjson.SetRaw(funcDecl, "parametersJsonSchema", cleaned)
+					funcDecl, _ = sjson.SetRaw(funcDecl, "parametersJsonSchema", params.Raw)
 				}
 
 				geminiTools, _ = sjson.SetRaw(geminiTools, "0.functionDeclarations.-1", funcDecl)
