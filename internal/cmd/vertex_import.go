@@ -62,14 +62,28 @@ func DoVertexImport(cfg *config.Config, keyPath string, prefix string) {
 	// Default location if not provided by user. Can be edited in the saved file later.
 	location := "us-central1"
 
-	fileName := fmt.Sprintf("vertex-%s.json", sanitizeFilePart(projectID))
+	// Normalize and validate prefix: must be a single segment (no "/" allowed).
+	prefix = strings.TrimSpace(prefix)
+	prefix = strings.Trim(prefix, "/")
+	if prefix != "" && strings.Contains(prefix, "/") {
+		log.Errorf("vertex-import: prefix must be a single segment (no '/' allowed): %q", prefix)
+		return
+	}
+
+	// Include prefix in filename so importing the same project with different
+	// prefixes creates separate credential files instead of overwriting.
+	baseName := sanitizeFilePart(projectID)
+	if prefix != "" {
+		baseName = sanitizeFilePart(prefix) + "-" + baseName
+	}
+	fileName := fmt.Sprintf("vertex-%s.json", baseName)
 	// Build auth record
 	storage := &vertex.VertexCredentialStorage{
 		ServiceAccount: sa,
 		ProjectID:      projectID,
 		Email:          email,
 		Location:       location,
-		Prefix:         strings.TrimSpace(prefix),
+		Prefix:         prefix,
 	}
 	metadata := map[string]any{
 		"service_account": sa,
@@ -77,6 +91,7 @@ func DoVertexImport(cfg *config.Config, keyPath string, prefix string) {
 		"email":           email,
 		"location":        location,
 		"type":            "vertex",
+		"prefix":          prefix,
 		"label":           labelForVertex(projectID, email),
 	}
 	record := &coreauth.Auth{
