@@ -94,19 +94,41 @@ func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
 		toolArray := tools.Array()
 		for i := 0; i < len(toolArray); i++ {
 			typePath := fmt.Sprintf("tools.%d.type", i)
-			if gjson.GetBytes(result, typePath).String() == "web_search_preview" {
-				if updated, err := sjson.SetBytes(result, typePath, "web_search"); err == nil {
+			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
+				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
 					result = updated
 				}
 			}
 		}
 	}
 
-	if gjson.GetBytes(result, "tool_choice.type").String() == "web_search_preview" {
-		if updated, err := sjson.SetBytes(result, "tool_choice.type", "web_search"); err == nil {
+	if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, "tool_choice.type").String()); normalized != "" {
+		if updated, err := sjson.SetBytes(result, "tool_choice.type", normalized); err == nil {
 			result = updated
 		}
 	}
 
+	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
+	if toolChoiceTools.IsArray() {
+		toolArray := toolChoiceTools.Array()
+		for i := 0; i < len(toolArray); i++ {
+			typePath := fmt.Sprintf("tool_choice.tools.%d.type", i)
+			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
+				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
+					result = updated
+				}
+			}
+		}
+	}
+
 	return result
+}
+
+func normalizeCodexBuiltinToolType(toolType string) string {
+	switch toolType {
+	case "web_search_preview", "web_search_preview_2025_03_11":
+		return "web_search"
+	default:
+		return ""
+	}
 }
