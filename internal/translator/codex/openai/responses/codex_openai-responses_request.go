@@ -3,6 +3,7 @@ package responses
 import (
 	"fmt"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -94,36 +95,43 @@ func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
 		toolArray := tools.Array()
 		for i := 0; i < len(toolArray); i++ {
 			typePath := fmt.Sprintf("tools.%d.type", i)
-			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
-				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
-					result = updated
-				}
-			}
+			result = normalizeCodexBuiltinToolAtPath(result, typePath)
 		}
 	}
 
-	if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, "tool_choice.type").String()); normalized != "" {
-		if updated, err := sjson.SetBytes(result, "tool_choice.type", normalized); err == nil {
-			result = updated
-		}
-	}
+	result = normalizeCodexBuiltinToolAtPath(result, "tool_choice.type")
 
 	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
 	if toolChoiceTools.IsArray() {
 		toolArray := toolChoiceTools.Array()
 		for i := 0; i < len(toolArray); i++ {
 			typePath := fmt.Sprintf("tool_choice.tools.%d.type", i)
-			if normalized := normalizeCodexBuiltinToolType(gjson.GetBytes(result, typePath).String()); normalized != "" {
-				if updated, err := sjson.SetBytes(result, typePath, normalized); err == nil {
-					result = updated
-				}
-			}
+			result = normalizeCodexBuiltinToolAtPath(result, typePath)
 		}
 	}
 
 	return result
 }
 
+func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string) []byte {
+	currentType := gjson.GetBytes(rawJSON, path).String()
+	normalizedType := normalizeCodexBuiltinToolType(currentType)
+	if normalizedType == "" {
+		return rawJSON
+	}
+
+	updated, err := sjson.SetBytes(rawJSON, path, normalizedType)
+	if err != nil {
+		return rawJSON
+	}
+
+	log.Debugf("codex responses: normalized builtin tool type at %s from %q to %q", path, currentType, normalizedType)
+	return updated
+}
+
+// normalizeCodexBuiltinToolType centralizes the current known Codex Responses
+// built-in tool alias compatibility. If Codex introduces more legacy aliases,
+// extend this helper instead of adding path-specific rewrite logic elsewhere.
 func normalizeCodexBuiltinToolType(toolType string) string {
 	switch toolType {
 	case "web_search_preview", "web_search_preview_2025_03_11":
