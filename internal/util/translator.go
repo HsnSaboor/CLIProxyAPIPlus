@@ -271,3 +271,52 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 	}
 	return name
 }
+
+// SanitizedToolNameMap builds a sanitized-name → original-name map from Claude request tools.
+// It is used to restore exact tool names for clients (e.g. Claude Code) after the proxy
+// sanitizes tool names for Gemini/Vertex API compatibility via SanitizeFunctionName.
+// Only entries where sanitization actually changes the name are included.
+func SanitizedToolNameMap(rawJSON []byte) map[string]string {
+	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+		return nil
+	}
+
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return nil
+	}
+
+	out := make(map[string]string)
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			return true
+		}
+		sanitized := SanitizeFunctionName(name)
+		if sanitized == name {
+			return true
+		}
+		if _, exists := out[sanitized]; !exists {
+			out[sanitized] = name
+		}
+		return true
+	})
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// RestoreSanitizedToolName looks up a sanitized function name in the provided map
+// and returns the original client-facing name. If no mapping exists, it returns
+// the sanitized name unchanged.
+func RestoreSanitizedToolName(toolNameMap map[string]string, sanitizedName string) string {
+	if sanitizedName == "" || toolNameMap == nil {
+		return sanitizedName
+	}
+	if original, ok := toolNameMap[sanitizedName]; ok {
+		return original
+	}
+	return sanitizedName
+}
