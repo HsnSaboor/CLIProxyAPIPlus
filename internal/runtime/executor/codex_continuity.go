@@ -21,23 +21,44 @@ type codexContinuity struct {
 	Source string
 }
 
+func metadataString(meta map[string]any, key string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	raw, ok := meta[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func principalString(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", raw))
+	}
+}
+
 func resolveCodexContinuity(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) codexContinuity {
 	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()); promptCacheKey != "" {
 		return codexContinuity{Key: promptCacheKey, Source: "prompt_cache_key"}
 	}
-	if opts.Metadata != nil {
-		if raw, ok := opts.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey]; ok && raw != nil {
-			switch v := raw.(type) {
-			case string:
-				if trimmed := strings.TrimSpace(v); trimmed != "" {
-					return codexContinuity{Key: trimmed, Source: "execution_session"}
-				}
-			case []byte:
-				if trimmed := strings.TrimSpace(string(v)); trimmed != "" {
-					return codexContinuity{Key: trimmed, Source: "execution_session"}
-				}
-			}
-		}
+	if executionSession := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey); executionSession != "" {
+		return codexContinuity{Key: executionSession, Source: "execution_session"}
+	}
+	if affinityKey := metadataString(opts.Metadata, codexAuthAffinityMetadataKey); affinityKey != "" {
+		return codexContinuity{Key: affinityKey, Source: "auth_affinity"}
 	}
 	if ginCtx := ginContextFrom(ctx); ginCtx != nil {
 		if ginCtx.Request != nil {
@@ -46,34 +67,8 @@ func resolveCodexContinuity(ctx context.Context, auth *cliproxyauth.Auth, req cl
 			}
 		}
 		if v, exists := ginCtx.Get("apiKey"); exists && v != nil {
-			switch value := v.(type) {
-			case string:
-				if trimmed := strings.TrimSpace(value); trimmed != "" {
-					return codexContinuity{Key: uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+trimmed)).String(), Source: "client_principal"}
-				}
-			case fmt.Stringer:
-				if trimmed := strings.TrimSpace(value.String()); trimmed != "" {
-					return codexContinuity{Key: uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+trimmed)).String(), Source: "client_principal"}
-				}
-			default:
-				trimmed := strings.TrimSpace(fmt.Sprintf("%v", value))
-				if trimmed != "" {
-					return codexContinuity{Key: uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+trimmed)).String(), Source: "client_principal"}
-				}
-			}
-		}
-	}
-	if opts.Metadata != nil {
-		if raw, ok := opts.Metadata[codexAuthAffinityMetadataKey]; ok && raw != nil {
-			switch v := raw.(type) {
-			case string:
-				if trimmed := strings.TrimSpace(v); trimmed != "" {
-					return codexContinuity{Key: trimmed, Source: "auth_affinity"}
-				}
-			case []byte:
-				if trimmed := strings.TrimSpace(string(v)); trimmed != "" {
-					return codexContinuity{Key: trimmed, Source: "auth_affinity"}
-				}
+			if trimmed := principalString(v); trimmed != "" {
+				return codexContinuity{Key: uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+trimmed)).String(), Source: "client_principal"}
 			}
 		}
 	}
@@ -111,26 +106,8 @@ func logCodexRequestDiagnostics(ctx context.Context, auth *cliproxyauth.Auth, re
 		authID = strings.TrimSpace(auth.ID)
 		authFile = strings.TrimSpace(auth.FileName)
 	}
-	selectedAuthID := ""
-	executionSessionID := ""
-	if opts.Metadata != nil {
-		if raw, ok := opts.Metadata[cliproxyexecutor.SelectedAuthMetadataKey]; ok && raw != nil {
-			switch v := raw.(type) {
-			case string:
-				selectedAuthID = strings.TrimSpace(v)
-			case []byte:
-				selectedAuthID = strings.TrimSpace(string(v))
-			}
-		}
-		if raw, ok := opts.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey]; ok && raw != nil {
-			switch v := raw.(type) {
-			case string:
-				executionSessionID = strings.TrimSpace(v)
-			case []byte:
-				executionSessionID = strings.TrimSpace(string(v))
-			}
-		}
-	}
+	selectedAuthID := metadataString(opts.Metadata, cliproxyexecutor.SelectedAuthMetadataKey)
+	executionSessionID := metadataString(opts.Metadata, cliproxyexecutor.ExecutionSessionMetadataKey)
 	entry.Debugf(
 		"codex request diagnostics auth_id=%s selected_auth_id=%s auth_file=%s exec_session=%s continuity_source=%s session_id=%s prompt_cache_key=%s prompt_cache_retention=%s store=%t has_instructions=%t reasoning_effort=%s reasoning_summary=%s chatgpt_account_id=%t originator=%s model=%s source_format=%s",
 		authID,

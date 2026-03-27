@@ -41,7 +41,7 @@ func TestApplyCodexPromptCacheHeaders_PreservesPromptCacheRetention(t *testing.T
 	}
 	body := []byte(`{"model":"gpt-5-codex","stream":true,"prompt_cache_retention":"persistent"}`)
 
-	updatedBody, headers := applyCodexPromptCacheHeaders(sdktranslator.FromString("openai-response"), req, body)
+	updatedBody, headers, _ := applyCodexPromptCacheHeaders(context.Background(), nil, sdktranslator.FromString("openai-response"), req, cliproxyexecutor.Options{}, body)
 
 	if got := gjson.GetBytes(updatedBody, "prompt_cache_key").String(); got != "cache-key-1" {
 		t.Fatalf("prompt_cache_key = %q, want %q", got, "cache-key-1")
