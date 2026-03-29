@@ -33,9 +33,13 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 		return
 	}
 	if bytes.HasSuffix(chunk, []byte("\n")) {
-		_, _ = w.Write([]byte("\n"))
+		if _, err := w.Write([]byte("\n")); err != nil {
+			return
+		}
 	} else {
-		_, _ = w.Write([]byte("\n\n"))
+		if _, err := w.Write([]byte("\n\n")); err != nil {
+			return
+		}
 	}
 }
 

@@ -35,14 +35,18 @@ func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {
 
 	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs)
 	body := recorder.Body.String()
+	parts := strings.Split(strings.TrimSpace(body), "\n\n")
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 SSE events, got %d. Body: %q", len(parts), body)
+	}
 
-	if !strings.Contains(body, "data: {\"type\":\"response.output_item.done\"") {
-		t.Fatalf("expected first SSE data chunk, got: %q", body)
+	expectedPart1 := "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"arguments\":\"{}\"}}"
+	if parts[0] != expectedPart1 {
+		t.Errorf("unexpected first event.\nGot: %q\nWant: %q", parts[0], expectedPart1)
 	}
-	if !strings.Contains(body, "\n\ndata: {\"type\":\"response.completed\"") {
-		t.Fatalf("expected blank-line separation before second SSE event, got: %q", body)
-	}
-	if strings.Contains(body, "arguments\":\"{}\"}}data: {\"type\":\"response.completed\"") {
-		t.Fatalf("second SSE event was concatenated onto first event body: %q", body)
+
+	expectedPart2 := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
+	if parts[1] != expectedPart2 {
+		t.Errorf("unexpected second event.\nGot: %q\nWant: %q", parts[1], expectedPart2)
 	}
 }
