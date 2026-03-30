@@ -741,6 +741,32 @@ func TestNormalizeResponsesWebsocketRequestTreatsTranscriptReplacementAsReset(t 
 	}
 }
 
+func TestNormalizeResponsesWebsocketRequestDoesNotTreatDeveloperMessageAsReplacement(t *testing.T) {
+	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"}]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"message","id":"assistant-1","role":"assistant"}
+	]`)
+	raw := []byte(`{"type":"response.create","input":[{"type":"message","id":"dev-1","role":"developer"},{"type":"message","id":"msg-2"}]}`)
+
+	normalized, next, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	items := gjson.GetBytes(normalized, "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("merged input len = %d, want 4: %s", len(items), normalized)
+	}
+	if items[0].Get("id").String() != "msg-1" ||
+		items[1].Get("id").String() != "assistant-1" ||
+		items[2].Get("id").String() != "dev-1" ||
+		items[3].Get("id").String() != "msg-2" {
+		t.Fatalf("developer follow-up should preserve merge behavior: %s", normalized)
+	}
+	if !bytes.Equal(next, normalized) {
+		t.Fatalf("next request snapshot should match merged request")
+	}
+}
+
 func TestResponsesWebsocketCompactionResetsTurnStateOnTranscriptReplacement(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

@@ -374,7 +374,7 @@ func shouldReplaceWebsocketTranscript(rawJSON []byte, nextInput gjson.Result) bo
 			return true
 		case "message":
 			role := strings.TrimSpace(item.Get("role").String())
-			if role == "assistant" || role == "developer" {
+			if role == "assistant" {
 				return true
 			}
 		}
