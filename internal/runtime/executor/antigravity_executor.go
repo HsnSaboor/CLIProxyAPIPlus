@@ -493,7 +493,7 @@ attemptLoop:
 		for idx, baseURL := range baseURLs {
 			requestPayload := translated
 			usedCreditsDirect := false
-			if antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
+			if antigravityCreditsRetryEnabled(e.cfg) && antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
 				if creditsPayload := injectEnabledCreditTypes(translated); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
@@ -541,7 +541,7 @@ attemptLoop:
 						markAntigravityCreditsExhausted(auth, time.Now())
 					}
 				} else {
-					creditsResp, attemptedCredits := e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translated, false, opts.Alt, baseURL, bodyBytes)
+					creditsResp, _ := e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translated, false, opts.Alt, baseURL, bodyBytes)
 					if creditsResp != nil {
 						recordAPIResponseMetadata(ctx, e.cfg, creditsResp.StatusCode, creditsResp.Header.Clone())
 						creditsBody, errCreditsRead := io.ReadAll(creditsResp.Body)
@@ -560,10 +560,6 @@ attemptLoop:
 						resp = cliproxyexecutor.Response{Payload: converted, Headers: creditsResp.Header.Clone()}
 						reporter.ensurePublished(ctx)
 						return resp, nil
-					}
-					if attemptedCredits {
-						err = newAntigravityStatusErr(httpResp.StatusCode, bodyBytes)
-						return resp, err
 					}
 				}
 			}
@@ -665,7 +661,7 @@ attemptLoop:
 		for idx, baseURL := range baseURLs {
 			requestPayload := translated
 			usedCreditsDirect := false
-			if antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
+			if antigravityCreditsRetryEnabled(e.cfg) && antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
 				if creditsPayload := injectEnabledCreditTypes(translated); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
@@ -727,13 +723,10 @@ attemptLoop:
 							markAntigravityCreditsExhausted(auth, time.Now())
 						}
 					} else {
-						creditsResp, attemptedCredits := e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translated, true, opts.Alt, baseURL, bodyBytes)
+						creditsResp, _ := e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translated, true, opts.Alt, baseURL, bodyBytes)
 						if creditsResp != nil {
 							httpResp = creditsResp
 							recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-						} else if attemptedCredits {
-							err = newAntigravityStatusErr(http.StatusTooManyRequests, bodyBytes)
-							return resp, err
 						}
 					}
 				}
@@ -1085,7 +1078,7 @@ attemptLoop:
 		for idx, baseURL := range baseURLs {
 			requestPayload := translated
 			usedCreditsDirect := false
-			if antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
+			if antigravityCreditsRetryEnabled(e.cfg) && antigravityShouldPreferCredits(auth, baseModel, time.Now()) {
 				if creditsPayload := injectEnabledCreditTypes(translated); len(creditsPayload) > 0 {
 					requestPayload = creditsPayload
 					usedCreditsDirect = true
@@ -1146,13 +1139,10 @@ attemptLoop:
 							markAntigravityCreditsExhausted(auth, time.Now())
 						}
 					} else {
-						creditsResp, attemptedCredits := e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translated, true, opts.Alt, baseURL, bodyBytes)
+						creditsResp, _ := e.attemptCreditsFallback(ctx, auth, httpClient, token, baseModel, translated, true, opts.Alt, baseURL, bodyBytes)
 						if creditsResp != nil {
 							httpResp = creditsResp
 							recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-						} else if attemptedCredits {
-							err = newAntigravityStatusErr(http.StatusTooManyRequests, bodyBytes)
-							return nil, err
 						}
 					}
 				}
@@ -1797,7 +1787,7 @@ func antigravityWait(ctx context.Context, wait time.Duration) error {
 	}
 }
 
-func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
+var antigravityBaseURLFallbackOrder = func(auth *cliproxyauth.Auth) []string {
 	if base := resolveCustomAntigravityBaseURL(auth); base != "" {
 		return []string{base}
 	}
