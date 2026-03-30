@@ -36,14 +36,14 @@ func NewResponseRewriter(w gin.ResponseWriter, originalModel string) *ResponseRe
 const maxBufferedResponseBytes = 2 * 1024 * 1024 // 2MB safety cap
 
 func looksLikeSSEChunk(data []byte) bool {
-	return bytes.Contains(data, []byte("data:")) ||
-		bytes.Contains(data, []byte("event:")) ||
-		bytes.Contains(data, []byte("message_start")) ||
-		bytes.Contains(data, []byte("message_delta")) ||
-		bytes.Contains(data, []byte("content_block_start")) ||
-		bytes.Contains(data, []byte("content_block_delta")) ||
-		bytes.Contains(data, []byte("content_block_stop")) ||
-		bytes.Contains(data, []byte("\n\n"))
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if bytes.HasPrefix(trimmed, []byte("data:")) ||
+			bytes.HasPrefix(trimmed, []byte("event:")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (rw *ResponseRewriter) enableStreaming(reason string) error {
@@ -250,11 +250,15 @@ func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
 			}
 
 			if dataIdx >= 0 {
-				// Found event+data pair - process through model rewriter only
-				// (no thinking suppression for streaming)
+				// Found event+data pair - process through rewriter
 				jsonData := bytes.TrimPrefix(bytes.TrimSpace(lines[dataIdx]), []byte("data: "))
 				if len(jsonData) > 0 && jsonData[0] == '{' {
 					rewritten := rw.rewriteStreamEvent(jsonData)
+					if rewritten == nil {
+						// Event suppressed (e.g. thinking block), skip event+data pair
+						i = dataIdx + 1
+						continue
+					}
 					// Emit event line
 					out = append(out, line)
 					// Emit blank lines between event and data
@@ -280,7 +284,9 @@ func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
 			jsonData := bytes.TrimPrefix(trimmed, []byte("data: "))
 			if len(jsonData) > 0 && jsonData[0] == '{' {
 				rewritten := rw.rewriteStreamEvent(jsonData)
-				out = append(out, append([]byte("data: "), rewritten...))
+				if rewritten != nil {
+					out = append(out, append([]byte("data: "), rewritten...))
+				}
 				i++
 				continue
 			}
@@ -296,9 +302,13 @@ func (rw *ResponseRewriter) rewriteStreamChunk(chunk []byte) []byte {
 
 // rewriteStreamEvent processes a single JSON event in the SSE stream.
 // It rewrites model names and ensures signature fields exist.
-// Unlike rewriteModelInResponse, it does NOT suppress thinking blocks
-// in streaming mode - they are passed through with signature injection.
 func (rw *ResponseRewriter) rewriteStreamEvent(data []byte) []byte {
+	// Suppress thinking blocks before any other processing.
+	data = rw.suppressAmpThinking(data)
+	if len(data) == 0 {
+		return nil
+	}
+
 	// Inject empty signature where needed
 	data = ensureAmpSignature(data)
 
