@@ -450,6 +450,10 @@ func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	return resolvedModel
 }
 
+func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string {
+	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
+}
+
 func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
 	stateModel := executionResultModel(routeModel, upstreamModel, pooled)
 	selectionModel := m.selectionModelForAuth(auth, routeModel)
@@ -507,8 +511,7 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 	availableByPriority := make(map[int][]*Auth)
 	cooldownCount := 0
 	var earliest time.Time
-	for i := 0; i < len(auths); i++ {
-		candidate := auths[i]
+	for _, candidate := range auths {
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
 		if !blocked {
@@ -553,6 +556,28 @@ func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeMode
 		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
 	}
 	return available, nil
+}
+
+func selectionArgForSelector(selector Selector, routeModel string) string {
+	if isBuiltInSelector(selector) {
+		return ""
+	}
+	return routeModel
+}
+
+func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
+	if registryRef == nil || auth == nil {
+		return true
+	}
+	routeKey := canonicalModelKey(routeModel)
+	if routeKey == "" {
+		return true
+	}
+	if registryRef.ClientSupportsModel(auth.ID, routeKey) {
+		return true
+	}
+	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
+	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
@@ -2353,7 +2378,7 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 	if auth == nil || strings.TrimSpace(routeModel) == "" {
 		return false
 	}
-	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel)) != canonicalModelKey(routeModel)
+	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
 }
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
@@ -2385,17 +2410,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && registryRef != nil {
-			supportsModel := registryRef.ClientSupportsModel(candidate.ID, modelKey)
-			if !supportsModel {
-				selectionKey := canonicalModelKey(m.selectionModelForAuth(candidate, model))
-				if selectionKey != "" && selectionKey != modelKey {
-					supportsModel = registryRef.ClientSupportsModel(candidate.ID, selectionKey)
-				}
-			}
-			if !supportsModel {
-				continue
-			}
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -2408,7 +2424,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
-	selected, errPick := m.selector.Pick(ctx, provider, "", opts, available)
+	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, errPick
@@ -2523,17 +2539,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && registryRef != nil {
-			supportsModel := registryRef.ClientSupportsModel(candidate.ID, modelKey)
-			if !supportsModel {
-				selectionKey := canonicalModelKey(m.selectionModelForAuth(candidate, model))
-				if selectionKey != "" && selectionKey != modelKey {
-					supportsModel = registryRef.ClientSupportsModel(candidate.ID, selectionKey)
-				}
-			}
-			if !supportsModel {
-				continue
-			}
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
+			continue
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -2546,7 +2553,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
-	selected, errPick := m.selector.Pick(ctx, "mixed", "", opts, available)
+	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errPick
