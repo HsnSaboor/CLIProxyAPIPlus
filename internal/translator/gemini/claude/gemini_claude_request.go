@@ -6,7 +6,6 @@
 package claude
 
 import (
-	"bytes"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -31,8 +30,6 @@ const geminiClaudeThoughtSignature = "skip_thought_signature_validator"
 //   - []byte: The transformed request in Gemini CLI format.
 func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool) []byte {
 	rawJSON := inputRawJSON
-	rawJSON = bytes.Replace(rawJSON, []byte(`"url":{"type":"string","format":"uri",`), []byte(`"url":{"type":"string",`), -1)
-
 	// Build output Gemini CLI request JSON
 	out := []byte(`{"contents":[]}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
@@ -152,7 +149,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		toolsResult.ForEach(func(_, toolResult gjson.Result) bool {
 			inputSchemaResult := toolResult.Get("input_schema")
 			if inputSchemaResult.Exists() && inputSchemaResult.IsObject() {
-				inputSchema := inputSchemaResult.Raw
+				inputSchema := util.CleanJSONSchemaForGemini(inputSchemaResult.Raw)
 				tool := []byte(toolResult.Raw)
 				var err error
 				tool, err = sjson.DeleteBytes(tool, "input_schema")
@@ -168,6 +165,7 @@ func ConvertClaudeRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				tool, _ = sjson.DeleteBytes(tool, "type")
 				tool, _ = sjson.DeleteBytes(tool, "cache_control")
 				tool, _ = sjson.DeleteBytes(tool, "defer_loading")
+				tool, _ = sjson.DeleteBytes(tool, "eager_input_streaming")
 				tool, _ = sjson.SetBytes(tool, "name", util.SanitizeFunctionName(gjson.GetBytes(tool, "name").String()))
 				if gjson.ValidBytes(tool) && gjson.ParseBytes(tool).IsObject() {
 					if !hasTools {
