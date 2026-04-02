@@ -103,13 +103,12 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 }
 
 func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	host := req.URL.Host
-	addr := host
-	if !strings.Contains(addr, ":") {
-		addr += ":443"
-	}
-
 	hostname := req.URL.Hostname()
+	port := req.URL.Port()
+	if port == "" {
+		port = "443"
+	}
+	addr := net.JoinHostPort(hostname, port)
 
 	h2Conn, err := t.getOrCreateConnection(hostname, addr)
 	if err != nil {
@@ -129,8 +128,13 @@ func (t *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return resp, nil
 }
 
-// fallbackRoundTripper tries utls first; if the target is plain HTTP or a
-// non-HTTPS scheme it falls back to a standard transport.
+// anthropicHosts contains the hosts that should use utls Chrome TLS fingerprint.
+var anthropicHosts = map[string]struct{}{
+	"api.anthropic.com": {},
+}
+
+// fallbackRoundTripper uses utls for Anthropic HTTPS hosts and falls back to
+// standard transport for all other requests (non-HTTPS or non-Anthropic hosts).
 type fallbackRoundTripper struct {
 	utls     *utlsRoundTripper
 	fallback http.RoundTripper
@@ -138,7 +142,9 @@ type fallbackRoundTripper struct {
 
 func (f *fallbackRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Scheme == "https" {
-		return f.utls.RoundTrip(req)
+		if _, ok := anthropicHosts[strings.ToLower(req.URL.Hostname())]; ok {
+			return f.utls.RoundTrip(req)
+		}
 	}
 	return f.fallback.RoundTrip(req)
 }

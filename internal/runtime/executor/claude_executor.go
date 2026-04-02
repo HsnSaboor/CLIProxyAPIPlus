@@ -1200,15 +1200,16 @@ const fingerprintSalt = "59cf53e54c78"
 // Algorithm: SHA256(salt + messageText[4] + messageText[7] + messageText[20] + version)[:3]
 func computeFingerprint(messageText, version string) string {
 	indices := [3]int{4, 7, 20}
-	var chars [3]byte
-	for i, idx := range indices {
-		if idx < len(messageText) {
-			chars[i] = messageText[idx]
+	runes := []rune(messageText)
+	var sb strings.Builder
+	for _, idx := range indices {
+		if idx < len(runes) {
+			sb.WriteRune(runes[idx])
 		} else {
-			chars[i] = '0'
+			sb.WriteRune('0')
 		}
 	}
-	input := fingerprintSalt + string(chars[:]) + version
+	input := fingerprintSalt + sb.String() + version
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:])[:3]
 }
