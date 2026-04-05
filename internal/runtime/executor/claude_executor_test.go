@@ -965,6 +965,28 @@ func TestNormalizeCacheControlTTL_PreservesOriginalBytesWhenNoChange(t *testing.
 	}
 }
 
+func TestNormalizeCacheControlTTL_PreservesKeyOrderWhenModified(t *testing.T) {
+	payload := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"u1","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"tools":[{"name":"t1","cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"s1","cache_control":{"type":"ephemeral"}}]}`)
+
+	out := normalizeCacheControlTTL(payload)
+
+	if gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").Exists() {
+		t.Fatalf("messages.0.content.0.cache_control.ttl should be removed after a default-5m block")
+	}
+
+	outStr := string(out)
+	idxModel := strings.Index(outStr, `"model"`)
+	idxMessages := strings.Index(outStr, `"messages"`)
+	idxTools := strings.Index(outStr, `"tools"`)
+	idxSystem := strings.Index(outStr, `"system"`)
+	if idxModel == -1 || idxMessages == -1 || idxTools == -1 || idxSystem == -1 {
+		t.Fatalf("failed to locate top-level keys in output: %s", outStr)
+	}
+	if !(idxModel < idxMessages && idxMessages < idxTools && idxTools < idxSystem) {
+		t.Fatalf("top-level key order changed:\noriginal: %s\ngot:      %s", payload, out)
+	}
+}
+
 func TestEnforceCacheControlLimit_StripsNonLastToolBeforeMessages(t *testing.T) {
 	payload := []byte(`{
 		"tools": [
@@ -991,6 +1013,31 @@ func TestEnforceCacheControlLimit_StripsNonLastToolBeforeMessages(t *testing.T) 
 	}
 	if !gjson.GetBytes(out, "messages.0.content.0.cache_control").Exists() || !gjson.GetBytes(out, "messages.1.content.0.cache_control").Exists() {
 		t.Fatalf("message cache_control blocks should be preserved when non-last tool removal is enough")
+	}
+}
+
+func TestEnforceCacheControlLimit_PreservesKeyOrderWhenModified(t *testing.T) {
+	payload := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"u1","cache_control":{"type":"ephemeral"}},{"type":"text","text":"u2","cache_control":{"type":"ephemeral"}}]}],"tools":[{"name":"t1","cache_control":{"type":"ephemeral"}},{"name":"t2","cache_control":{"type":"ephemeral"}}],"system":[{"type":"text","text":"s1","cache_control":{"type":"ephemeral"}}]}`)
+
+	out := enforceCacheControlLimit(payload, 4)
+
+	if got := countCacheControls(out); got != 4 {
+		t.Fatalf("cache_control count = %d, want 4", got)
+	}
+	if gjson.GetBytes(out, "tools.0.cache_control").Exists() {
+		t.Fatalf("tools.0.cache_control should be removed first (non-last tool)")
+	}
+
+	outStr := string(out)
+	idxModel := strings.Index(outStr, `"model"`)
+	idxMessages := strings.Index(outStr, `"messages"`)
+	idxTools := strings.Index(outStr, `"tools"`)
+	idxSystem := strings.Index(outStr, `"system"`)
+	if idxModel == -1 || idxMessages == -1 || idxTools == -1 || idxSystem == -1 {
+		t.Fatalf("failed to locate top-level keys in output: %s", outStr)
+	}
+	if !(idxModel < idxMessages && idxMessages < idxTools && idxTools < idxSystem) {
+		t.Fatalf("top-level key order changed:\noriginal: %s\ngot:      %s", payload, out)
 	}
 }
 
