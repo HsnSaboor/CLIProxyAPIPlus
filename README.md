@@ -8,6 +8,20 @@ All third-party provider support is maintained by community contributors; CLIPro
 
 The Plus release stays in lockstep with the mainline features.
 
+## Supported Providers
+
+| Provider | Flag | Notes |
+|---|---|---|
+| Cline | `--cline-login` | OAuth device flow via Cline extension |
+| CodeBuddy (CN) | `--codebuddy-login` | OAuth via `copilot.tencent.com` (codebuddy.cn) |
+| CodeBuddy International | `--codebuddy-intl-login` | OAuth via `www.codebuddy.ai` |
+
+> For the full list of built-in providers (Claude, Codex, Gemini, Cursor, etc.), see the [mainline README](https://github.com/router-for-me/CLIProxyAPI).
+
+### CodeBuddy International
+
+The `--codebuddy-intl-login` flag authenticates against `www.codebuddy.ai` instead of the default `copilot.tencent.com` endpoint. The international variant uses identical API endpoints and response formats — only the base URL and default domain differ. Tokens are stored with `type: "codebuddy-intl"` and `base_url` metadata so the executor routes requests to the correct backend.
+
 ## Contributing
 
 This project only accepts pull requests that relate to third-party provider support. Any pull requests unrelated to third-party provider support will be rejected.
