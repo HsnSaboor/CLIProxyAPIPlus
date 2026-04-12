@@ -30,6 +30,8 @@ type CodeBuddyTokenStorage struct {
 	Domain string `json:"domain"`
 	// UserID is the user ID associated with this token.
 	UserID string `json:"user_id"`
+	// Email is the email address associated with this token.
+	Email string `json:"email,omitempty"`
 	// Type indicates the authentication provider type, always "codebuddy" for this storage.
 	Type string `json:"type"`
 }

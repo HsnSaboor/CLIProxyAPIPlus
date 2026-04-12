@@ -62,12 +62,18 @@ func (a CodeBuddyIntlAuthenticator) Login(ctx context.Context, cfg *config.Confi
 		return nil, fmt.Errorf("codebuddy-intl: %s: %w", codebuddy.GetUserFriendlyMessage(err), err)
 	}
 
-	fmt.Printf("\nSuccessfully logged in! (User ID: %s)\n", storage.UserID)
+	if storage.Email != "" {
+		fmt.Printf("\nSuccessfully logged in! (Email: %s)\n", storage.Email)
+	} else {
+		fmt.Printf("\nSuccessfully logged in! (User ID: %s)\n", storage.UserID)
+	}
 
 	authID := fmt.Sprintf("codebuddy-intl-%s.json", storage.UserID)
 
 	label := storage.UserID
-	if label == "" {
+	if storage.Email != "" {
+		label = storage.Email
+	} else if label == "" {
 		label = "codebuddy-intl-user"
 	}
 
@@ -81,6 +87,7 @@ func (a CodeBuddyIntlAuthenticator) Login(ctx context.Context, cfg *config.Confi
 			"access_token":  storage.AccessToken,
 			"refresh_token": storage.RefreshToken,
 			"user_id":       storage.UserID,
+			"email":         storage.Email,
 			"domain":        storage.Domain,
 			"expires_in":    storage.ExpiresIn,
 			"base_url":      codebuddy.IntlBaseURL,

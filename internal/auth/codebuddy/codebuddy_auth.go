@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	BaseURL          = "https://copilot.tencent.com"
-	DefaultDomain    = "www.codebuddy.cn"
-	IntlBaseURL      = "https://www.codebuddy.ai"
+	BaseURL           = "https://copilot.tencent.com"
+	DefaultDomain     = "www.codebuddy.cn"
+	IntlBaseURL       = "https://www.codebuddy.ai"
 	IntlDefaultDomain = "www.codebuddy.ai"
-	UserAgent        = "CLI/2.63.2 CodeBuddy/2.63.2"
+	UserAgent         = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 	codeBuddyStatePath   = "/v2/plugin/auth/state"
 	codeBuddyTokenPath   = "/v2/plugin/auth/token"
@@ -82,7 +82,7 @@ func (a *CodeBuddyAuth) FetchAuthState(ctx context.Context) (*AuthState, error) 
 		return nil, fmt.Errorf("codebuddy: failed to create auth state request: %w", err)
 	}
 
-requestID := uuid.NewString()
+	requestID := uuid.NewString()
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -208,6 +208,7 @@ func (a *CodeBuddyAuth) PollForToken(ctx context.Context, state string) (*CodeBu
 				return nil, fmt.Errorf("%w: empty data in response", ErrTokenFetchFailed)
 			}
 			userID, _ := a.DecodeUserID(result.Data.AccessToken)
+			email, _ := a.DecodeJWTClaims(result.Data.AccessToken)
 			return &CodeBuddyTokenStorage{
 				AccessToken:  result.Data.AccessToken,
 				RefreshToken: result.Data.RefreshToken,
@@ -215,6 +216,7 @@ func (a *CodeBuddyAuth) PollForToken(ctx context.Context, state string) (*CodeBu
 				TokenType:    result.Data.TokenType,
 				Domain:       result.Data.Domain,
 				UserID:       userID,
+				Email:        email,
 				Type:         a.authType,
 			}, nil
 		case codeLoginPending:
@@ -248,6 +250,31 @@ func (a *CodeBuddyAuth) DecodeUserID(accessToken string) (string, error) {
 		return "", fmt.Errorf("%w: sub claim is empty", ErrJWTDecodeFailed)
 	}
 	return claims.Sub, nil
+}
+
+// DecodeJWTClaims decodes the email and name from a JWT access token.
+func (a *CodeBuddyAuth) DecodeJWTClaims(accessToken string) (email string, name string) {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) < 2 {
+		return "", ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", ""
+	}
+	var claims struct {
+		Email             string `json:"email"`
+		Name              string `json:"name"`
+		PreferredUsername string `json:"preferred_username"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return "", ""
+	}
+	email = claims.Email
+	if email == "" {
+		email = claims.PreferredUsername
+	}
+	return email, claims.Name
 }
 
 // RefreshToken exchanges a refresh token for a new access token.
@@ -325,6 +352,7 @@ func (a *CodeBuddyAuth) RefreshToken(ctx context.Context, accessToken, refreshTo
 	if newUserID == "" {
 		newUserID = userID
 	}
+	newEmail, _ := a.DecodeJWTClaims(result.Data.AccessToken)
 	tokenDomain := result.Data.Domain
 	if tokenDomain == "" {
 		tokenDomain = domain
@@ -338,6 +366,7 @@ func (a *CodeBuddyAuth) RefreshToken(ctx context.Context, accessToken, refreshTo
 		TokenType:        result.Data.TokenType,
 		Domain:           tokenDomain,
 		UserID:           newUserID,
+		Email:            newEmail,
 		Type:             a.authType,
 	}, nil
 }

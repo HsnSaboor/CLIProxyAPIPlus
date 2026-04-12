@@ -25,12 +25,21 @@ import (
 
 const (
 	codeBuddyChatPath     = "/v2/chat/completions"
+	codeBuddyImagesPath   = "/v2/images/generations"
 	codeBuddyAuthType     = "codebuddy"
 	codeBuddyIntlAuthType = "codebuddy-intl"
 )
 
+var codeBuddyImageModels = map[string]bool{
+	"gemini-3.0-pro-image":            true,
+	"gemini-3.1-flash-image":          true,
+	"gemini-2.5-flash-image":          true,
+	"hunyuan-image-v3.0":              true,
+	"hunyuan-image-v2.0-general-edit": true,
+}
+
 type CodeBuddyExecutor struct {
-	cfg           *config.Config
+	cfg            *config.Config
 	defaultBaseURL string
 }
 
@@ -115,6 +124,11 @@ func (e *CodeBuddyExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	accessToken, userID, domain, _ := codeBuddyCredentials(auth)
 	if accessToken == "" {
 		return resp, fmt.Errorf("codebuddy: missing access token")
+	}
+
+	// Handle image generation models
+	if codeBuddyImageModels[baseModel] {
+		return e.executeImageGeneration(ctx, auth, req, opts, accessToken, userID, domain)
 	}
 
 	from := opts.SourceFormat
@@ -355,6 +369,9 @@ func (e *CodeBuddyExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth
 	if storage.UserID != "" {
 		updated.Metadata["user_id"] = storage.UserID
 	}
+	if storage.Email != "" {
+		updated.Metadata["email"] = storage.Email
+	}
 	now := time.Now()
 	updated.UpdatedAt = now
 	updated.LastRefreshedAt = now
@@ -574,4 +591,132 @@ func aggregateOpenAIChatCompletionStream(raw []byte) ([]byte, usage.Detail, erro
 		return nil, usageDetail, fmt.Errorf("codebuddy: failed to encode aggregated response: %w", err)
 	}
 	return out, usageDetail, nil
+}
+
+// executeImageGeneration handles image generation requests for CodeBuddy image models.
+func (e *CodeBuddyExecutor) executeImageGeneration(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, accessToken, userID, domain string) (resp cliproxyexecutor.Response, err error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
+	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	defer reporter.trackFailure(ctx, &err)
+
+	url := codeBuddyBaseURL(e, auth) + codeBuddyImagesPath
+
+	// Translate the request to OpenAI format
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("openai")
+
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
+	}
+	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, true)
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	requestedModel := payloadRequestedModel(opts, req.Model)
+	translated = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", translated, originalTranslated, requestedModel)
+
+	// Remove stream option for image generation
+	translated, _ = sjson.DeleteBytes(translated, "stream")
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
+	if err != nil {
+		return resp, err
+	}
+	e.applyHeaders(httpReq, accessToken, userID, domain)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	var authID, authLabel, authType, authValue string
+	if auth != nil {
+		authID = auth.ID
+		authLabel = auth.Label
+		authType, authValue = auth.AccountInfo()
+	}
+	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+		URL:       url,
+		Method:    http.MethodPost,
+		Headers:   httpReq.Header.Clone(),
+		Body:      translated,
+		Provider:  e.Identifier(),
+		AuthID:    authID,
+		AuthLabel: authLabel,
+		AuthType:  authType,
+		AuthValue: authValue,
+	})
+
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+	httpResp, err := httpClient.Do(httpReq)
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return resp, err
+	}
+	defer func() {
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("codebuddy executor: close response body error: %v", errClose)
+		}
+	}()
+
+	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+	if !isHTTPSuccess(httpResp.StatusCode) {
+		data, _ := io.ReadAll(httpResp.Body)
+		appendAPIResponseChunk(ctx, e.cfg, data)
+		log.Debugf("codebuddy executor: upstream error status: %d, body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+		err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, err
+	}
+
+	data, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		recordAPIResponseError(ctx, e.cfg, err)
+		return resp, err
+	}
+	appendAPIResponseChunk(ctx, e.cfg, data)
+
+	// Convert CodeBuddy image response to OpenAI format
+	converted := convertCodeBuddyImageResponse(data, baseModel)
+
+	return cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}, nil
+}
+
+// convertCodeBuddyImageResponse converts CodeBuddy image generation response to OpenAI format.
+func convertCodeBuddyImageResponse(data []byte, model string) []byte {
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return data
+	}
+
+	// Check if response has images
+	images, ok := resp["data"].([]any)
+	if !ok || len(images) == 0 {
+		return data
+	}
+
+	// Convert to OpenAI images-response format
+	openAIResp := map[string]any{
+		"object":  "chat.completion",
+		"model":   model,
+		"created": time.Now().Unix(),
+	}
+
+	convertedImages := make([]map[string]any, 0, len(images))
+	for _, img := range images {
+		if imgMap, ok := img.(map[string]any); ok {
+			b64Data, _ := imgMap["b64_json"].(string)
+			revisedPrompt, _ := imgMap["revised_prompt"].(string)
+
+			converted := map[string]any{
+				"object":         "image",
+				"b64_json":       b64Data,
+				"revised_prompt": revisedPrompt,
+			}
+			convertedImages = append(convertedImages, converted)
+		}
+	}
+
+	if len(convertedImages) > 0 {
+		openAIResp["data"] = convertedImages
+	}
+
+	out, _ := json.Marshal(openAIResp)
+	return out
 }
