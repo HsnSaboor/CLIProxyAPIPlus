@@ -23,6 +23,13 @@ import (
 
 const nvidiaCompatTokenReserve int64 = 2
 
+var openAICompatKnownEndpointSuffixes = []string{
+	"/chat/completions",
+	"/responses/compact",
+	"/responses",
+	"/completions",
+}
+
 // OpenAICompatExecutor implements a stateless executor for OpenAI-compatible providers.
 // It performs request/response translation and executes against the provider base URL
 // using per-auth credentials (API key) and per-auth HTTP transport (proxy) from context.
@@ -112,7 +119,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	translated = e.applyCompatSafetyMargin(auth, translated)
 
-	url := strings.TrimSuffix(baseURL, "/") + endpoint
+	url := openAICompatRequestURL(baseURL, endpoint)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -214,7 +221,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := openAICompatRequestURL(baseURL, "/chat/completions")
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -420,6 +427,40 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+func openAICompatRequestURL(baseURL, endpoint string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		return ""
+	}
+	endpoint = normalizeOpenAICompatEndpoint(endpoint)
+	if endpoint == "" {
+		return base
+	}
+
+	baseLower := strings.ToLower(base)
+	endpointLower := strings.ToLower(endpoint)
+	if strings.HasSuffix(baseLower, endpointLower) {
+		return base
+	}
+
+	for _, suffix := range openAICompatKnownEndpointSuffixes {
+		if strings.HasSuffix(baseLower, suffix) {
+			base = strings.TrimRight(base[:len(base)-len(suffix)], "/")
+			break
+		}
+	}
+
+	return base + endpoint
+}
+
+func normalizeOpenAICompatEndpoint(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return ""
+	}
+	return "/" + strings.Trim(endpoint, "/")
 }
 
 type statusErr struct {
