@@ -377,12 +377,6 @@ nonstream-keepalive-interval: 0
 #   codex:
 #     - name: "gpt-5"
 #       alias: "g5"
-#   qwen:
-#     - name: "qwen3-coder-plus"
-#       alias: "qwen-plus"
-#   iflow:
-#     - name: "glm-4.7"
-#       alias: "glm-god"
 #   kimi:
 #     - name: "kimi-k2.5"
 #       alias: "k2.5"
@@ -411,10 +405,6 @@ nonstream-keepalive-interval: 0
 #     - "claude-3-5-haiku-20241022"
 #   codex:
 #     - "gpt-5-codex-mini"
-#   qwen:
-#     - "vision-model"
-#   iflow:
-#     - "tstars2.0"
 #   kimi:
 #     - "kimi-k2-thinking"
 #   kiro:

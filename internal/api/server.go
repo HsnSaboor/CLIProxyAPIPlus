@@ -260,6 +260,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		authManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
@@ -432,20 +433,6 @@ func (s *Server) setupRoutes() {
 		}
 		if state != "" {
 			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "gemini", state, code, errStr)
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, oauthCallbackSuccessHTML)
-	})
-
-	s.engine.GET("/iflow/callback", func(c *gin.Context) {
-		code := c.Query("code")
-		state := c.Query("state")
-		errStr := c.Query("error")
-		if errStr == "" {
-			errStr = c.Query("error_description")
-		}
-		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "iflow", state, code, errStr)
 		}
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
