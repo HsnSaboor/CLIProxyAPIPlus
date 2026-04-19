@@ -97,7 +97,6 @@ func main() {
 	var kiroIDCRegion string
 	var kiroIDCFlow string
 	var githubCopilotLogin bool
-	var kilocodeLogin bool
 	var clineLogin bool
 	var codeBuddyLogin bool
 	var codeBuddyIntlLogin bool
@@ -141,7 +140,6 @@ func main() {
 	flag.StringVar(&kiroIDCRegion, "kiro-idc-region", "", "IDC region (default: us-east-1)")
 	flag.StringVar(&kiroIDCFlow, "kiro-idc-flow", "", "IDC flow type: authcode (default) or device")
 	flag.BoolVar(&githubCopilotLogin, "github-copilot-login", false, "Login to GitHub Copilot using device flow")
-	flag.BoolVar(&kilocodeLogin, "kilocode-login", false, "Login to Kilocode using device flow")
 	flag.BoolVar(&clineLogin, "cline-login", false, "Login to Cline using OAuth")
 	flag.BoolVar(&codeBuddyLogin, "codebuddy-login", false, "Login to CodeBuddy using browser OAuth flow")
 	flag.BoolVar(&codeBuddyIntlLogin, "codebuddy-intl-login", false, "Login to CodeBuddy International (codebuddy.ai) using browser OAuth flow")
@@ -534,9 +532,6 @@ func main() {
 	} else if githubCopilotLogin {
 		// Handle GitHub Copilot login
 		cmd.DoGitHubCopilotLogin(cfg, options)
-	} else if kilocodeLogin {
-		// Handle Kilocode login
-		cmd.DoKilocodeLogin(cfg, options)
 	} else if codeBuddyLogin {
 		cmd.DoCodeBuddyLogin(cfg, options)
 	} else if codeBuddyIntlLogin {
