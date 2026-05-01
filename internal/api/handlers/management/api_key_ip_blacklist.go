@@ -36,10 +36,10 @@ type APIKeyIPBlacklistEntry struct {
 }
 
 type apiKeyIPBlacklistState struct {
-	failures    []time.Time
+	failures     []time.Time
 	blockedUntil time.Time
-	lastFailure time.Time
-	lastSeen    time.Time
+	lastFailure  time.Time
+	lastSeen     time.Time
 }
 
 type APIKeyIPBlacklistStore struct {
