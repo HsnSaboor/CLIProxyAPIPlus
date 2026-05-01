@@ -16,6 +16,7 @@ import (
 
 	vertexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/vertex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -332,8 +333,9 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 		}
 
 		body = fixGeminiImageAspectRatio(baseModel, body)
-		requestedModel := payloadRequestedModel(opts, req.Model)
-		body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+		requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+		requestPath := helps.PayloadRequestPath(opts)
+		body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 		body, _ = sjson.SetBytes(body, "model", baseModel)
 	}
 
@@ -396,7 +398,7 @@ func (e *GeminiVertexExecutor) executeWithServiceAccount(ctx context.Context, au
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), body, b)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -447,8 +449,9 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	}
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	action := getVertexAction(baseModel, false)
@@ -511,7 +514,7 @@ func (e *GeminiVertexExecutor) executeWithAPIKey(ctx context.Context, auth *clip
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), body, b)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -552,8 +555,9 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	}
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	action := getVertexAction(baseModel, true)
@@ -610,7 +614,7 @@ func (e *GeminiVertexExecutor) executeStreamWithServiceAccount(ctx context.Conte
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), body, b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("vertex executor: close response body error: %v", errClose)
 		}
@@ -676,8 +680,9 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	}
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	action := getVertexAction(baseModel, true)
@@ -734,7 +739,7 @@ func (e *GeminiVertexExecutor) executeStreamWithAPIKey(ctx context.Context, auth
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), body, b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("vertex executor: close response body error: %v", errClose)
 		}
@@ -846,7 +851,7 @@ func (e *GeminiVertexExecutor) countTokensWithServiceAccount(ctx context.Context
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), translatedReq, b)
 		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 	data, errRead := io.ReadAll(httpResp.Body)
@@ -930,7 +935,7 @@ func (e *GeminiVertexExecutor) countTokensWithAPIKey(ctx context.Context, auth *
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), translatedReq, b)
 		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(b)}
 	}
 	data, errRead := io.ReadAll(httpResp.Body)

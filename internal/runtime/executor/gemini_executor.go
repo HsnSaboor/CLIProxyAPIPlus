@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -130,8 +131,9 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	action := "generateContent"
@@ -192,7 +194,7 @@ func (e *GeminiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), body, b)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -237,8 +239,9 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	body = fixGeminiImageAspectRatio(baseModel, body)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	baseURL := resolveGeminiBaseURL(auth)
@@ -290,7 +293,7 @@ func (e *GeminiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), b)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), body, b)
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("gemini executor: close response body error: %v", errClose)
 		}
@@ -409,7 +412,7 @@ func (e *GeminiExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	appendAPIResponseChunk(ctx, e.cfg, data)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		logDetailedAPIError(ctx, e.Identifier(), baseModel, url, resp.StatusCode, resp.Header.Get("Content-Type"), data)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), baseModel, url, resp.StatusCode, resp.Header.Get("Content-Type"), req.Payload, data)
 		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(data)}
 	}
 

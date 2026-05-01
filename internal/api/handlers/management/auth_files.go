@@ -568,6 +568,11 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 						fileData["billing_class"] = normalized
 					}
 				}
+				if uv := gjson.GetBytes(data, "base_url"); uv.Exists() && uv.Type == gjson.String {
+					if trimmed := strings.TrimSpace(uv.String()); trimmed != "" {
+						fileData["base_url"] = trimmed
+					}
+				}
 			}
 
 			files = append(files, fileData)
@@ -610,6 +615,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"source":         "memory",
 		"size":           int64(0),
 	}
+	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}
@@ -694,6 +700,15 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		} else if rawBillingClass, ok := auth.Metadata["billing-class"].(string); ok {
 			if normalized := normalizeBillingClassValue(rawBillingClass); normalized != "" {
 				entry["billing_class"] = normalized
+			}
+		}
+	}
+	if baseURL := strings.TrimSpace(authAttribute(auth, "base_url")); baseURL != "" {
+		entry["base_url"] = baseURL
+	} else if auth.Metadata != nil {
+		if rawBaseURL, ok := auth.Metadata["base_url"].(string); ok {
+			if trimmed := strings.TrimSpace(rawBaseURL); trimmed != "" {
+				entry["base_url"] = trimmed
 			}
 		}
 	}
@@ -1341,6 +1356,11 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 			}
 		}
 	}
+	if rawBaseURL, ok := metadata["base_url"].(string); ok {
+		if trimmed := strings.TrimSpace(rawBaseURL); trimmed != "" {
+			auth.Attributes["base_url"] = trimmed
+		}
+	}
 	if primaryInfo := extractPrimaryInfoFromMetadata(metadata); primaryInfo != nil && strings.EqualFold(strings.TrimSpace(provider), "antigravity") {
 		auth.PrimaryInfo = primaryInfo
 	}
@@ -1453,6 +1473,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		Name         string            `json:"name"`
 		Prefix       *string           `json:"prefix"`
 		ProxyURL     *string           `json:"proxy_url"`
+		BaseURL      *string           `json:"base_url"`
 		Headers      map[string]string `json:"headers"`
 		Priority     *int              `json:"priority"`
 		Note         *string           `json:"note"`
@@ -1514,6 +1535,23 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 			delete(targetAuth.Metadata, "proxy_url")
 		} else {
 			targetAuth.Metadata["proxy_url"] = proxyURL
+		}
+		changed = true
+	}
+	if req.BaseURL != nil {
+		baseURL := strings.TrimSpace(*req.BaseURL)
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if targetAuth.Attributes == nil {
+			targetAuth.Attributes = make(map[string]string)
+		}
+		if baseURL == "" {
+			delete(targetAuth.Metadata, "base_url")
+			delete(targetAuth.Attributes, "base_url")
+		} else {
+			targetAuth.Metadata["base_url"] = baseURL
+			targetAuth.Attributes["base_url"] = baseURL
 		}
 		changed = true
 	}
@@ -2175,12 +2213,19 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		// Create token storage
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+		metadata := map[string]any{"email": tokenStorage.Email}
+		attributes := map[string]string{}
+		if baseURL := strings.TrimSpace(tokenStorage.BaseURL); baseURL != "" {
+			metadata["base_url"] = baseURL
+			attributes["base_url"] = baseURL
+		}
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
-			Provider: "claude",
-			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
+			ID:         fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			Provider:   "claude",
+			FileName:   fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			Storage:    tokenStorage,
+			Attributes: attributes,
+			Metadata:   metadata,
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
@@ -3020,62 +3065,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			fmt.Printf("Using GCP project: %s\n", projectID)
 		}
 		fmt.Println("You can now use Antigravity services through this CLI")
-	}()
-
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestQwenToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-
-	fmt.Println("Initializing Qwen authentication...")
-
-	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
-	// Initialize Qwen auth service
-	qwenAuth := qwen.NewQwenAuth(h.cfg)
-
-	// Generate authorization URL
-	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
-	if err != nil {
-		log.Errorf("Failed to generate authorization URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
-		return
-	}
-	authURL := deviceFlow.VerificationURIComplete
-
-	RegisterOAuthSession(state, "qwen")
-
-	go func() {
-		fmt.Println("Waiting for authentication...")
-		tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
-		if errPollForToken != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errPollForToken)
-			return
-		}
-
-		// Create token storage
-		tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
-
-		tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Provider: "qwen",
-			FileName: fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
-		fmt.Println("You can now use Qwen services through this CLI")
-		CompleteOAuthSession(state)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -4515,4 +4504,60 @@ func (h *Handler) RequestCursorToken(c *gin.Context) {
 		"url":    authParams.LoginURL,
 		"state":  state,
 	})
+}
+
+func (h *Handler) RequestQwenToken(c *gin.Context) {
+        ctx := context.Background()
+        ctx = PopulateAuthContext(ctx, c)
+
+        fmt.Println("Initializing Qwen authentication...")
+
+        state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
+        // Initialize Qwen auth service
+        qwenAuth := qwen.NewQwenAuth(h.cfg)
+
+        // Generate authorization URL
+        deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
+        if err != nil {
+                log.Errorf("Failed to generate authorization URL: %v", err)
+                c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+                return
+        }
+        authURL := deviceFlow.VerificationURIComplete
+
+        RegisterOAuthSession(state, "qwen")
+
+        go func() {
+                fmt.Println("Waiting for authentication...")
+                tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
+                if errPollForToken != nil {
+                        SetOAuthSessionError(state, "Authentication failed")
+                        fmt.Printf("Authentication failed: %v\n", errPollForToken)
+                        return
+                }
+
+                // Create token storage
+                tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
+
+                tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
+                record := &coreauth.Auth{
+                        ID:       fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
+                        Provider: "qwen",
+                        FileName: fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
+                        Storage:  tokenStorage,
+                        Metadata: map[string]any{"email": tokenStorage.Email},
+                }
+                savedPath, errSave := h.saveTokenRecord(ctx, record)
+                if errSave != nil {
+                        log.Errorf("Failed to save authentication tokens: %v", errSave)
+                        SetOAuthSessionError(state, "Failed to save authentication tokens")
+                        return
+                }
+
+                fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+                fmt.Println("You can now use Qwen services through this CLI")
+                CompleteOAuthSession(state)
+        }()
+
+        c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }

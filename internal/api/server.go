@@ -7,8 +7,10 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,11 +26,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -39,6 +42,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -128,6 +132,12 @@ type Server struct {
 	// server is the underlying HTTP server.
 	server *http.Server
 
+	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
+	muxBaseListener net.Listener
+
+	// muxHTTPListener receives HTTP connections selected by the multiplexer.
+	muxHTTPListener *muxListener
+
 	// handlers contains the API handlers for processing requests.
 	handlers *handlers.BaseAPIHandler
 
@@ -158,7 +168,8 @@ type Server struct {
 	wsAuthEnabled atomic.Bool
 
 	// management handler
-	mgmt *managementHandlers.Handler
+	mgmt              *managementHandlers.Handler
+	apiKeyIPBlacklist *managementHandlers.APIKeyIPBlacklistStore
 
 	// ampModule is the Amp routing module for model mapping hot-reload
 	ampModule *ampmodule.AmpModule
@@ -209,7 +220,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 
 	// Add middleware
-	engine.Use(logging.GinLogrusLogger())
+	engine.Use(logging.GinLogrusLogger(cfg))
 	engine.Use(logging.GinLogrusRecovery())
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
@@ -261,12 +272,15 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 		authManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
+		authManager.SetFallbackModels(cfg.Routing.FallbackModels)
+		authManager.SetFallbackChain(cfg.Routing.FallbackChain, cfg.Routing.FallbackMaxDepth)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.apiKeyIPBlacklist = s.mgmt.APIKeyIPBlacklistStore()
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -275,18 +289,24 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
+	s.mgmt.SetOnConfigApplied(func(updatedCfg *config.Config) {
+		if updatedCfg == nil {
+			return
+		}
+		s.UpdateClients(updatedCfg)
+	})
 	s.localPassword = optionState.localPassword
 
 	// Setup routes
 	s.setupRoutes()
 
 	// Register Amp module using V2 interface with Context
-	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager))
+	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager, s.apiKeyIPBlacklist))
 	ctx := modules.Context{
 		Engine:         engine,
 		BaseHandler:    s.handlers,
 		Config:         cfg,
-		AuthMiddleware: AuthMiddleware(accessManager),
+		AuthMiddleware: AuthMiddleware(accessManager, s.apiKeyIPBlacklist),
 	}
 	if err := modules.RegisterModule(ctx, s.ampModule); err != nil {
 		log.Errorf("Failed to register Amp module: %v", err)
@@ -301,6 +321,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// or when a local management password is provided (e.g. TUI mode).
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
 	s.managementRoutesEnabled.Store(hasManagementSecret)
+	redisqueue.SetEnabled(hasManagementSecret)
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
@@ -326,9 +347,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
-	s.engine.GET("/healthz", func(c *gin.Context) {
+	healthzHandler := func(c *gin.Context) {
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
+
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
+	}
+	s.engine.GET("/healthz", healthzHandler)
+	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
@@ -339,11 +367,13 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
+		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
+		v1.POST("/images/edits", openaiHandlers.ImagesEdits)
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
@@ -351,9 +381,18 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
+	// Codex CLI direct route aliases (chatgpt_base_url compatible)
+	codexDirect := s.engine.Group("/backend-api/codex")
+	codexDirect.Use(AuthMiddleware(s.accessManager))
+	{
+		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
+		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
+		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
+	}
+
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist))
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -361,7 +400,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	// Root endpoint
-	s.engine.GET("/", func(c *gin.Context) {
+	s.engine.GET("/", s.apiKeyIPBlacklistMiddleware(), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "CLI Proxy API Server",
 			"endpoints": []string{
@@ -504,7 +543,7 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.wsRoutes[trimmed] = struct{}{}
 	s.wsRouteMu.Unlock()
 
-	authMiddleware := AuthMiddleware(s.accessManager)
+	authMiddleware := AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist)
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {
 			c.Next()
@@ -539,6 +578,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
+		mgmt.GET("/api-key-ip-blacklist", s.mgmt.GetAPIKeyIPBlacklist)
+		mgmt.POST("/api-key-ip-blacklist", s.mgmt.PostAPIKeyIPBlacklist)
+		mgmt.DELETE("/api-key-ip-blacklist", s.mgmt.DeleteAPIKeyIPBlacklist)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
 
 		mgmt.GET("/debug", s.mgmt.GetDebug)
@@ -582,6 +624,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
+		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
 
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
@@ -596,6 +639,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/request-log", s.mgmt.GetRequestLog)
 		mgmt.PUT("/request-log", s.mgmt.PutRequestLog)
 		mgmt.PATCH("/request-log", s.mgmt.PutRequestLog)
+		mgmt.GET("/request-log-success-body", s.mgmt.GetRequestLogSuccessBody)
+		mgmt.PUT("/request-log-success-body", s.mgmt.PutRequestLogSuccessBody)
+		mgmt.PATCH("/request-log-success-body", s.mgmt.PutRequestLogSuccessBody)
+		mgmt.GET("/detailed-api-error-body-log-format", s.mgmt.GetDetailedAPIErrorBodyLogFormat)
+		mgmt.PUT("/detailed-api-error-body-log-format", s.mgmt.PutDetailedAPIErrorBodyLogFormat)
+		mgmt.PATCH("/detailed-api-error-body-log-format", s.mgmt.PutDetailedAPIErrorBodyLogFormat)
 		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)
@@ -700,9 +749,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/gitlab-auth-url", s.mgmt.RequestGitLabPATToken)
 		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
-		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)
 		mgmt.GET("/kilo-auth-url", s.mgmt.RequestKiloToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
+		mgmt.GET("/qwen-auth-url", s.mgmt.RequestQwenToken)
 		mgmt.GET("/iflow-auth-url", s.mgmt.RequestIFlowToken)
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
@@ -861,26 +910,98 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
+	addr := s.server.Addr
+	listener, errListen := net.Listen("tcp", addr)
+	if errListen != nil {
+		return fmt.Errorf("failed to start HTTP server: %v", errListen)
+	}
+
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
-		cert := strings.TrimSpace(s.cfg.TLS.Cert)
-		key := strings.TrimSpace(s.cfg.TLS.Key)
-		if cert == "" || key == "" {
+		certPath := strings.TrimSpace(s.cfg.TLS.Cert)
+		keyPath := strings.TrimSpace(s.cfg.TLS.Key)
+		if certPath == "" || keyPath == "" {
+			if errClose := listener.Close(); errClose != nil {
+				log.Errorf("failed to close listener after TLS validation failure: %v", errClose)
+			}
 			return fmt.Errorf("failed to start HTTPS server: tls.cert or tls.key is empty")
 		}
-		log.Debugf("Starting API server on %s with TLS", s.server.Addr)
-		if errServeTLS := s.server.ListenAndServeTLS(cert, key); errServeTLS != nil && !errors.Is(errServeTLS, http.ErrServerClosed) {
-			return fmt.Errorf("failed to start HTTPS server: %v", errServeTLS)
+		certPair, errLoad := tls.LoadX509KeyPair(certPath, keyPath)
+		if errLoad != nil {
+			if errClose := listener.Close(); errClose != nil {
+				log.Errorf("failed to close listener after TLS key pair load failure: %v", errClose)
+			}
+			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{certPair},
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+		s.server.TLSConfig = tlsConfig
+		if errHTTP2 := http2.ConfigureServer(s.server, &http2.Server{}); errHTTP2 != nil {
+			log.Warnf("failed to configure HTTP/2: %v", errHTTP2)
+		}
+		listener = tls.NewListener(listener, tlsConfig)
+		log.Debugf("Starting API server on %s with TLS", addr)
+	} else {
+		log.Debugf("Starting API server on %s", addr)
+	}
+
+	httpListener := newMuxListener(listener.Addr(), 1024)
+	s.muxBaseListener = listener
+	s.muxHTTPListener = httpListener
+
+	httpErrCh := make(chan error, 1)
+	acceptErrCh := make(chan error, 1)
+
+	go func() {
+		httpErrCh <- s.server.Serve(httpListener)
+	}()
+	go func() {
+		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
+	}()
+
+	select {
+	case errServe := <-httpErrCh:
+		if s.muxBaseListener != nil {
+			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+				log.Debugf("failed to close shared listener after HTTP serve exit: %v", errClose)
+			}
+		}
+		if s.muxHTTPListener != nil {
+			_ = s.muxHTTPListener.Close()
+		}
+		errAccept := <-acceptErrCh
+		errServe = normalizeHTTPServeError(errServe)
+		errAccept = normalizeListenerError(errAccept)
+		if errServe != nil {
+			return fmt.Errorf("failed to start HTTP server: %v", errServe)
+		}
+		if errAccept != nil {
+			return fmt.Errorf("failed to start HTTP server: %v", errAccept)
+		}
+		return nil
+	case errAccept := <-acceptErrCh:
+		if s.muxHTTPListener != nil {
+			_ = s.muxHTTPListener.Close()
+		}
+		if s.muxBaseListener != nil {
+			if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+				log.Debugf("failed to close shared listener after accept loop exit: %v", errClose)
+			}
+		}
+		errServe := <-httpErrCh
+		errServe = normalizeHTTPServeError(errServe)
+		errAccept = normalizeListenerError(errAccept)
+		if errAccept != nil {
+			return fmt.Errorf("failed to start HTTP server: %v", errAccept)
+		}
+		if errServe != nil {
+			return fmt.Errorf("failed to start HTTP server: %v", errServe)
 		}
 		return nil
 	}
-
-	log.Debugf("Starting API server on %s", s.server.Addr)
-	if errServe := s.server.ListenAndServe(); errServe != nil && !errors.Is(errServe, http.ErrServerClosed) {
-		return fmt.Errorf("failed to start HTTP server: %v", errServe)
-	}
-
-	return nil
 }
 
 // Stop gracefully shuts down the API server without interrupting any
@@ -898,6 +1019,15 @@ func (s *Server) Stop(ctx context.Context) error {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
+		}
+	}
+
+	if s.muxHTTPListener != nil {
+		_ = s.muxHTTPListener.Close()
+	}
+	if s.muxBaseListener != nil {
+		if errClose := s.muxBaseListener.Close(); errClose != nil && !errors.Is(errClose, net.ErrClosed) {
+			log.Debugf("failed to close shared listener: %v", errClose)
 		}
 	}
 
@@ -985,10 +1115,16 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	}
 
+	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
+		log.Infof("disable-image-generation updated: %v -> %v", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)
+	}
+
 	applySignatureCacheConfig(oldCfg, cfg)
 
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
+		s.handlers.AuthManager.SetFallbackModels(cfg.Routing.FallbackModels)
+		s.handlers.AuthManager.SetFallbackChain(cfg.Routing.FallbackChain, cfg.Routing.FallbackMaxDepth)
 	}
 
 	// Update log level dynamically when debug flag changes
@@ -1027,6 +1163,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			s.managementRoutesEnabled.Store(!newSecretEmpty)
 		}
 	}
+	redisqueue.SetEnabled(s.managementRoutesEnabled.Load())
 
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
@@ -1071,6 +1208,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	openAICompatCount := 0
 	for i := range cfg.OpenAICompatibility {
 		entry := cfg.OpenAICompatibility[i]
+		if entry.Disabled {
+			continue
+		}
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
 
@@ -1095,18 +1235,52 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 
 // (management handlers moved to internal/api/handlers/management)
 
+func (s *Server) apiKeyIPBlacklistMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.apiKeyIPBlacklist != nil {
+			if blockedEntry, blocked := s.apiKeyIPBlacklist.IsBlocked(c.ClientIP()); blocked {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error":                   "IP blocked due to repeated invalid API key attempts",
+					"blocked-until":           blockedEntry.BlockedUntil,
+					"remaining-block-seconds": blockedEntry.RemainingBlockSeconds,
+				})
+				return
+			}
+		}
+		c.Next()
+	}
+}
+
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,
 // it allows all requests (legacy behaviour).
-func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
+func AuthMiddleware(manager *sdkaccess.Manager, apiKeyIPBlacklist ...*managementHandlers.APIKeyIPBlacklistStore) gin.HandlerFunc {
+	var blacklist *managementHandlers.APIKeyIPBlacklistStore
+	if len(apiKeyIPBlacklist) > 0 {
+		blacklist = apiKeyIPBlacklist[0]
+	}
 	return func(c *gin.Context) {
 		if manager == nil {
 			c.Next()
 			return
 		}
 
+		if blacklist != nil {
+			if blockedEntry, blocked := blacklist.IsBlocked(c.ClientIP()); blocked {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error":                   "IP blocked due to repeated invalid API key attempts",
+					"blocked-until":           blockedEntry.BlockedUntil,
+					"remaining-block-seconds": blockedEntry.RemainingBlockSeconds,
+				})
+				return
+			}
+		}
+
 		result, err := manager.Authenticate(c.Request.Context(), c.Request)
 		if err == nil {
+			if blacklist != nil && result != nil && result.ProviderType == sdkaccess.AccessProviderTypeConfigAPIKey {
+				blacklist.ResetFailures(c.ClientIP())
+			}
 			if result != nil {
 				c.Set("apiKey", result.Principal)
 				c.Set("accessProvider", result.Provider)
@@ -1119,6 +1293,9 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		}
 
 		statusCode := err.HTTPStatusCode()
+		if blacklist != nil && statusCode == http.StatusUnauthorized && sdkaccess.IsAuthErrorCode(err, sdkaccess.AuthErrorCodeInvalidCredential) && strings.EqualFold(strings.TrimSpace(err.ProviderType), sdkaccess.AccessProviderTypeConfigAPIKey) {
+			blacklist.RecordFailure(c.ClientIP())
+		}
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
 		}
@@ -1139,20 +1316,17 @@ func applySignatureCacheConfig(oldCfg, cfg *config.Config) {
 	if oldCfg == nil {
 		cache.SetSignatureCacheEnabled(newVal)
 		cache.SetSignatureBypassStrictMode(newStrict)
-		log.Debugf("antigravity_signature_cache_enabled toggled to %t", newVal)
 		return
 	}
 
 	oldVal := configuredSignatureCacheEnabled(oldCfg)
 	if oldVal != newVal {
 		cache.SetSignatureCacheEnabled(newVal)
-		log.Debugf("antigravity_signature_cache_enabled updated from %t to %t", oldVal, newVal)
 	}
 
 	oldStrict := configuredSignatureBypassStrict(oldCfg)
 	if oldStrict != newStrict {
 		cache.SetSignatureBypassStrictMode(newStrict)
-		log.Debugf("antigravity_signature_bypass_strict updated from %t to %t", oldStrict, newStrict)
 	}
 }
 

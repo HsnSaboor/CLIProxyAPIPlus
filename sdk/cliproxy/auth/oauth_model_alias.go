@@ -334,6 +334,33 @@ func resolveRequestedModelForAuth(m *Manager, auth *Auth, channel string, candid
 	return ""
 }
 
+func configuredAliasTargetForCandidate(m *Manager, channel, candidate string, requestResult thinking.SuffixResult) string {
+	if m == nil {
+		return ""
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	if channel == "" {
+		return ""
+	}
+	key := strings.ToLower(strings.TrimSpace(candidate))
+	if key == "" {
+		return ""
+	}
+	raw := m.oauthModelAlias.Load()
+	table, _ := raw.(*oauthModelAliasTable)
+	if table == nil || table.reverse == nil || table.fork == nil {
+		return ""
+	}
+	if !table.fork[channel][key] {
+		return ""
+	}
+	original := strings.TrimSpace(table.reverse[channel][key])
+	if original == "" || strings.EqualFold(original, candidate) {
+		return ""
+	}
+	return preserveResolvedModelSuffix(original, requestResult)
+}
+
 func (m *Manager) resolveBlockedForkAliasTarget(auth *Auth, requestedModel string) string {
 	if m == nil || auth == nil {
 		return ""
@@ -391,7 +418,7 @@ func modelAliasChannel(auth *Auth) string {
 // and auth kind. Returns empty string if the provider/authKind combination doesn't support
 // OAuth model alias (e.g., API key authentication).
 //
-// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kiro, github-copilot, kimi, kilo, kilocode.
+// Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, iflow, kiro, github-copilot, kimi.
 func OAuthModelAliasChannel(provider, authKind string) string {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	authKind = strings.ToLower(strings.TrimSpace(authKind))
@@ -415,7 +442,7 @@ func OAuthModelAliasChannel(provider, authKind string) string {
 			return ""
 		}
 		return "codex"
-	case "gemini-cli", "aistudio", "antigravity", "qwen", "iflow", "kiro", "cline", "github-copilot", "kimi", "kilo", "kilocode":
+	case "gemini-cli", "aistudio", "antigravity", "iflow", "kiro", "github-copilot", "kimi":
 		return provider
 	default:
 		return ""

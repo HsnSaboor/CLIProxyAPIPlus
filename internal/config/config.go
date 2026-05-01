@@ -69,6 +69,10 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh worker pool.
+	// When <= 0, the default worker count is used.
+	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
@@ -91,6 +95,10 @@ type Config struct {
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
+
+	// APIKeyIPBlacklist configures automatic temporary IP blocking for repeated
+	// invalid inline API key attempts on the main API surface.
+	APIKeyIPBlacklist APIKeyIPBlacklistConfig `yaml:"api-key-ip-blacklist,omitempty" json:"api-key-ip-blacklist,omitempty"`
 
 	// AntigravitySignatureCacheEnabled controls whether signature cache validation is enabled for thinking blocks.
 	// When true (default), cached signatures are preferred and validated.
@@ -149,7 +157,8 @@ type Config struct {
 	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
 	OAuthModelAlias map[string][]OAuthModelAlias `yaml:"oauth-model-alias,omitempty" json:"oauth-model-alias,omitempty"`
 
-	// Payload defines default and override rules for provider payload parameters.
+	OAuthEndpointOverrides map[string]OAuthEndpointConfig `yaml:"oauth-endpoint-overrides,omitempty" json:"oauth-endpoint-overrides,omitempty"`
+
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.
@@ -226,8 +235,9 @@ type QuotaExceeded struct {
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
 
-	// AntigravityCredits indicates whether to retry Antigravity quota_exhausted 429s once
-	// on the same credential with enabledCreditTypes=["GOOGLE_ONE_AI"].
+	// AntigravityCredits enables credits-based last-resort fallback for Claude models.
+	// When all free-tier auths are exhausted (429/503), the conductor retries with
+	// an auth that has available Google One AI credits.
 	AntigravityCredits bool `yaml:"antigravity-credits" json:"antigravity-credits"`
 }
 
@@ -253,9 +263,35 @@ type RoutingConfig struct {
 	// FallbackMaxDepth limits the number of fallback attempts (default: 3).
 	FallbackMaxDepth int `yaml:"fallback-max-depth,omitempty" json:"fallback-max-depth,omitempty"`
 
+	// ClaudeCodeSessionAffinity enables session-sticky routing for Claude Code clients.
+	// When enabled, requests with the same session ID (extracted from metadata.user_id)
+	// are routed to the same auth credential when available.
+	// Deprecated: Use SessionAffinity instead for universal session support.
+	ClaudeCodeSessionAffinity bool `yaml:"claude-code-session-affinity,omitempty" json:"claude-code-session-affinity,omitempty"`
+
+	// SessionAffinity enables universal session-sticky routing for all clients.
+	// Session IDs are extracted from multiple sources:
+	// metadata.user_id (Claude Code session format), X-Session-ID, Session_id (Codex),
+	// X-Amp-Thread-Id (Amp CLI thread), X-Client-Request-Id (PI), metadata.user_id,
+	// conversation_id, or message hash.
+	// Automatic failover is always enabled when bound auth becomes unavailable.
+	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+
+	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
+	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
+	SessionAffinityTTL string `yaml:"session-affinity-ttl,omitempty" json:"session-affinity-ttl,omitempty"`
+
 	// TokenThresholdRules defines routing rules that filter eligible credentials
 	// by billing class when the estimated input token count is at or below a threshold.
 	TokenThresholdRules []TokenThresholdRule `yaml:"token-threshold-rules,omitempty" json:"token-threshold-rules,omitempty"`
+}
+
+// APIKeyIPBlacklistConfig defines the automatic IP blacklist policy applied to
+// repeated invalid inline API key attempts on the main API.
+type APIKeyIPBlacklistConfig struct {
+	FailureThreshold int    `yaml:"failure-threshold,omitempty" json:"failure-threshold,omitempty"`
+	FailureWindow    string `yaml:"failure-window,omitempty" json:"failure-window,omitempty"`
+	BlockDuration    string `yaml:"block-duration,omitempty" json:"block-duration,omitempty"`
 }
 
 // BillingClass identifies how a credential/provider is billed for routing policy.
@@ -286,6 +322,38 @@ type OAuthModelAlias struct {
 	Name  string `yaml:"name" json:"name"`
 	Alias string `yaml:"alias" json:"alias"`
 	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
+}
+
+type OAuthEndpointConfig struct {
+	ApiBaseURL         string `yaml:"api-base-url,omitempty" json:"api-base-url,omitempty"`
+	AuthorizeURL       string `yaml:"authorize-url,omitempty" json:"authorize-url,omitempty"`
+	TokenURL           string `yaml:"token-url,omitempty" json:"token-url,omitempty"`
+	RefreshURL         string `yaml:"refresh-url,omitempty" json:"refresh-url,omitempty"`
+	UserinfoURL        string `yaml:"userinfo-url,omitempty" json:"userinfo-url,omitempty"`
+	DeviceAuthorizeURL string `yaml:"device-authorize-url,omitempty" json:"device-authorize-url,omitempty"`
+}
+
+func (c *OAuthEndpointConfig) ApplyDefaults(defaults OAuthEndpointConfig) OAuthEndpointConfig {
+	result := *c
+	if result.ApiBaseURL == "" {
+		result.ApiBaseURL = defaults.ApiBaseURL
+	}
+	if result.AuthorizeURL == "" {
+		result.AuthorizeURL = defaults.AuthorizeURL
+	}
+	if result.TokenURL == "" {
+		result.TokenURL = defaults.TokenURL
+	}
+	if result.RefreshURL == "" {
+		result.RefreshURL = defaults.RefreshURL
+	}
+	if result.UserinfoURL == "" {
+		result.UserinfoURL = defaults.UserinfoURL
+	}
+	if result.DeviceAuthorizeURL == "" {
+		result.DeviceAuthorizeURL = defaults.DeviceAuthorizeURL
+	}
+	return result
 }
 
 // AmpModelMapping defines a model name mapping for Amp CLI requests.
@@ -616,6 +684,9 @@ type OpenAICompatibility struct {
 	// BillingClass classifies this provider for threshold-based routing policies.
 	BillingClass BillingClass `yaml:"billing-class,omitempty" json:"billing-class,omitempty"`
 
+	// Disabled prevents this provider from being used for routing.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
+
 	// Prefix optionally namespaces model aliases for this provider (e.g., "teamA/kimi-k2").
 	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
@@ -702,6 +773,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
+	cfg.DisableImageGeneration = DisableImageGenerationOff
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
@@ -791,11 +863,16 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize token-threshold routing rules.
 	cfg.SanitizeTokenThresholdRules()
 
+	// Normalize automatic API-key IP blacklist policy.
+	cfg.SanitizeAPIKeyIPBlacklist()
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
 	// Normalize global OAuth model name aliases.
 	cfg.SanitizeOAuthModelAlias()
+
+	cfg.NormalizeOAuthEndpointOverrides()
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
@@ -814,6 +891,19 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// SanitizeAPIKeyIPBlacklist trims user-provided duration strings and clamps the
+// failure threshold to a non-negative value.
+func (cfg *Config) SanitizeAPIKeyIPBlacklist() {
+	if cfg == nil {
+		return
+	}
+	if cfg.APIKeyIPBlacklist.FailureThreshold < 0 {
+		cfg.APIKeyIPBlacklist.FailureThreshold = 0
+	}
+	cfg.APIKeyIPBlacklist.FailureWindow = strings.TrimSpace(cfg.APIKeyIPBlacklist.FailureWindow)
+	cfg.APIKeyIPBlacklist.BlockDuration = strings.TrimSpace(cfg.APIKeyIPBlacklist.BlockDuration)
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
@@ -1141,6 +1231,40 @@ func normalizeModelPrefix(prefix string) string {
 		return ""
 	}
 	return trimmed
+}
+
+func (cfg *Config) NormalizeOAuthEndpointOverrides() {
+	if cfg == nil || len(cfg.OAuthEndpointOverrides) == 0 {
+		return
+	}
+	normalized := make(map[string]OAuthEndpointConfig, len(cfg.OAuthEndpointOverrides))
+	for provider, ep := range cfg.OAuthEndpointOverrides {
+		normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
+		if normalizedProvider == "" {
+			continue
+		}
+		ep.ApiBaseURL = strings.TrimSpace(ep.ApiBaseURL)
+		ep.AuthorizeURL = strings.TrimSpace(ep.AuthorizeURL)
+		ep.TokenURL = strings.TrimSpace(ep.TokenURL)
+		ep.RefreshURL = strings.TrimSpace(ep.RefreshURL)
+		ep.UserinfoURL = strings.TrimSpace(ep.UserinfoURL)
+		ep.DeviceAuthorizeURL = strings.TrimSpace(ep.DeviceAuthorizeURL)
+		normalized[normalizedProvider] = ep
+	}
+	cfg.OAuthEndpointOverrides = normalized
+}
+
+func (cfg *Config) GetOAuthEndpointOverride(provider string) OAuthEndpointConfig {
+	if cfg == nil {
+		return OAuthEndpointConfig{}
+	}
+	normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
+	if cfg.OAuthEndpointOverrides != nil {
+		if ep, ok := cfg.OAuthEndpointOverrides[normalizedProvider]; ok {
+			return ep
+		}
+	}
+	return OAuthEndpointConfig{}
 }
 
 // looksLikeBcrypt returns true if the provided string appears to be a bcrypt hash.

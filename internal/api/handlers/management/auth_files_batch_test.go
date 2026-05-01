@@ -9,12 +9,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestUploadAuthFile_BatchMultipart(t *testing.T) {
@@ -74,8 +74,8 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected uploaded file %s to exist: %v", file.name, err)
 		}
-		if !assert.JSONEq(t, file.content, string(data)) {
-			t.Fatalf("expected file %s JSON to match", file.name)
+		if !jsonStringEqual(file.content, string(data)) {
+			t.Fatalf("expected file %s content %q, got %q", file.name, file.content, string(data))
 		}
 	}
 
@@ -138,7 +138,7 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	if err != nil {
 		t.Fatalf("expected existing auth file to remain readable: %v", err)
 	}
-	if string(data) != existingContent {
+	if !jsonStringEqual(existingContent, string(data)) {
 		t.Fatalf("expected existing auth file to remain %q, got %q", existingContent, string(data))
 	}
 
@@ -146,9 +146,21 @@ func TestUploadAuthFile_BatchMultipart_InvalidJSONDoesNotOverwriteExistingFile(t
 	if err != nil {
 		t.Fatalf("expected valid auth file to be created: %v", err)
 	}
-	if !assert.JSONEq(t, files[1].content, string(betaData)) {
-		t.Fatalf("expected beta auth file JSON to match")
+	if !jsonStringEqual(files[1].content, string(betaData)) {
+		t.Fatalf("expected beta auth file content %q, got %q", files[1].content, string(betaData))
 	}
+}
+
+func jsonStringEqual(want, got string) bool {
+	var wantValue any
+	if err := json.Unmarshal([]byte(want), &wantValue); err != nil {
+		return false
+	}
+	var gotValue any
+	if err := json.Unmarshal([]byte(got), &gotValue); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(wantValue, gotValue)
 }
 
 func TestDeleteAuthFile_BatchQuery(t *testing.T) {
