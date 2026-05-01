@@ -11,10 +11,13 @@ import (
 	"io"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
@@ -25,20 +28,57 @@ import (
 var aiAPIPrefixes = []string{
 	"/v1/chat/completions",
 	"/v1/completions",
+	"/v1/images",
 	"/v1/messages",
 	"/v1/responses",
 	"/v1beta/models/",
 	"/api/provider/",
 }
 
-const skipGinLogKey = "__gin_skip_request_logging__"
-const requestBodyKey = "__gin_request_body__"
-const providerAuthContextKey = "cliproxy.provider_auth"
-const ginProviderAuthKey = "providerAuth"
-const fallbackInfoContextKey = "cliproxy.fallback_info"
-const ginFallbackInfoKey = "fallbackInfo"
-const billingDecisionContextKey = "cliproxy.billing_decision"
-const ginBillingDecisionKey = "billingClassDecision"
+const (
+	skipGinLogKey                  = "__gin_skip_request_logging__"
+	requestBodyKey                 = "__gin_request_body__"
+	creditsUsedKey                 = "__antigravity_credits_used__"
+	providerAuthContextKey         = "cliproxy.provider_auth"
+	ginProviderAuthKey             = "providerAuth"
+	fallbackInfoContextKey         = "cliproxy.fallback_info"
+	ginFallbackInfoKey             = "fallbackInfo"
+	billingDecisionContextKey      = "cliproxy.billing_decision"
+	ginBillingDecisionKey          = "billingClassDecision"
+	ginAPIRequestSummaryKey        = "API_REQUEST_SUMMARY"
+	defaultDetailedAPILogBodyLimit = 4096
+)
+
+func detailedAPILogBodyLimit(cfg *config.Config) int {
+	if cfg == nil || cfg.DetailedAPIErrorBodyLogLimit == 0 {
+		return defaultDetailedAPILogBodyLimit
+	}
+	return cfg.DetailedAPIErrorBodyLogLimit
+}
+
+func truncateDetailedAPILogBody(body string, limit int) string {
+	if limit < 0 || len(body) <= limit {
+		return body
+	}
+	if limit == 0 {
+		return "...[truncated]"
+	}
+	if !utf8.ValidString(body[:limit]) {
+		for limit > 0 && !utf8.ValidString(body[:limit]) {
+			limit--
+		}
+	}
+	return body[:limit] + "...[truncated]"
+}
+
+func formatDetailedLogBody(cfg *config.Config, body []byte) string {
+	if len(body) == 0 {
+		return "\"\""
+	}
+	formatted := strings.ToValidUTF8(string(body), "�")
+	formatted = truncateDetailedAPILogBody(formatted, detailedAPILogBodyLimit(cfg))
+	return strconv.QuoteToASCII(formatted)
+}
 
 func getProviderAuthFromContext(c *gin.Context) (provider, authID, authLabel string) {
 	if c == nil {
@@ -130,6 +170,33 @@ func getBillingDecisionFromContext(c *gin.Context) (billingClass, reason string)
 	return "", ""
 }
 
+func getUpstreamRequestInfoFromContext(c *gin.Context) (url, model string) {
+	if c == nil {
+		return "", ""
+	}
+	if v, exists := c.Get(ginAPIRequestSummaryKey); exists {
+		switch summary := v.(type) {
+		case map[string]string:
+			return strings.TrimSpace(summary["url"]), strings.TrimSpace(summary["model"])
+		}
+	}
+
+	if apiRequest, exists := c.Get("API_REQUEST"); exists {
+		if bodyBytes, ok := apiRequest.([]byte); ok && len(bodyBytes) > 0 {
+			text := string(bodyBytes)
+			if idx := strings.LastIndex(text, "Upstream URL: "); idx >= 0 {
+				line := text[idx+len("Upstream URL: "):]
+				if end := strings.IndexByte(line, '\n'); end >= 0 {
+					url = strings.TrimSpace(line[:end])
+				} else {
+					url = strings.TrimSpace(line)
+				}
+			}
+		}
+	}
+	return url, ""
+}
+
 // GinLogrusLogger returns a Gin middleware handler that logs HTTP requests and responses
 // using logrus. It captures request details including method, path, status code, latency,
 // client IP, model name, and auth key name. Request ID is only added for AI API requests.
@@ -139,7 +206,7 @@ func getBillingDecisionFromContext(c *gin.Context) (billingClass, reason string)
 //
 // Returns:
 //   - gin.HandlerFunc: A middleware handler for request logging
-func GinLogrusLogger() gin.HandlerFunc {
+func GinLogrusLogger(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
@@ -182,7 +249,44 @@ func GinLogrusLogger() gin.HandlerFunc {
 		statusCode := c.Writer.Status()
 		clientIP := c.ClientIP()
 		method := c.Request.Method
-		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
+		errorMessage := strings.TrimSpace(c.Errors.ByType(gin.ErrorTypePrivate).String())
+
+		modelName := ""
+		if len(requestBody) == 0 {
+			if storedBody, exists := c.Get(requestBodyKey); exists {
+				if bodyBytes, ok := storedBody.([]byte); ok {
+					requestBody = bodyBytes
+				}
+			}
+		}
+		if len(requestBody) > 0 {
+			modelName = gjson.GetBytes(requestBody, "model").String()
+			modelName = strings.TrimSpace(modelName)
+		}
+
+		authKeyName := ""
+		if apiKey, exists := c.Get("apiKey"); exists {
+			if keyStr, ok := apiKey.(string); ok {
+				authKeyName = keyStr
+			}
+		}
+
+		provider, authID, authLabel := getProviderAuthFromContext(c)
+		requestedModel, actualModel := getFallbackInfoFromContext(c)
+		billingClass, billingReason := getBillingDecisionFromContext(c)
+		upstreamURL, upstreamModel := getUpstreamRequestInfoFromContext(c)
+		providerInfo := ""
+		if provider != "" {
+			displayAuth := authLabel
+			if displayAuth == "" {
+				displayAuth = authID
+			}
+			if displayAuth != "" {
+				providerInfo = fmt.Sprintf("%s:%s", provider, displayAuth)
+			} else {
+				providerInfo = provider
+			}
+		}
 
 		modelName := ""
 		if len(requestBody) == 0 {
@@ -230,6 +334,10 @@ func GinLogrusLogger() gin.HandlerFunc {
 			displayModelName := modelName
 			if requestedModel != "" && actualModel != "" && requestedModel != actualModel {
 				displayModelName = fmt.Sprintf("%s → %s", requestedModel, actualModel)
+			} else if displayModelName != "" && upstreamModel != "" && displayModelName != upstreamModel {
+				displayModelName = fmt.Sprintf("%s → %s", displayModelName, upstreamModel)
+			} else if displayModelName == "" && upstreamModel != "" {
+				displayModelName = upstreamModel
 			}
 
 			if displayModelName != "" && providerInfo != "" {
@@ -261,6 +369,10 @@ func GinLogrusLogger() gin.HandlerFunc {
 			}
 		}
 
+		if isAIAPIPath(path) && upstreamURL != "" {
+			logLine = logLine + " | upstream=" + upstreamURL
+		}
+
 		// Append token usage if available
 		if isAIAPIPath(path) {
 			detail := getUsageDetailFromContext(c)
@@ -270,8 +382,23 @@ func GinLogrusLogger() gin.HandlerFunc {
 			}
 		}
 
+		if creditsUsed(c) {
+			logLine += " [credits]"
+		}
 		if errorMessage != "" {
-			logLine = logLine + " | " + errorMessage
+			logLine = logLine + " | " + truncateDetailedAPILogBody(strings.ToValidUTF8(errorMessage, "�"), detailedAPILogBodyLimit(cfg))
+		}
+
+		logBodies := isAIAPIPath(path) && (statusCode >= http.StatusBadRequest || (cfg != nil && cfg.RequestLogSuccessBody))
+		if logBodies {
+			if len(requestBody) > 0 {
+				logLine = logLine + " | request=" + formatDetailedLogBody(cfg, requestBody)
+			}
+			if apiResponse, exists := c.Get("API_RESPONSE"); exists {
+				if bodyBytes, ok := apiResponse.([]byte); ok && len(bodyBytes) > 0 {
+					logLine = logLine + " | response=" + formatDetailedLogBody(cfg, bodyBytes)
+				}
+			}
 		}
 
 		entry := log.WithField("request_id", requestID)
@@ -358,4 +485,16 @@ func GetRequestBody(c *gin.Context) []byte {
 		return body
 	}
 	return nil
+}
+
+func creditsUsed(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	val, exists := c.Get(creditsUsedKey)
+	if !exists {
+		return false
+	}
+	flag, ok := val.(bool)
+	return ok && flag
 }

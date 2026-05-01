@@ -28,7 +28,7 @@ func (h *Handler) GetConfig(c *gin.Context) {
 		c.JSON(200, gin.H{})
 		return
 	}
-	c.JSON(200, new(*h.cfg))
+	c.JSON(200, h.cfg)
 }
 
 type releaseInfo struct {
@@ -159,6 +159,9 @@ func (h *Handler) PutConfigYAML(c *gin.Context) {
 		return
 	}
 	h.cfg = newCfg
+	h.mu.Unlock()
+	h.applyRuntimeConfig(newCfg)
+	h.mu.Lock()
 	c.JSON(http.StatusOK, gin.H{"ok": true, "changed": []string{"config"}})
 }
 
@@ -245,6 +248,43 @@ func (h *Handler) PutErrorLogsMaxFiles(c *gin.Context) {
 func (h *Handler) GetRequestLog(c *gin.Context) { c.JSON(200, gin.H{"request-log": h.cfg.RequestLog}) }
 func (h *Handler) PutRequestLog(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.RequestLog = v })
+}
+
+// Request log success body
+func (h *Handler) GetRequestLogSuccessBody(c *gin.Context) {
+	c.JSON(200, gin.H{"request-log-success-body": h.cfg.RequestLogSuccessBody})
+}
+func (h *Handler) PutRequestLogSuccessBody(c *gin.Context) {
+	h.updateBoolField(c, func(v bool) { h.cfg.RequestLogSuccessBody = v })
+}
+
+// Detailed API error body log format
+func (h *Handler) GetDetailedAPIErrorBodyLogFormat(c *gin.Context) {
+	format := strings.TrimSpace(h.cfg.DetailedAPIErrorBodyLogFormat)
+	if format == "" {
+		format = "full"
+	}
+	c.JSON(200, gin.H{"detailed-api-error-body-log-format": format})
+}
+func (h *Handler) PutDetailedAPIErrorBodyLogFormat(c *gin.Context) {
+	var body struct {
+		Value *string `json:"value"`
+	}
+	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	format := strings.ToLower(strings.TrimSpace(*body.Value))
+	switch format {
+	case "", "full":
+		h.cfg.DetailedAPIErrorBodyLogFormat = "full"
+	case "summary":
+		h.cfg.DetailedAPIErrorBodyLogFormat = "summary"
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid value"})
+		return
+	}
+	h.persist(c)
 }
 
 // Websocket auth

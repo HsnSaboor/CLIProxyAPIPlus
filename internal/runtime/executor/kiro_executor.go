@@ -896,7 +896,6 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				log.Warnf("kiro: received 401 error, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 				if refreshErr != nil {
-					log.Errorf("kiro: token refresh failed: %v", refreshErr)
 					return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 				}
 
@@ -964,7 +963,6 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 					log.Warnf("kiro: 403 appears token-related, attempting token refresh")
 					refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 					if refreshErr != nil {
-						log.Errorf("kiro: token refresh failed: %v", refreshErr)
 						// Token refresh failed - return error immediately
 						return resp, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 					}
@@ -1334,7 +1332,6 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				log.Warnf("kiro: stream received 401 error, attempting token refresh")
 				refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 				if refreshErr != nil {
-					log.Errorf("kiro: token refresh failed: %v", refreshErr)
 					return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 				}
 
@@ -1402,7 +1399,6 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 					log.Warnf("kiro: 403 appears token-related, attempting token refresh")
 					refreshedAuth, refreshErr := e.Refresh(ctx, auth)
 					if refreshErr != nil {
-						log.Errorf("kiro: token refresh failed: %v", refreshErr)
 						// Token refresh failed - return error immediately
 						return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 					}

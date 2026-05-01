@@ -2,10 +2,13 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
@@ -100,7 +103,7 @@ func payloadRequestedModel(opts cliproxyexecutor.Options, fallback string) strin
 }
 
 func applyPayloadConfigWithRoot(cfg *config.Config, model, protocol, root string, payload, original []byte, requestedModel string) []byte {
-	return helps.ApplyPayloadConfigWithRoot(cfg, model, protocol, root, payload, original, requestedModel)
+	return helps.ApplyPayloadConfigWithRoot(cfg, model, protocol, root, payload, original, requestedModel, "")
 }
 
 func summarizeErrorBody(contentType string, body []byte) string {
@@ -115,16 +118,73 @@ func logWithRequestID(ctx context.Context) *log.Entry {
 	return helps.LogWithRequestID(ctx)
 }
 
-func logDetailedAPIError(ctx context.Context, provider string, model string, url string, statusCode int, contentType string, body []byte) {
+const defaultDetailedAPILogBodyLimit = 4096
+
+func detailedAPILogBodyLimit(cfg *config.Config) int {
+	if cfg == nil || cfg.DetailedAPIErrorBodyLogLimit == 0 {
+		return defaultDetailedAPILogBodyLimit
+	}
+	return cfg.DetailedAPIErrorBodyLogLimit
+}
+
+func truncateDetailedAPILogBody(body string, limit int) string {
+	if limit < 0 || len(body) <= limit {
+		return body
+	}
+	if limit == 0 {
+		return "...[truncated]"
+	}
+	if !utf8.ValidString(body[:limit]) {
+		for limit > 0 && !utf8.ValidString(body[:limit]) {
+			limit--
+		}
+	}
+	return body[:limit] + "...[truncated]"
+}
+
+func formatDetailedAPILogBody(cfg *config.Config, contentType string, body []byte) string {
+	if len(body) == 0 {
+		return "<empty>"
+	}
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.DetailedAPIErrorBodyLogFormat), "summary") {
+		return summarizeErrorBody(contentType, body)
+	}
+	formatted := strings.ToValidUTF8(string(body), "�")
+	formatted = truncateDetailedAPILogBody(formatted, detailedAPILogBodyLimit(cfg))
+	return strconv.QuoteToASCII(formatted)
+}
+
+func sanitizeDetailedAPIRequestBody(body []byte) []byte {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" || !strings.HasPrefix(trimmed, "{") {
+		return body
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	if _, exists := payload["messages"]; !exists {
+		return body
+	}
+	cleaned := make(map[string]any, len(payload))
+	for k, v := range payload {
+		if k == "messages" {
+			continue
+		}
+		cleaned[k] = v
+	}
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
+func logDetailedAPIError(ctx context.Context, cfg *config.Config, provider string, model string, url string, statusCode int, contentType string, requestBody []byte, responseBody []byte) {
 	entry := logWithRequestID(ctx)
 	logFn := entry.Warnf
 	if statusCode >= 500 {
 		logFn = entry.Errorf
-	}
-
-	bodyStr := string(body)
-	if len(bodyStr) > 4096 {
-		bodyStr = bodyStr[:4096] + "...[truncated]"
 	}
 
 	providerDisplay := provider
@@ -142,8 +202,14 @@ func logDetailedAPIError(ctx context.Context, provider string, model string, url
 		providerDisplay = fmt.Sprintf("%s model=%s", providerDisplay, model)
 	}
 
-	logFn("[%s] API error - URL: %s, Status: %d, Content-Type: %s, Response: %s",
-		providerDisplay, url, statusCode, contentType, bodyStr)
+	logFn("[%s] API error - URL: %s, Status: %d, Content-Type: %s, Request: %s, Response: %s",
+		providerDisplay,
+		url,
+		statusCode,
+		contentType,
+		formatDetailedAPILogBody(cfg, "application/json", sanitizeDetailedAPIRequestBody(requestBody)),
+		formatDetailedAPILogBody(cfg, contentType, responseBody),
+	)
 }
 
 func jsonPayload(line []byte) []byte {

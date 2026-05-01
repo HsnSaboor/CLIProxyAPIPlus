@@ -334,6 +334,33 @@ func resolveRequestedModelForAuth(m *Manager, auth *Auth, channel string, candid
 	return ""
 }
 
+func configuredAliasTargetForCandidate(m *Manager, channel, candidate string, requestResult thinking.SuffixResult) string {
+	if m == nil {
+		return ""
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	if channel == "" {
+		return ""
+	}
+	key := strings.ToLower(strings.TrimSpace(candidate))
+	if key == "" {
+		return ""
+	}
+	raw := m.oauthModelAlias.Load()
+	table, _ := raw.(*oauthModelAliasTable)
+	if table == nil || table.reverse == nil || table.fork == nil {
+		return ""
+	}
+	if !table.fork[channel][key] {
+		return ""
+	}
+	original := strings.TrimSpace(table.reverse[channel][key])
+	if original == "" || strings.EqualFold(original, candidate) {
+		return ""
+	}
+	return preserveResolvedModelSuffix(original, requestResult)
+}
+
 func (m *Manager) resolveBlockedForkAliasTarget(auth *Auth, requestedModel string) string {
 	if m == nil || auth == nil {
 		return ""

@@ -43,6 +43,29 @@ type ClaudeExecutor struct {
 	cfg *config.Config
 }
 
+func resolveClaudeExecutionModel(auth *cliproxyauth.Auth, model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return model
+	}
+
+	models := registry.GetGlobalRegistry().GetModelsForClient(auth.ID)
+	for _, info := range models {
+		if info == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(info.ID), model) {
+			continue
+		}
+		if target := strings.TrimSpace(info.ExecutionTarget); target != "" {
+			return target
+		}
+		break
+	}
+
+	return model
+}
+
 // claudeToolPrefix is empty to match real Claude Code behavior (no tool name prefix).
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
@@ -96,7 +119,7 @@ func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	if req == nil {
 		return nil
 	}
-	apiKey, _ := claudeCreds(auth)
+	apiKey, _ := claudeCreds(auth, e.cfg)
 	if strings.TrimSpace(apiKey) == "" {
 		return nil
 	}
@@ -137,9 +160,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := resolveClaudeExecutionModel(auth, thinking.ParseSuffix(req.Model).ModelName)
 
-	apiKey, baseURL := claudeCreds(auth)
+	apiKey, baseURL := claudeCreds(auth, e.cfg)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
@@ -168,8 +191,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
 
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
@@ -202,6 +227,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
+	bodyForUpstream, _ = sjson.SetBytes(bodyForUpstream, "model", baseModel)
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -311,9 +337,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if opts.Alt == "responses/compact" {
 		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := resolveClaudeExecutionModel(auth, thinking.ParseSuffix(req.Model).ModelName)
 
-	apiKey, baseURL := claudeCreds(auth)
+	apiKey, baseURL := claudeCreds(auth, e.cfg)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
@@ -340,8 +366,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// based on client type and configuration.
 	body = applyCloaking(ctx, e.cfg, auth, body, baseModel, apiKey)
 
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel, requestPath)
+	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
@@ -371,6 +399,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	if experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
+	bodyForUpstream, _ = sjson.SetBytes(bodyForUpstream, "model", baseModel)
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -510,9 +539,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 }
 
 func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := resolveClaudeExecutionModel(auth, thinking.ParseSuffix(req.Model).ModelName)
 
-	apiKey, baseURL := claudeCreds(auth)
+	apiKey, baseURL := claudeCreds(auth, e.cfg)
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com"
 	}
@@ -931,7 +960,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 			hasClaude1MHeader = true
 		}
 	}
-
 	// Merge extra betas from request body and request flags.
 	if len(extraBetas) > 0 || hasClaude1MHeader {
 		existingSet := make(map[string]bool)
@@ -994,17 +1022,61 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 }
 
-func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
+func claudeCreds(a *cliproxyauth.Auth, cfg *config.Config) (apiKey, baseURL string) {
+	return claudeCredsForLLM(a, cfg)
+}
+
+func claudeCredsForLLM(a *cliproxyauth.Auth, cfg *config.Config) (apiKey, baseURL string) {
+	if a == nil {
+		if cfg != nil {
+			if override := strings.TrimSpace(cfg.GetOAuthEndpointOverride("claude").ApiBaseURL); override != "" {
+				return "", override
+			}
+		}
+		return "", ""
+	}
+	if a.Attributes != nil {
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+		baseURL = strings.TrimSpace(a.Attributes["base_url"])
+	}
+	if a.Metadata != nil {
+		if apiKey == "" {
+			if v, ok := a.Metadata["access_token"].(string); ok {
+				apiKey = strings.TrimSpace(v)
+			}
+		}
+		if baseURL == "" {
+			if v, ok := a.Metadata["base_url"].(string); ok {
+				baseURL = strings.TrimSpace(v)
+			}
+		}
+	}
+	if baseURL == "" && cfg != nil {
+		if override := strings.TrimSpace(cfg.GetOAuthEndpointOverride("claude").ApiBaseURL); override != "" {
+			baseURL = override
+		}
+	}
+	return
+}
+
+func claudeCredsForAuthLookup(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	if a == nil {
 		return "", ""
 	}
 	if a.Attributes != nil {
-		apiKey = a.Attributes["api_key"]
-		baseURL = a.Attributes["base_url"]
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+		baseURL = strings.TrimSpace(a.Attributes["base_url"])
 	}
-	if apiKey == "" && a.Metadata != nil {
-		if v, ok := a.Metadata["access_token"].(string); ok {
-			apiKey = v
+	if a.Metadata != nil {
+		if apiKey == "" {
+			if v, ok := a.Metadata["access_token"].(string); ok {
+				apiKey = strings.TrimSpace(v)
+			}
+		}
+		if baseURL == "" {
+			if v, ok := a.Metadata["base_url"].(string); ok {
+				baseURL = strings.TrimSpace(v)
+			}
 		}
 	}
 	return
@@ -1473,62 +1545,110 @@ func generateBillingHeader(payload []byte) string {
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=2.1.63.%s; cc_entrypoint=cli; cch=%s;", buildHash, cch)
 }
 
-// checkSystemInstructionsWithMode injects Claude Code-style system blocks:
-//
-//	system[0]: billing header (no cache_control)
-//	system[1]: agent identifier (no cache_control)
-//	system[2..]: user system messages (cache_control added when missing)
+// checkSystemInstructionsWithMode injects Claude Code-style system blocks.
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 	system := gjson.GetBytes(payload, "system")
 
-	billingText := generateBillingHeader(payload)
-	billingBlock := fmt.Sprintf(`{"type":"text","text":"%s"}`, billingText)
-	// No cache_control on the agent block. It is a cloaking artifact with zero cache
-	// value (the last system block is what actually triggers caching of all system content).
-	// Including any cache_control here creates an intra-system TTL ordering violation
-	// when the client's system blocks use ttl='1h' (prompt-caching-scope-2026-01-05 beta
-	// forbids 1h blocks after 5m blocks, and a no-TTL block defaults to 5m).
-	agentBlock := `{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."}`
-
-	if strictMode {
-		// Strict mode: billing header + agent identifier only
-		result := "[" + billingBlock + "," + agentBlock + "]"
-		payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
-		return payload
-	}
-
-	// Non-strict mode: billing header + agent identifier + user system messages
-	// Skip if already injected
 	firstText := gjson.GetBytes(payload, "system.0.text").String()
 	if strings.HasPrefix(firstText, "x-anthropic-billing-header:") {
 		return payload
 	}
 
-	result := "[" + billingBlock + "," + agentBlock
+	billingText := generateBillingHeader(payload)
+	billingBlock := buildTextBlock(billingText, nil)
+	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
+	staticPrompt := strings.Join([]string{
+		helps.ClaudeCodeIntro,
+		helps.ClaudeCodeSystem,
+		helps.ClaudeCodeDoingTasks,
+		helps.ClaudeCodeToneAndStyle,
+		helps.ClaudeCodeOutputEfficiency,
+	}, "\n\n")
+	staticBlock := buildTextBlock(staticPrompt, nil)
+
+	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
+	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
+
+	if strictMode {
+		return payload
+	}
+
+	var userSystemParts []string
 	if system.IsArray() {
 		system.ForEach(func(_, part gjson.Result) bool {
 			if part.Get("type").String() == "text" {
-				// Add cache_control to user system messages if not present.
-				// Do NOT add ttl — let it inherit the default (5m) to avoid
-				// TTL ordering violations with the prompt-caching-scope-2026-01-05 beta.
-				partJSON := part.Raw
-				if !part.Get("cache_control").Exists() {
-					updated, _ := sjson.SetBytes([]byte(partJSON), "cache_control.type", "ephemeral")
-					partJSON = string(updated)
+				txt := strings.TrimSpace(part.Get("text").String())
+				if txt != "" {
+					userSystemParts = append(userSystemParts, txt)
 				}
-				result += "," + partJSON
 			}
 			return true
 		})
-	} else if system.Type == gjson.String && system.String() != "" {
-		partJSON := `{"type":"text","cache_control":{"type":"ephemeral"}}`
-		updated, _ := sjson.SetBytes([]byte(partJSON), "text", system.String())
-		partJSON = string(updated)
-		result += "," + partJSON
+	} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
+		userSystemParts = append(userSystemParts, strings.TrimSpace(system.String()))
 	}
-	result += "]"
 
-	payload, _ = sjson.SetRawBytes(payload, "system", []byte(result))
+	if len(userSystemParts) > 0 {
+		payload = prependToFirstUserMessage(payload, strings.Join(userSystemParts, "\n\n"))
+	}
+
+	return payload
+}
+
+func buildTextBlock(text string, cacheControl map[string]string) string {
+	block := []byte(`{"type":"text"}`)
+	block, _ = sjson.SetBytes(block, "text", text)
+	if cacheControl != nil && len(cacheControl) > 0 {
+		cc := `{"type":"ephemeral"`
+		if ttl, ok := cacheControl["ttl"]; ok {
+			cc += fmt.Sprintf(`,"ttl":"%s"`, ttl)
+		}
+		cc += "}"
+		block, _ = sjson.SetRawBytes(block, "cache_control", []byte(cc))
+	}
+	return string(block)
+}
+
+func prependToFirstUserMessage(payload []byte, text string) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	firstUserIdx := -1
+	messages.ForEach(func(idx, msg gjson.Result) bool {
+		if msg.Get("role").String() == "user" {
+			firstUserIdx = int(idx.Int())
+			return false
+		}
+		return true
+	})
+	if firstUserIdx < 0 {
+		return payload
+	}
+
+	prefix := fmt.Sprintf(`<system-reminder>
+As you answer the user's questions, you can use the following context from the system:
+%s
+
+IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.
+</system-reminder>
+`, text)
+
+	contentPath := fmt.Sprintf("messages.%d.content", firstUserIdx)
+	content := gjson.GetBytes(payload, contentPath)
+	if content.IsArray() {
+		newBlock := fmt.Sprintf(`{"type":"text","text":%q}`, prefix)
+		var newArray string
+		if content.Raw == "[]" || content.Raw == "" {
+			newArray = "[" + newBlock + "]"
+		} else {
+			newArray = "[" + newBlock + "," + content.Raw[1:]
+		}
+		payload, _ = sjson.SetRawBytes(payload, contentPath, []byte(newArray))
+	} else if content.Type == gjson.String {
+		payload, _ = sjson.SetBytes(payload, contentPath, prefix+content.String())
+	}
 	return payload
 }
 
@@ -1681,105 +1801,11 @@ func marshalPayloadObject(original []byte, root map[string]any) []byte {
 	if root == nil {
 		return original
 	}
-	orderedKeys := extractTopLevelKeyOrder(original)
-	if len(orderedKeys) == 0 {
-		out, err := json.Marshal(root)
-		if err != nil {
-			return original
-		}
-		return out
-	}
-
-	used := make(map[string]struct{}, len(root))
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	first := true
-
-	writeField := func(key string, val any) bool {
-		keyJSON, err := json.Marshal(key)
-		if err != nil {
-			return false
-		}
-		valueJSON, err := json.Marshal(val)
-		if err != nil {
-			return false
-		}
-		if !first {
-			buf.WriteByte(',')
-		}
-		buf.Write(keyJSON)
-		buf.WriteByte(':')
-		buf.Write(valueJSON)
-		first = false
-		return true
-	}
-
-	for _, key := range orderedKeys {
-		val, ok := root[key]
-		if !ok {
-			continue
-		}
-		if !writeField(key, val) {
-			return original
-		}
-		used[key] = struct{}{}
-	}
-
-	extraKeys := make([]string, 0)
-	for key := range root {
-		if _, ok := used[key]; !ok {
-			extraKeys = append(extraKeys, key)
-		}
-	}
-	sort.Strings(extraKeys)
-	for _, key := range extraKeys {
-		if !writeField(key, root[key]) {
-			return original
-		}
-	}
-
-	buf.WriteByte('}')
-	return buf.Bytes()
-}
-
-func extractTopLevelKeyOrder(payload []byte) []string {
-	if len(payload) == 0 {
-		return nil
-	}
-
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	start, err := dec.Token()
+	out, err := json.Marshal(root)
 	if err != nil {
-		return nil
+		return original
 	}
-	startDelim, ok := start.(json.Delim)
-	if !ok || startDelim != '{' {
-		return nil
-	}
-
-	order := make([]string, 0)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return nil
-		}
-		key, ok := keyTok.(string)
-		if !ok {
-			return nil
-		}
-		order = append(order, key)
-
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			return nil
-		}
-	}
-
-	if _, err := dec.Token(); err != nil {
-		return nil
-	}
-
-	return order
+	return out
 }
 
 func asObject(v any) (map[string]any, bool) {

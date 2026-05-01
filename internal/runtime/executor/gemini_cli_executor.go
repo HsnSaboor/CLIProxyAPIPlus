@@ -132,8 +132,9 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	}
 
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	basePayload = applyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel, requestPath)
 
 	action := "generateContent"
 	if req.Metadata != nil {
@@ -230,7 +231,7 @@ func (e *GeminiCLIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 
 		lastStatus = httpResp.StatusCode
 		lastBody = append([]byte(nil), data...)
-		logDetailedAPIError(ctx, e.Identifier(), attemptModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), data)
+		logDetailedAPIError(ctx, e.cfg, e.Identifier(), attemptModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), payload, data)
 		if httpResp.StatusCode == 429 {
 			if idx+1 < len(models) {
 				log.Debugf("gemini cli executor: rate limited, retrying with next model: %s", models[idx+1])
@@ -286,8 +287,9 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	}
 
 	basePayload = fixGeminiCLIImageAspectRatio(baseModel, basePayload)
-	requestedModel := payloadRequestedModel(opts, req.Model)
-	basePayload = applyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	requestPath := helps.PayloadRequestPath(opts)
+	basePayload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, "gemini", "request", basePayload, originalTranslated, requestedModel, requestPath)
 
 	projectID := resolveGeminiProjectID(auth)
 
@@ -367,7 +369,7 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 			appendAPIResponseChunk(ctx, e.cfg, data)
 			lastStatus = httpResp.StatusCode
 			lastBody = append([]byte(nil), data...)
-			logDetailedAPIError(ctx, e.Identifier(), attemptModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), data)
+			logDetailedAPIError(ctx, e.cfg, e.Identifier(), attemptModel, url, httpResp.StatusCode, httpResp.Header.Get("Content-Type"), payload, data)
 			if httpResp.StatusCode == 429 {
 				if idx+1 < len(models) {
 					log.Debugf("gemini cli executor: rate limited, retrying with next model: %s", models[idx+1])
@@ -414,7 +416,9 @@ func (e *GeminiCLIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 					recordAPIResponseError(ctx, e.cfg, errScan)
 					reporter.publishFailure(ctx)
 					out <- cliproxyexecutor.StreamChunk{Err: errScan}
+					return
 				}
+				reporter.ensurePublished(ctx)
 				return
 			}
 
@@ -887,7 +891,14 @@ func parseRetryDelay(errorBody []byte) (*time.Duration, error) {
 		if matches := re.FindStringSubmatch(message); len(matches) > 1 {
 			seconds, err := strconv.Atoi(matches[1])
 			if err == nil {
-				return new(time.Duration(seconds) * time.Second), nil
+				duration := time.Duration(seconds) * time.Second
+				return &duration, nil
+			}
+		}
+		reHuman := regexp.MustCompile(`after\s+((?:\d+h)?(?:\d+m)?(?:\d+s)?)\.?`)
+		if matches := reHuman.FindStringSubmatch(strings.ToLower(message)); len(matches) > 1 {
+			if duration, err := time.ParseDuration(matches[1]); err == nil && duration > 0 {
+				return &duration, nil
 			}
 		}
 	}

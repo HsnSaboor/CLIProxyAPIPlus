@@ -55,22 +55,122 @@ func newTestServer(t *testing.T) *Server {
 func TestHealthz(t *testing.T) {
 	server := newTestServer(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	rr := httptest.NewRecorder()
-	server.engine.ServeHTTP(rr, req)
+	t.Run("GET", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		if rr.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+
+		var resp struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+		}
+		if resp.Status != "ok" {
+			t.Fatalf("unexpected response status: got %q want %q", resp.Status, "ok")
+		}
+	})
+
+	t.Run("HEAD", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodHead, "/healthz", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+		}
+		if rr.Body.Len() != 0 {
+			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
+		}
+	})
+}
+
+func TestAuthMiddleware_BlocksAfterRepeatedInvalidAPIKeys(t *testing.T) {
+	server := newTestServer(t)
+	rootOKReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootOKReq.RemoteAddr = "203.0.113.20:1234"
+	rootOK := httptest.NewRecorder()
+	server.engine.ServeHTTP(rootOK, rootOKReq)
+	if rootOK.Code != http.StatusOK {
+		t.Fatalf("expected root endpoint to remain public before IP block, got %d body=%s", rootOK.Code, rootOK.Body.String())
 	}
 
-	var resp struct {
-		Status string `json:"status"`
+	performRequest := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.RemoteAddr = "203.0.113.20:1234"
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		return rr
 	}
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
+
+	for i := 0; i < 3; i++ {
+		rr := performRequest("wrong-key")
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d body=%s", i+1, rr.Code, rr.Body.String())
+		}
 	}
-	if resp.Status != "ok" {
-		t.Fatalf("unexpected response status: got %q want %q", resp.Status, "ok")
+
+	blocked := performRequest("wrong-key")
+	if blocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 after threshold reached, got %d body=%s", blocked.Code, blocked.Body.String())
+	}
+	if !strings.Contains(blocked.Body.String(), "IP blocked") {
+		t.Fatalf("expected blocked response body, got %s", blocked.Body.String())
+	}
+
+	rootReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	rootReq.RemoteAddr = "203.0.113.20:1234"
+	rootBlocked := httptest.NewRecorder()
+	server.engine.ServeHTTP(rootBlocked, rootReq)
+	if rootBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected root endpoint to return 403 for blocked IP, got %d body=%s", rootBlocked.Code, rootBlocked.Body.String())
+	}
+	if !strings.Contains(rootBlocked.Body.String(), "IP blocked") {
+		t.Fatalf("expected root blocked response body, got %s", rootBlocked.Body.String())
+	}
+}
+
+func TestAuthMiddleware_SuccessClearsPendingFailures(t *testing.T) {
+	server := newTestServer(t)
+
+	performRequest := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.RemoteAddr = "203.0.113.21:1234"
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		return rr
+	}
+
+	for i := 0; i < 2; i++ {
+		rr := performRequest("wrong-key")
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d body=%s", i+1, rr.Code, rr.Body.String())
+		}
+	}
+
+	valid := performRequest("test-key")
+	if valid.Code != http.StatusOK {
+		t.Fatalf("expected successful auth to pass, got %d body=%s", valid.Code, valid.Body.String())
+	}
+
+	for i := 0; i < 2; i++ {
+		rr := performRequest("wrong-key")
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("post-reset attempt %d: expected 401, got %d body=%s", i+1, rr.Code, rr.Body.String())
+		}
+	}
+
+	stillUnauthorized := performRequest("wrong-key")
+	if stillUnauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("expected threshold to restart after success reset, got %d body=%s", stillUnauthorized.Code, stillUnauthorized.Body.String())
 	}
 }
 
