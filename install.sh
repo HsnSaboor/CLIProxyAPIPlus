@@ -214,7 +214,9 @@ extract_and_deploy() {
         rm -rf "$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}"
     fi
 
-    chmod +x "$PROD_DIR/cli-proxy-api"
+    if [[ -f "$PROD_DIR/cli-proxy-api" ]]; then
+        chmod +x "$PROD_DIR/cli-proxy-api"
+    fi
     log_success "Binary deployed"
 
     create_systemd_service
