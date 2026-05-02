@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codebuddy"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -396,7 +397,24 @@ func (e *CodeBuddyExecutor) applyHeaders(req *http.Request, accessToken, userID,
 	req.Header.Set("X-IDE-Type", "CLI")
 	req.Header.Set("X-IDE-Name", "CLI")
 	req.Header.Set("X-IDE-Version", "2.63.2")
+	req.Header.Set("X-Product-Version", "2.63.2")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	convID := strings.ReplaceAll(uuid.New().String(), "-", "")
+	requestID := strings.ReplaceAll(uuid.New().String(), "-", "")
+	messageID := strings.ReplaceAll(uuid.New().String(), "-", "")
+	req.Header.Set("X-Conversation-ID", convID)
+	req.Header.Set("X-Conversation-Request-ID", requestID)
+	req.Header.Set("X-Conversation-Message-ID", messageID)
+	req.Header.Set("X-Request-ID", messageID)
+	req.Header.Set("X-Agent-Intent", "craft")
+
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Stainless-Package-Version", "6.25.0")
+	req.Header.Set("X-Stainless-OS", "Linux")
+	req.Header.Set("X-Stainless-Arch", "x64")
+	req.Header.Set("X-Stainless-Runtime", "node")
+	req.Header.Set("X-Stainless-Runtime-Version", "v20.0.0")
 }
 
 type openAIChatStreamChoiceAccumulator struct {
