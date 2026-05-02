@@ -26,6 +26,15 @@
 
 Plus 版本会与主线功能保持同步。
 
+## Fork 特有功能
+
+此 fork 在上游 [jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus) 基础上添加了以下增强功能：
+
+- **CodeBuddy 国际版支持**：`--codebuddy-intl-login` 标志用于 `www.codebuddy.ai` 端点（与国内端点分离）
+- **CodeBuddy 请求头修复**：添加了缺失的必需请求头（`x-request-id`、`x-github-api-version`）以确保 API 兼容性
+- **公共安装脚本**：使用 GitHub releases 的跨平台安装器（无需编译 Go）
+- **Cline OAuth 支持**：添加了 `--cline-login` 处理器用于 Cline 扩展认证
+
 现已支持通过 OAuth 登录接入 OpenAI Codex（GPT 系列）和 Claude Code。
 
 您可以使用本地或多账户的CLI方式，通过任何与 OpenAI（包括Responses）/Gemini/Claude 兼容的客户端和SDK进行访问。
