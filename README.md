@@ -22,6 +22,15 @@ All third-party provider support is maintained by community contributors; CLIPro
 
 The Plus release stays in lockstep with the mainline features.
 
+## Fork-Specific Features
+
+This fork adds the following enhancements on top of upstream [jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus):
+
+- **CodeBuddy International Support**: `--codebuddy-intl-login` flag for `www.codebuddy.ai` endpoint (separate from CN endpoint)
+- **CodeBuddy Headers Fix**: Added missing required headers (`x-request-id`, `x-github-api-version`) for proper API compatibility
+- **Public Installer Script**: Cross-platform installer using GitHub releases (no Go compilation required)
+- **Cline OAuth Support**: Added `--cline-login` handler for Cline extension authentication
+
 ## Supported Providers
 
 | Provider | Flag | Notes |
