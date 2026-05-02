@@ -9,11 +9,11 @@ English | [Chinese](README_CN.md)
 ## Quick Install
 
 ```bash
-# Direct download
-curl -fSL https://raw.githubusercontent.com/HsnSaboor/CLIProxyAPIPlus/main/install.sh -o /tmp/cliproxyapi-installer.sh && chmod +x /tmp/cliproxyapi-installer.sh && /tmp/cliproxyapi-installer.sh
+# Via jsdelivr CDN (recommended)
+curl -fSL https://cdn.jsdelivr.net/gh/HsnSaboor/CLIProxyAPIPlus@main/install.sh | bash
 
-# Or via cdnjsdelivr
-curl -fSL https://cdn.jsdelivr.net/gh/HsnSaboor/CLIProxyAPIPlus@main/install.sh -o /tmp/cliproxyapi-installer.sh && chmod +x /tmp/cliproxyapi-installer.sh && /tmp/cliproxyapi-installer.sh
+# Or direct from GitHub
+curl -fSL https://raw.githubusercontent.com/HsnSaboor/CLIProxyAPIPlus/main/install.sh | bash
 ```
 
 This is the Plus version of [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), adding support for third-party providers on top of the mainline project.
