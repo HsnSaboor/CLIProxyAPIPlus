@@ -6,10 +6,6 @@
 
 [English](README.md) | [中文](README_CN.md) | 日本語
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
-
 CLI向けのOpenAI/Gemini/Claude/Codex互換APIインターフェースを提供するプロキシサーバーです。
 
 OAuth経由でOpenAI Codex（GPTモデル）およびClaude Codeもサポートしています。
@@ -217,3 +213,7 @@ OmniRouteはマルチプロバイダーLLM向けのAIゲートウェイです：
 ## ライセンス
 
 本プロジェクトはMITライセンスの下でライセンスされています - 詳細は[LICENSE](LICENSE)ファイルを参照してください。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)

@@ -6,10 +6,6 @@
 
 English | [Chinese](README_CN.md)
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
-
 ## Quick Install
 
 ```bash
@@ -244,3 +240,7 @@ OmniRoute is an AI gateway for multi-provider LLMs: an OpenAI-compatible endpoin
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)

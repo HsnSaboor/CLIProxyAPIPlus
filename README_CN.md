@@ -6,10 +6,6 @@
 
 [English](README.md) | 中文
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
-
 这是 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Plus 版本，在原有基础上增加了第三方供应商的支持。
 
 所有的第三方供应商支持都由第三方社区维护者提供，CLIProxyAPI 不提供技术支持。如需取得支持，请与对应的社区维护者联系。
@@ -232,3 +228,7 @@ OmniRoute 是一个面向多供应商大语言模型的 AI 网关：它提供兼
 ## 许可证
 
 此项目根据 MIT 许可证授权 - 有关详细信息，请参阅 [LICENSE](LICENSE) 文件。
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
