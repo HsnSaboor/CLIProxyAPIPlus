@@ -218,15 +218,21 @@ extract_and_deploy() {
         tar -xzf "$filename" -C "$PROD_DIR"
     fi
 
-    local extracted_dir="$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}"
-    if [[ ! -f "$extracted_dir/cli-proxy-api" ]]; then
+    cd "$PROD_DIR"
+    
+    local binary_name=""
+    if [[ -f "cli-proxy-api" ]]; then
+        binary_name="cli-proxy-api"
+    elif [[ -f "cli-proxy-api-plus" ]]; then
+        binary_name="cli-proxy-api-plus"
+    else
         log_error "Binary not found in extracted archive"
         exit 1
     fi
 
     create_config
 
-    mv "$extracted_dir/cli-proxy-api" "$PROD_DIR/cli-proxy-api.new"
+    mv "$binary_name" "$PROD_DIR/cli-proxy-api.new"
     chmod +x "$PROD_DIR/cli-proxy-api.new" || {
         log_error "Failed to make binary executable"
         exit 1
@@ -234,7 +240,6 @@ extract_and_deploy() {
     
     mv -f "$PROD_DIR/cli-proxy-api.new" "$PROD_DIR/cli-proxy-api"
     
-    rm -rf "$extracted_dir"
     [[ -f "$PROD_DIR/cli-proxy-api.old" ]] && rm -f "$PROD_DIR/cli-proxy-api.old"
     
     log_success "Binary deployed"
@@ -289,8 +294,7 @@ create_config() {
         return
     fi
 
-    local extracted_dir="$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}"
-    local example_config="$extracted_dir/config.example.yaml"
+    local example_config="$PROD_DIR/config.example.yaml"
 
     if [[ ! -f "$example_config" ]]; then
         log_error "config.example.yaml not found in release"
