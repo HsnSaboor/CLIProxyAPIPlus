@@ -1,6 +1,14 @@
 # CLI Proxy API
 
+[![GitHub stars](https://img.shields.io/github/stars/HsnSaboor/CLIProxyAPIPlus?style=social)](https://github.com/HsnSaboor/CLIProxyAPIPlus/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/HsnSaboor/CLIProxyAPIPlus?style=social)](https://github.com/HsnSaboor/CLIProxyAPIPlus/network/members)
+[![License](https://img.shields.io/github/license/HsnSaboor/CLIProxyAPIPlus)](LICENSE)
+
 [English](README.md) | [中文](README_CN.md) | 日本語
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
 
 CLI向けのOpenAI/Gemini/Claude/Codex互換APIインターフェースを提供するプロキシサーバーです。
 

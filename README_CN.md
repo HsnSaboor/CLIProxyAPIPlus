@@ -1,6 +1,14 @@
 # CLIProxyAPI Plus
 
+[![GitHub stars](https://img.shields.io/github/stars/HsnSaboor/CLIProxyAPIPlus?style=social)](https://github.com/HsnSaboor/CLIProxyAPIPlus/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/HsnSaboor/CLIProxyAPIPlus?style=social)](https://github.com/HsnSaboor/CLIProxyAPIPlus/network/members)
+[![License](https://img.shields.io/github/license/HsnSaboor/CLIProxyAPIPlus)](LICENSE)
+
 [English](README.md) | 中文
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
 
 这是 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 的 Plus 版本，在原有基础上增加了第三方供应商的支持。
 

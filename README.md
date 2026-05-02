@@ -1,6 +1,14 @@
 # CLIProxyAPI Plus
 
+[![GitHub stars](https://img.shields.io/github/stars/HsnSaboor/CLIProxyAPIPlus?style=social)](https://github.com/HsnSaboor/CLIProxyAPIPlus/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/HsnSaboor/CLIProxyAPIPlus?style=social)](https://github.com/HsnSaboor/CLIProxyAPIPlus/network/members)
+[![License](https://img.shields.io/github/license/HsnSaboor/CLIProxyAPIPlus)](LICENSE)
+
 English | [Chinese](README_CN.md)
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HsnSaboor/CLIProxyAPIPlus&type=Date)](https://star-history.com/#HsnSaboor/CLIProxyAPIPlus&Date)
 
 ## Quick Install
 
