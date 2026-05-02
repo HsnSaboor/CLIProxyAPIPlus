@@ -91,7 +91,7 @@ stop_service() {
             systemctl --user stop cliproxyapi.service 2>/dev/null || true
         fi
         pkill -f "cli-proxy-api" 2>/dev/null || true
-        sleep 2
+        sleep 3
     fi
 }
 
@@ -183,10 +183,9 @@ extract_and_deploy() {
 
     local filename="CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}.${ext}"
 
-    mkdir -p "$PROD_DIR/config_backup"
-
     log_info "Backing up config..."
     if [[ -f "$PROD_DIR/config.yaml" ]]; then
+        mkdir -p "$PROD_DIR/config_backup"
         local ts
         ts=$(date +"%Y%m%d_%H%M%S")
         cp "$PROD_DIR/config.yaml" "$PROD_DIR/config_backup/config_${ts}.yaml"
@@ -194,6 +193,7 @@ extract_and_deploy() {
 
     log_info "Backing up auth tokens..."
     if [[ -d "$AUTH_DIR" ]]; then
+        mkdir -p "$PROD_DIR/config_backup"
         local token_ts
         token_ts=$(date +"%Y%m%d_%H%M")
         tar -czf "$PROD_DIR/config_backup/tokens_${token_ts}.tar.gz" -C "$AUTH_DIR" . 2>/dev/null || true
@@ -205,24 +205,31 @@ extract_and_deploy() {
         tar -xzf "$filename" -C "$PROD_DIR"
     fi
 
+    local extracted_dir="$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}"
+    if [[ ! -f "$extracted_dir/cli-proxy-api" ]]; then
+        log_error "Binary not found in extracted archive"
+        exit 1
+    fi
+
     if [[ -f "$PROD_DIR/cli-proxy-api" ]]; then
         mv "$PROD_DIR/cli-proxy-api" "$PROD_DIR/cli-proxy-api.old"
     fi
 
-    if [[ -f "$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}/cli-proxy-api" ]]; then
-        mv "$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}/cli-proxy-api" "$PROD_DIR/cli-proxy-api"
-        rm -rf "$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}"
-    fi
-
-    if [[ -f "$PROD_DIR/cli-proxy-api" ]]; then
-        chmod +x "$PROD_DIR/cli-proxy-api"
-    fi
+    mv "$extracted_dir/cli-proxy-api" "$PROD_DIR/cli-proxy-api"
+    chmod +x "$PROD_DIR/cli-proxy-api"
+    
+    create_config
+    
+    rm -rf "$extracted_dir"
+    [[ -f "$PROD_DIR/cli-proxy-api.old" ]] && rm -f "$PROD_DIR/cli-proxy-api.old"
+    
     log_success "Binary deployed"
 
     create_systemd_service
 
     log_info "Starting service..."
     if [[ "$OS" == "linux" ]]; then
+        systemctl --user enable cliproxyapi.service 2>/dev/null || true
         systemctl --user restart cliproxyapi.service
     fi
     sleep 3
@@ -255,7 +262,6 @@ WorkingDirectory=$PROD_DIR
 ExecStart=$PROD_DIR/cli-proxy-api
 Restart=always
 RestartSec=10
-Environment=HOME=$HOME
 
 [Install]
 WantedBy=default.target
@@ -269,24 +275,28 @@ create_config() {
         return
     fi
 
-    # Look in extracted folder (before binary is moved out)
     local extracted_dir="$PROD_DIR/CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}"
     local example_config="$extracted_dir/config.example.yaml"
 
-    # Fallback to cache if already extracted and moved
-    [[ ! -f "$example_config" ]] && example_config="$CACHE_DIR/config.example.yaml"
-
-    if [[ -f "$example_config" ]]; then
-        cp "$example_config" "$PROD_DIR/config.yaml"
-        local key1 key2
-        key1=$(generate_api_key)
-        key2=$(generate_api_key)
-        sed -i "s/\"your-api-key-1\"/\"$key1\"/g" "$PROD_DIR/config.yaml" 2>/dev/null || true
-        sed -i "s/\"your-api-key-2\"/\"$key2\"/g" "$PROD_DIR/config.yaml" 2>/dev/null || true
-        log_success "Created config.yaml with generated API keys"
-    else
-        log_warning "config.example.yaml not found, skipping config creation"
+    if [[ ! -f "$example_config" ]]; then
+        log_error "config.example.yaml not found in release"
+        exit 1
     fi
+
+    cp "$example_config" "$PROD_DIR/config.yaml"
+    local key1 key2
+    key1=$(generate_api_key)
+    key2=$(generate_api_key)
+    
+    if [[ "$OS" == "darwin" ]]; then
+        sed -i.bak "s/\"your-api-key-1\"/\"$key1\"/g" "$PROD_DIR/config.yaml"
+        sed -i.bak "s/\"your-api-key-2\"/\"$key2\"/g" "$PROD_DIR/config.yaml"
+        rm -f "$PROD_DIR/config.yaml.bak"
+    else
+        sed -i "s/\"your-api-key-1\"/\"$key1\"/g" "$PROD_DIR/config.yaml"
+        sed -i "s/\"your-api-key-2\"/\"$key2\"/g" "$PROD_DIR/config.yaml"
+    fi
+    log_success "Created config.yaml with generated API keys"
 }
 
 show_status() {
@@ -330,19 +340,13 @@ install_or_upgrade() {
     set_paths
     get_latest_release
     download_and_verify
-
-    # Extract just to get config.example.yaml
-    log_step "Preparing config..."
-    cd "$CACHE_DIR"
-    if [[ "$OS" == "windows" ]]; then
-        unzip -o "CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}.zip" -d "$PROD_DIR" >/dev/null
-    else
-        tar -xzf "CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}.tar.gz" -C "$PROD_DIR"
-    fi
-
-    create_config
     extract_and_deploy
 
+    echo
+    echo -e "${GREEN}Installation Complete${NC}"
+    echo -e "${BLUE}Binary:${NC}      ${CYAN}${PROD_DIR}/cli-proxy-api${NC}"
+    echo -e "${BLUE}Auth Dir:${NC}    ${CYAN}${AUTH_DIR}${NC}"
+    
     if [[ ! -f "$PROD_DIR/config.yaml" ]] || ! check_api_keys; then
         echo
         echo -e "${YELLOW}API Keys Required${NC}"
