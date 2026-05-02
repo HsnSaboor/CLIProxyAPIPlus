@@ -97,11 +97,7 @@ stop_service() {
 
 generate_api_key() {
     local prefix="sk-"
-    local chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    local key=""
-    for i in {1..45}; do
-        key="${key}${chars:$((RANDOM % ${#chars})):1}"
-    done
+    local key=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 45)
     echo "${prefix}${key}"
 }
 
@@ -129,6 +125,11 @@ get_latest_release() {
         exit 1
     fi
 
+    if [[ ! "$VERSION" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        log_error "Invalid version format: $VERSION"
+        exit 1
+    fi
+
     log_success "Latest version: $VERSION"
 }
 
@@ -136,6 +137,11 @@ download_and_verify() {
     log_step "Downloading release..."
 
     mkdir -p "$CACHE_DIR"
+    chmod 700 "$CACHE_DIR"
+    if [[ -L "$CACHE_DIR" ]]; then
+        log_error "Cache directory is a symlink, potential attack"
+        exit 1
+    fi
     cd "$CACHE_DIR"
 
     local ext="tar.gz"
@@ -159,7 +165,11 @@ download_and_verify() {
 
     log_info "Verifying checksum..."
     local expected_hash
-    expected_hash=$(grep "$filename" "checksums.txt" | awk '{print $1}')
+    expected_hash=$(grep "^[a-f0-9]\{64\}  $filename$" "checksums.txt" | awk '{print $1}')
+    if [[ -z "$expected_hash" ]]; then
+        log_error "Checksum not found for $filename"
+        exit 1
+    fi
     local actual_hash
     actual_hash=$(sha256sum "$filename" | awk '{print $1}')
 
@@ -186,14 +196,17 @@ extract_and_deploy() {
     log_info "Backing up config..."
     if [[ -f "$PROD_DIR/config.yaml" ]]; then
         mkdir -p "$PROD_DIR/config_backup"
+        chmod 700 "$PROD_DIR/config_backup"
         local ts
         ts=$(date +"%Y%m%d_%H%M%S")
         cp "$PROD_DIR/config.yaml" "$PROD_DIR/config_backup/config_${ts}.yaml"
+        chmod 600 "$PROD_DIR/config_backup/config_${ts}.yaml"
     fi
 
     log_info "Backing up auth tokens..."
     if [[ -d "$AUTH_DIR" ]]; then
         mkdir -p "$PROD_DIR/config_backup"
+        chmod 700 "$PROD_DIR/config_backup"
         local token_ts
         token_ts=$(date +"%Y%m%d_%H%M")
         tar -czf "$PROD_DIR/config_backup/tokens_${token_ts}.tar.gz" -C "$AUTH_DIR" . 2>/dev/null || true
@@ -211,14 +224,15 @@ extract_and_deploy() {
         exit 1
     fi
 
-    if [[ -f "$PROD_DIR/cli-proxy-api" ]]; then
-        mv "$PROD_DIR/cli-proxy-api" "$PROD_DIR/cli-proxy-api.old"
-    fi
-
-    mv "$extracted_dir/cli-proxy-api" "$PROD_DIR/cli-proxy-api"
-    chmod +x "$PROD_DIR/cli-proxy-api"
-    
     create_config
+
+    mv "$extracted_dir/cli-proxy-api" "$PROD_DIR/cli-proxy-api.new"
+    chmod +x "$PROD_DIR/cli-proxy-api.new" || {
+        log_error "Failed to make binary executable"
+        exit 1
+    }
+    
+    mv -f "$PROD_DIR/cli-proxy-api.new" "$PROD_DIR/cli-proxy-api"
     
     rm -rf "$extracted_dir"
     [[ -f "$PROD_DIR/cli-proxy-api.old" ]] && rm -f "$PROD_DIR/cli-proxy-api.old"
@@ -289,12 +303,12 @@ create_config() {
     key2=$(generate_api_key)
     
     if [[ "$OS" == "darwin" ]]; then
-        sed -i.bak "s/\"your-api-key-1\"/\"$key1\"/g" "$PROD_DIR/config.yaml"
-        sed -i.bak "s/\"your-api-key-2\"/\"$key2\"/g" "$PROD_DIR/config.yaml"
+        sed -i.bak "s|\"your-api-key-1\"|\"$key1\"|g" "$PROD_DIR/config.yaml"
+        sed -i.bak "s|\"your-api-key-2\"|\"$key2\"|g" "$PROD_DIR/config.yaml"
         rm -f "$PROD_DIR/config.yaml.bak"
     else
-        sed -i "s/\"your-api-key-1\"/\"$key1\"/g" "$PROD_DIR/config.yaml"
-        sed -i "s/\"your-api-key-2\"/\"$key2\"/g" "$PROD_DIR/config.yaml"
+        sed -i "s|\"your-api-key-1\"|\"$key1\"|g" "$PROD_DIR/config.yaml"
+        sed -i "s|\"your-api-key-2\"|\"$key2\"|g" "$PROD_DIR/config.yaml"
     fi
     log_success "Created config.yaml with generated API keys"
 }
