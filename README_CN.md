@@ -14,6 +14,7 @@
 
 | 供应商 | 标志 | 说明 |
 |---|---|---|
+| Kiro (AWS Q Developer) | `--kiro-cli-login` | 原生 Kiro CLI OAuth 流程，具有正确的指纹识别 |
 | Cline | `--cline-login` | 通过 Cline 扩展的 OAuth 设备流程 |
 | CodeBuddy (CN) | `--codebuddy-login` | 通过 `copilot.tencent.com` 的 OAuth (codebuddy.cn) |
 | CodeBuddy 国际版 | `--codebuddy-intl-login` | 通过 `www.codebuddy.ai` 的 OAuth |
