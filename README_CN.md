@@ -30,10 +30,13 @@ Plus 版本会与主线功能保持同步。
 
 此 fork 在上游 [jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus) 基础上添加了以下增强功能：
 
+- **Kiro CLI 原生 OAuth**：`--kiro-cli-login` 标志用于原生 Kiro CLI OAuth 流程，具有正确的指纹识别和遥测功能
+- **Kiro 改进**：令牌估算回退、tool_use.id 验证、OAuth 别名热重载、详细的 400 错误日志
 - **CodeBuddy 国际版支持**：`--codebuddy-intl-login` 标志用于 `www.codebuddy.ai` 端点（与国内端点分离）
 - **CodeBuddy 请求头修复**：添加了缺失的必需请求头（`x-request-id`、`x-github-api-version`）以确保 API 兼容性
+- **CodeBuddy 图像生成**：V2 端点转换和图像生成路由支持
+- **Cline OAuth 支持**：`--cline-login` 处理器，支持令牌刷新和 OpenRouter 兼容请求头
 - **公共安装脚本**：使用 GitHub releases 的跨平台安装器（无需编译 Go）
-- **Cline OAuth 支持**：添加了 `--cline-login` 处理器用于 Cline 扩展认证
 
 现已支持通过 OAuth 登录接入 OpenAI Codex（GPT 系列）和 Claude Code。
 

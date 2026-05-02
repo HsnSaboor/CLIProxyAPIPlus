@@ -26,15 +26,19 @@ The Plus release stays in lockstep with the mainline features.
 
 This fork adds the following enhancements on top of upstream [jc01rho/CLIProxyAPIPlus](https://github.com/jc01rho/CLIProxyAPIPlus):
 
+- **Kiro CLI Native OAuth**: `--kiro-cli-login` flag for native Kiro CLI OAuth flow parity with proper fingerprinting and telemetry
+- **Kiro Improvements**: Token estimation fallback, tool_use.id validation, OAuth alias hot-reload, detailed 400 error logging
 - **CodeBuddy International Support**: `--codebuddy-intl-login` flag for `www.codebuddy.ai` endpoint (separate from CN endpoint)
 - **CodeBuddy Headers Fix**: Added missing required headers (`x-request-id`, `x-github-api-version`) for proper API compatibility
+- **CodeBuddy Image Generation**: V2 endpoint translation and image generation routing support
+- **Cline OAuth Support**: `--cline-login` handler with token refresh and OpenRouter parity headers
 - **Public Installer Script**: Cross-platform installer using GitHub releases (no Go compilation required)
-- **Cline OAuth Support**: Added `--cline-login` handler for Cline extension authentication
 
 ## Supported Providers
 
 | Provider | Flag | Notes |
 |---|---|---|
+| Kiro (AWS Q Developer) | `--kiro-cli-login` | Native Kiro CLI OAuth flow with proper fingerprinting |
 | Cline | `--cline-login` | OAuth device flow via Cline extension |
 | CodeBuddy (CN) | `--codebuddy-login` | OAuth via `copilot.tencent.com` (codebuddy.cn) |
 | CodeBuddy International | `--codebuddy-intl-login` | OAuth via `www.codebuddy.ai` |
