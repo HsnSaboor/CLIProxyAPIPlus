@@ -8,9 +8,12 @@ import (
 	"testing"
 
 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	intlogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
@@ -61,6 +64,41 @@ func TestGitHubCopilotNormalizeModel_StripsSuffix(t *testing.T) {
 	}
 }
 
+func TestGitHubCopilotLogUpstreamErrorUsesDetailedWarnWithAuthAndModels(t *testing.T) {
+	originalOutput := log.StandardLogger().Out
+	originalFormatter := log.StandardLogger().Formatter
+	originalLevel := log.StandardLogger().Level
+	defer func() {
+		log.SetOutput(originalOutput)
+		log.SetFormatter(originalFormatter)
+		log.SetLevel(originalLevel)
+	}()
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableLevelTruncation: true})
+	log.SetLevel(log.WarnLevel)
+
+	e := NewGitHubCopilotExecutor(&config.Config{})
+	ctx := intlogging.WithRequestID(context.Background(), "copilot-test")
+	auth := &cliproxyauth.Auth{ID: "auth-1", Label: "work", Provider: "github-copilot"}
+	e.logUpstreamError(ctx, auth, "claude-sonnet-4-6", []byte(`{"model":"claude-sonnet-4.6","messages":[]}`), "https://api.githubcopilot.com/chat/completions", http.StatusBadRequest, "application/json", []byte(`{"error":{"message":"The requested model is not supported.","code":"model_not_supported"}}`))
+
+	output := buf.String()
+	for _, want := range []string{
+		"github-copilot:work model=claude-sonnet-4.6 requested_model=claude-sonnet-4-6",
+		"Status: 400",
+		"Request:",
+		"Response:",
+		"model_not_supported",
+		"request_id=copilot-test",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected log to contain %q, got: %s", want, output)
+		}
+	}
+}
+
 func TestUseGitHubCopilotResponsesEndpoint_OpenAIResponseSource(t *testing.T) {
 	t.Parallel()
 	if !useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai-response"), "claude-3-5-sonnet") {
@@ -75,18 +113,8 @@ func TestUseGitHubCopilotResponsesEndpoint_CodexModel(t *testing.T) {
 	}
 }
 
-func TestUseGitHubCopilotResponsesEndpoint_RegistryResponsesOnlyModel(t *testing.T) {
-	// Not parallel: shares global model registry with DynamicRegistryWinsOverStatic.
-	if !useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5.4") {
-		t.Fatal("expected responses-only registry model to use /responses")
-	}
-	if !useGitHubCopilotResponsesEndpoint(sdktranslator.FromString("openai"), "gpt-5.4-mini") {
-		t.Fatal("expected responses-only registry model to use /responses")
-	}
-}
-
 func TestUseGitHubCopilotResponsesEndpoint_DynamicRegistryWinsOverStatic(t *testing.T) {
-	// Not parallel: mutates global model registry, conflicts with RegistryResponsesOnlyModel.
+	// Not parallel: mutates global model registry.
 
 	reg := registry.GetGlobalRegistry()
 	clientID := "github-copilot-test-client"
@@ -613,6 +641,168 @@ func TestCountTokens_ClaudeSourceFormatTranslates(t *testing.T) {
 	}
 }
 
+<<<<<<< HEAD
+=======
+func TestGitHubCopilotAllowsOnlySupportedDynamicModels(t *testing.T) {
+	t.Parallel()
+
+	for _, modelID := range []string{
+		"claude-haiku-4.5",
+		"gemini-2.5-pro",
+		"gemini-3-pro-preview",
+		"gemini-3.1-pro-preview",
+		"gemini-3-flash-preview",
+	} {
+		if !registry.IsAllowedGitHubCopilotModel(modelID) {
+			t.Fatalf("expected %s to be allowed for GitHub Copilot dynamic model discovery", modelID)
+		}
+	}
+	for _, modelID := range []string{"gpt-5.5", "claude-sonnet-4.6"} {
+		if registry.IsAllowedGitHubCopilotModel(modelID) {
+			t.Fatalf("expected unsupported Copilot model %s to be hidden", modelID)
+		}
+	}
+}
+
+func TestGitHubCopilotExecute_ClaudeModelUsesNativeGateway(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	var gotQuery string
+	var gotAuth string
+	var gotAPIVersion string
+	var gotEditorVersion string
+	var gotIntent string
+	var gotInitiator string
+	var gotBody []byte
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIVersion = r.Header.Get("X-Github-Api-Version")
+		gotEditorVersion = r.Header.Get("Editor-Version")
+		gotIntent = r.Header.Get("Openai-Intent")
+		gotInitiator = r.Header.Get("X-Initiator")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4.6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	e := NewGitHubCopilotExecutor(&config.Config{})
+	e.cache["gh-access-token"] = &cachedAPIToken{
+		token:       "copilot-api-token",
+		apiEndpoint: server.URL,
+		expiresAt:   time.Now().Add(time.Hour),
+	}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "gh-access-token"}}
+	payload := []byte(`{"model":"claude-sonnet-4.6","max_tokens":256,"messages":[{"role":"user","content":"hello"}]}`)
+
+	resp, err := e.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4.6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		OriginalRequest: payload,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if gotPath != "/v1/messages" {
+		t.Fatalf("path = %q, want %q", gotPath, "/v1/messages")
+	}
+	if gotQuery != "beta=true" {
+		t.Fatalf("query = %q, want %q", gotQuery, "beta=true")
+	}
+	if gotAuth != "Bearer copilot-api-token" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer copilot-api-token")
+	}
+	if gotAPIVersion != copilotGitHubAPIVer {
+		t.Fatalf("X-Github-Api-Version = %q, want %q", gotAPIVersion, copilotGitHubAPIVer)
+	}
+	if gotEditorVersion != copilotEditorVersion {
+		t.Fatalf("Editor-Version = %q, want %q", gotEditorVersion, copilotEditorVersion)
+	}
+	if gotIntent != copilotOpenAIIntent {
+		t.Fatalf("Openai-Intent = %q, want %q", gotIntent, copilotOpenAIIntent)
+	}
+	if gotInitiator != "user" {
+		t.Fatalf("X-Initiator = %q, want %q", gotInitiator, "user")
+	}
+	if gjson.GetBytes(gotBody, "model").String() != "claude-sonnet-4.6" {
+		t.Fatalf("upstream model = %q, want %q", gjson.GetBytes(gotBody, "model").String(), "claude-sonnet-4.6")
+	}
+	if gjson.GetBytes(resp.Payload, "content.0.text").String() != "ok" {
+		t.Fatalf("response text = %q, want %q", gjson.GetBytes(resp.Payload, "content.0.text").String(), "ok")
+	}
+}
+
+func TestGitHubCopilotExecuteStream_ClaudeModelUsesNativeGateway(t *testing.T) {
+	t.Parallel()
+
+	var gotPath string
+	var gotInitiator string
+	var gotAPIVersion string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotInitiator = r.Header.Get("X-Initiator")
+		gotAPIVersion = r.Header.Get("X-Github-Api-Version")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4.6\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
+		_, _ = w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
+		_, _ = w.Write([]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+		_, _ = w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"))
+		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer server.Close()
+
+	e := NewGitHubCopilotExecutor(&config.Config{})
+	e.cache["gh-access-token"] = &cachedAPIToken{
+		token:       "copilot-api-token",
+		apiEndpoint: server.URL,
+		expiresAt:   time.Now().Add(time.Hour),
+	}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "gh-access-token"}}
+	payload := []byte(`{"model":"claude-sonnet-4.6","stream":true,"max_tokens":256,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"path":"notes.txt"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file contents"}]}]}`)
+
+	result, err := e.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4.6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FromString("claude"),
+		OriginalRequest: payload,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error: %v", err)
+	}
+
+	var joined strings.Builder
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Err)
+		}
+		joined.Write(chunk.Payload)
+	}
+
+	if gotPath != "/v1/messages" {
+		t.Fatalf("path = %q, want %q", gotPath, "/v1/messages")
+	}
+	if gotInitiator != "agent" {
+		t.Fatalf("X-Initiator = %q, want %q", gotInitiator, "agent")
+	}
+	if gotAPIVersion != copilotGitHubAPIVer {
+		t.Fatalf("X-Github-Api-Version = %q, want %q", gotAPIVersion, copilotGitHubAPIVer)
+	}
+	if !strings.Contains(joined.String(), "message_start") || !strings.Contains(joined.String(), "text_delta") {
+		t.Fatalf("stream = %q, want Claude SSE payload", joined.String())
+	}
+}
+
+>>>>>>> v6.10.8-2
 func TestCountTokens_EmptyPayload(t *testing.T) {
 	t.Parallel()
 	e := &GitHubCopilotExecutor{}

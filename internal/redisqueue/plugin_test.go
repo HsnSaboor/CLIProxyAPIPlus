@@ -10,7 +10,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
@@ -25,6 +24,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		plugin.HandleUsage(ctx, coreusage.Record{
 			Provider:    "openai",
 			Model:       "gpt-5.4",
+			Alias:       "client-gpt",
 			APIKey:      "test-key",
 			AuthIndex:   "0",
 			AuthType:    "apikey",
@@ -41,6 +41,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndSuccess(t *testing.T) {
 		payload := popSinglePayload(t)
 		requireStringField(t, payload, "provider", "openai")
 		requireStringField(t, payload, "model", "gpt-5.4")
+		requireStringField(t, payload, "alias", "client-gpt")
 		requireStringField(t, payload, "endpoint", "POST /v1/chat/completions")
 		requireStringField(t, payload, "auth_type", "apikey")
 		requireStringField(t, payload, "request_id", "ctx-request-id")
@@ -59,6 +60,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndFailureAndGinRequestID(t 
 		plugin.HandleUsage(ctx, coreusage.Record{
 			Provider:    "openai",
 			Model:       "gpt-5.4-mini",
+			Alias:       "client-mini",
 			APIKey:      "test-key",
 			AuthIndex:   "0",
 			AuthType:    "apikey",
@@ -75,6 +77,7 @@ func TestUsageQueuePluginPayloadIncludesStableFieldsAndFailureAndGinRequestID(t 
 		payload := popSinglePayload(t)
 		requireStringField(t, payload, "provider", "openai")
 		requireStringField(t, payload, "model", "gpt-5.4-mini")
+		requireStringField(t, payload, "alias", "client-mini")
 		requireStringField(t, payload, "endpoint", "GET /v1/responses")
 		requireStringField(t, payload, "auth_type", "apikey")
 		requireStringField(t, payload, "request_id", "gin-request-id")
@@ -103,6 +106,7 @@ func TestUsageQueuePluginAsyncIgnoresRecycledGinContext(t *testing.T) {
 		mgr.Publish(ctx, coreusage.Record{
 			Provider:    "openai",
 			Model:       "gpt-5.4",
+			Alias:       "client-gpt",
 			APIKey:      "test-key",
 			AuthIndex:   "0",
 			AuthType:    "apikey",
@@ -118,6 +122,7 @@ func TestUsageQueuePluginAsyncIgnoresRecycledGinContext(t *testing.T) {
 
 		payload := waitForSinglePayload(t, 2*time.Second)
 		requireStringField(t, payload, "endpoint", "POST /v1/chat/completions")
+		requireStringField(t, payload, "alias", "client-gpt")
 		requireStringField(t, payload, "request_id", "ctx-request-id")
 		requireBoolField(t, payload, "failed", true)
 	})
@@ -127,16 +132,16 @@ func withEnabledQueue(t *testing.T, fn func()) {
 	t.Helper()
 
 	prevQueueEnabled := Enabled()
-	prevStatsEnabled := internalusage.StatisticsEnabled()
+	prevUsageEnabled := UsageStatisticsEnabled()
 
 	SetEnabled(false)
 	SetEnabled(true)
-	internalusage.SetStatisticsEnabled(true)
+	SetUsageStatisticsEnabled(true)
 
 	defer func() {
 		SetEnabled(false)
 		SetEnabled(prevQueueEnabled)
-		internalusage.SetStatisticsEnabled(prevStatsEnabled)
+		SetUsageStatisticsEnabled(prevUsageEnabled)
 	}()
 
 	fn()

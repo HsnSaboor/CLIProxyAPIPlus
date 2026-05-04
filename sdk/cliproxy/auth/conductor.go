@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -1299,6 +1300,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
+	ctx = contextWithRequestedModelAlias(ctx, opts, routeModel)
 	var lastErr error
 	for idx, execModel := range execModels {
 		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
@@ -1660,6 +1662,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
 		}
+		auth.Success = existing.Success
+		auth.Failed = existing.Failed
+		auth.recentRequests = existing.recentRequests
 		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
 			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
 				auth.ModelStates = existing.ModelStates
@@ -1798,6 +1803,8 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
 			continue
@@ -1892,6 +1899,8 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
+		execCtx = contextWithRequestedModelAlias(execCtx, opts, routeModel)
+
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
 			continue
@@ -2271,6 +2280,36 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 		return strings.TrimSpace(string(v)) != ""
 	default:
 		return false
+	}
+}
+
+func contextWithRequestedModelAlias(ctx context.Context, opts cliproxyexecutor.Options, fallback string) context.Context {
+	alias := requestedModelAliasFromOptions(opts, fallback)
+	return coreusage.WithRequestedModelAlias(ctx, alias)
+}
+
+func requestedModelAliasFromOptions(opts cliproxyexecutor.Options, fallback string) string {
+	fallback = strings.TrimSpace(fallback)
+	if len(opts.Metadata) == 0 {
+		return fallback
+	}
+	raw, ok := opts.Metadata[cliproxyexecutor.RequestedModelMetadataKey]
+	if !ok || raw == nil {
+		return fallback
+	}
+	switch value := raw.(type) {
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return fallback
+		}
+		return strings.TrimSpace(value)
+	case []byte:
+		if len(value) == 0 {
+			return fallback
+		}
+		return strings.TrimSpace(string(value))
+	default:
+		return fallback
 	}
 }
 
@@ -2791,6 +2830,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
 		auth.recordRecentRequest(now, result.Success)
+		if result.Success {
+			auth.Success++
+		} else {
+			auth.Failed++
+		}
 
 		if result.Success {
 			if result.Model != "" {
@@ -4014,6 +4058,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
 		}
 		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
+		creditsCtx = contextWithRequestedModelAlias(creditsCtx, creditsOpts, routeModel)
 		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
 		models := m.executionModelCandidates(c.auth, routeModel)
 		if len(models) == 0 {
@@ -4683,6 +4728,29 @@ func (m *Manager) fallbackSourceForModel(originalModel, fbModel string) string {
 	return "fallback-chain"
 }
 
+func logRouteModelFallbackAttempt(ctx context.Context, originalModel, fallbackModel, source string, err error) {
+	fields := log.Fields{
+		"requested_model": strings.TrimSpace(originalModel),
+		"fallback_model":  strings.TrimSpace(fallbackModel),
+		"fallback_source": strings.TrimSpace(source),
+	}
+	if status := statusCodeFromError(err); status > 0 {
+		fields["upstream_status"] = status
+	}
+	if err != nil {
+		fields["fallback_reason"] = err.Error()
+	}
+	logEntryWithRequestID(ctx).WithFields(fields).Warn("routing request through fallback model")
+}
+
+func logRouteModelFallbackSuccess(ctx context.Context, originalModel, fallbackModel, source string) {
+	logEntryWithRequestID(ctx).WithFields(log.Fields{
+		"requested_model": strings.TrimSpace(originalModel),
+		"fallback_model":  strings.TrimSpace(fallbackModel),
+		"fallback_source": strings.TrimSpace(source),
+	}).Info("fallback model request completed")
+}
+
 func (m *Manager) executeWithRouteFallback(
 	ctx context.Context,
 	providers []string,
@@ -4713,13 +4781,14 @@ func (m *Manager) executeWithRouteFallback(
 		attempted[fbModel] = struct{}{}
 
 		source := m.fallbackSourceForModel(originalModel, fbModel)
-		logEntryWithRequestID(ctx).Infof("attempting fallback model %s (from %s) for original model %s", fbModel, source, originalModel)
+		logRouteModelFallbackAttempt(ctx, originalModel, fbModel, source, lastErr)
 
 		fbReq := req
 		fbReq.Model = fbModel
 
 		resp, err := m.executeWithRetry(ctx, providers, fbReq, opts, maxRetryCredentials, maxWait, execOnce)
 		if err == nil {
+			logRouteModelFallbackSuccess(ctx, originalModel, fbModel, source)
 			return resp, nil
 		}
 		lastErr = err
@@ -4761,13 +4830,14 @@ func (m *Manager) executeStreamWithRouteFallback(
 		attempted[fbModel] = struct{}{}
 
 		source := m.fallbackSourceForModel(originalModel, fbModel)
-		logEntryWithRequestID(ctx).Infof("attempting fallback model %s (from %s) for original model %s", fbModel, source, originalModel)
+		logRouteModelFallbackAttempt(ctx, originalModel, fbModel, source, lastErr)
 
 		fbReq := req
 		fbReq.Model = fbModel
 
 		result, err := m.executeStreamWithRetry(ctx, providers, fbReq, opts, maxRetryCredentials, maxWait, execOnce)
 		if err == nil {
+			logRouteModelFallbackSuccess(ctx, originalModel, fbModel, source)
 			return result, nil
 		}
 		lastErr = err
