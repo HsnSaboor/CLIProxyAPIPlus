@@ -3,14 +3,18 @@ package executor
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	copilotauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	intlogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
@@ -641,8 +645,23 @@ func TestCountTokens_ClaudeSourceFormatTranslates(t *testing.T) {
 	}
 }
 
-<<<<<<< HEAD
-=======
+func TestKiroMapModelToKiro_DynamicModelsUseBackendVersionFormat(t *testing.T) {
+	t.Parallel()
+
+	e := &KiroExecutor{}
+	tests := map[string]string{
+		"kiro-glm-5":                    "glm-5",
+		"kiro-glm-5-0":                  "glm-5.0",
+		"kiro-claude-sonnet-4-5":        "claude-sonnet-4.5",
+		"kiro-claude-haiku-4-5-agentic": "claude-haiku-4.5",
+	}
+	for modelID, want := range tests {
+		if got := e.mapModelToKiro(modelID); got != want {
+			t.Fatalf("mapModelToKiro(%q) = %q, want %q", modelID, got, want)
+		}
+	}
+}
+
 func TestGitHubCopilotAllowsOnlySupportedDynamicModels(t *testing.T) {
 	t.Parallel()
 
@@ -686,7 +705,7 @@ func TestGitHubCopilotExecute_ClaudeModelUsesNativeGateway(t *testing.T) {
 		gotInitiator = r.Header.Get("X-Initiator")
 		gotBody, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4.6","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"claude-sonnet-4.6","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
 	}))
 	defer server.Close()
 
@@ -710,11 +729,11 @@ func TestGitHubCopilotExecute_ClaudeModelUsesNativeGateway(t *testing.T) {
 		t.Fatalf("Execute() error: %v", err)
 	}
 
-	if gotPath != "/v1/messages" {
-		t.Fatalf("path = %q, want %q", gotPath, "/v1/messages")
+	if gotPath != "/chat/completions" {
+		t.Fatalf("path = %q, want %q", gotPath, "/chat/completions")
 	}
-	if gotQuery != "beta=true" {
-		t.Fatalf("query = %q, want %q", gotQuery, "beta=true")
+	if gotQuery != "" {
+		t.Fatalf("query = %q, want empty", gotQuery)
 	}
 	if gotAuth != "Bearer copilot-api-token" {
 		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer copilot-api-token")
@@ -751,12 +770,9 @@ func TestGitHubCopilotExecuteStream_ClaudeModelUsesNativeGateway(t *testing.T) {
 		gotInitiator = r.Header.Get("X-Initiator")
 		gotAPIVersion = r.Header.Get("X-Github-Api-Version")
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4.6\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"))
-		_, _ = w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
-		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"))
-		_, _ = w.Write([]byte("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
-		_, _ = w.Write([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"))
-		_, _ = w.Write([]byte("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"claude-sonnet-4.6\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer server.Close()
 
@@ -788,8 +804,8 @@ func TestGitHubCopilotExecuteStream_ClaudeModelUsesNativeGateway(t *testing.T) {
 		joined.Write(chunk.Payload)
 	}
 
-	if gotPath != "/v1/messages" {
-		t.Fatalf("path = %q, want %q", gotPath, "/v1/messages")
+	if gotPath != "/chat/completions" {
+		t.Fatalf("path = %q, want %q", gotPath, "/chat/completions")
 	}
 	if gotInitiator != "agent" {
 		t.Fatalf("X-Initiator = %q, want %q", gotInitiator, "agent")
@@ -801,8 +817,6 @@ func TestGitHubCopilotExecuteStream_ClaudeModelUsesNativeGateway(t *testing.T) {
 		t.Fatalf("stream = %q, want Claude SSE payload", joined.String())
 	}
 }
-
->>>>>>> v6.10.8-2
 func TestCountTokens_EmptyPayload(t *testing.T) {
 	t.Parallel()
 	e := &GitHubCopilotExecutor{}

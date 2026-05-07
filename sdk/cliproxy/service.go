@@ -732,6 +732,7 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		go s.startKiroModelRefresh(ctx, 3*time.Hour)
 	}
 
 	select {
@@ -812,6 +813,52 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		usage.StopDefault()
 	})
 	return shutdownErr
+}
+
+func (s *Service) startKiroModelRefresh(ctx context.Context, interval time.Duration) {
+	if s == nil || ctx == nil || interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	log.Infof("kiro model refresh started (interval=%s)", interval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.refreshKiroModels()
+		}
+	}
+}
+
+func (s *Service) refreshKiroModels() {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+
+	auths := s.coreManager.List()
+	refreshed := 0
+	for _, item := range auths {
+		if item == nil || item.ID == "" {
+			continue
+		}
+		auth, ok := s.coreManager.GetByID(item.ID)
+		if !ok || auth == nil || auth.Disabled {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "kiro") {
+			continue
+		}
+		if s.refreshModelRegistrationForAuth(auth) {
+			refreshed++
+		}
+	}
+
+	if refreshed > 0 {
+		log.Infof("kiro: refreshed model registrations for %d auth(s)", refreshed)
+	}
 }
 
 func (s *Service) ensureAuthDir() error {

@@ -23,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	kiroclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/claude"
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
 	kiroopenai "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/openai"
@@ -1691,6 +1692,7 @@ func getEffectiveProfileArnWithWarning(auth *cliproxyauth.Auth, profileArn strin
 // Supports both Kiro and Amazon Q prefixes since they use the same API.
 // Agentic variants (-agentic suffix) map to the same backend model IDs.
 func (e *KiroExecutor) mapModelToKiro(model string) string {
+	model = strings.TrimSpace(model)
 	modelMap := map[string]string{
 		// Amazon Q format (amazonq- prefix) - same API as Kiro
 		"amazonq-auto":                       "auto",
@@ -1745,6 +1747,20 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		return kiroID
 	}
 
+	if strings.HasPrefix(model, "kiro-") {
+		if modelInfo := registry.LookupModelInfo(model, "kiro"); modelInfo != nil {
+			if backendID := kiroBackendModelID(model); backendID != "" {
+				log.Debugf("kiro: mapped registry model '%s' to backend ID '%s'", model, backendID)
+				return backendID
+			}
+		}
+
+		if backendID := kiroBackendModelID(model); backendID != "" {
+			log.Debugf("kiro: inferred backend ID '%s' for model '%s'", backendID, model)
+			return backendID
+		}
+	}
+
 	// Smart fallback: try to infer model type from name patterns
 	modelLower := strings.ToLower(model)
 
@@ -1787,6 +1803,33 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 	// Final fallback to Sonnet 4.5 (most commonly used model)
 	log.Warnf("kiro: unknown model '%s', falling back to claude-sonnet-4.5", model)
 	return "claude-sonnet-4.5"
+}
+
+func kiroBackendModelID(model string) string {
+	backendID := strings.TrimSpace(model)
+	if backendID == "" {
+		return ""
+	}
+	backendID = strings.TrimPrefix(backendID, "kiro-")
+	backendID = strings.TrimSuffix(backendID, "-agentic")
+	if backendID == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.Grow(len(backendID))
+	for i := 0; i < len(backendID); i++ {
+		if backendID[i] == '-' && i > 0 && i < len(backendID)-1 {
+			prev := backendID[i-1]
+			next := backendID[i+1]
+			if prev >= '0' && prev <= '9' && next >= '0' && next <= '9' {
+				b.WriteByte('.')
+				continue
+			}
+		}
+		b.WriteByte(backendID[i])
+	}
+	return b.String()
 }
 
 // EventStreamError represents an Event Stream processing error
