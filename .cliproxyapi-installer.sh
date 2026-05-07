@@ -134,9 +134,6 @@ git_sync() {
     fi
     log_info "Latest release tag: $latest_tag"
 
-    local current_head
-    current_head=$(git rev-parse HEAD)
-    
     log_info "Merging $latest_tag..."
     if ! git merge "$latest_tag" --no-edit; then
         log_error "Merge conflict detected. Manual resolution required."
@@ -144,10 +141,10 @@ git_sync() {
         exit 1
     fi
     
-    local new_head
-    new_head=$(git rev-parse HEAD)
+    local commits_since_tag
+    commits_since_tag=$(git rev-list --count "${latest_tag}..HEAD")
     local has_new_commits=0
-    [[ "$current_head" != "$new_head" ]] && has_new_commits=1
+    [[ "$commits_since_tag" -gt 0 ]] && has_new_commits=1
     
     log_success "Merged $latest_tag"
 
