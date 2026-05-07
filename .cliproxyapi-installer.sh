@@ -61,7 +61,10 @@ is_service_running() {
 }
 
 stop_service() {
-    is_service_running && { log_info "Stopping service..."; systemctl --user stop cliproxyapi.service; }
+    if is_service_running; then
+        log_info "Stopping service..."
+        systemctl --user stop cliproxyapi.service
+    fi
 }
 
 stop_processes() {
