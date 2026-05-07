@@ -75,7 +75,7 @@ func TestRefreshSingle_UsesCLIOAuthForKiroCLI(t *testing.T) {
 	}
 }
 
-func TestRefreshSingle_KiroCLIWithoutCLIOAuthUsesFallback(t *testing.T) {
+func TestRefreshSingle_KiroCLIWithoutCLIOAuthAborts(t *testing.T) {
 	repo := &testTokenRepo{}
 	r := NewBackgroundRefresher(repo)
 
