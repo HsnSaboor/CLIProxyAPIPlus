@@ -1186,9 +1186,6 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 		// Each endpoint requires its matching Origin value in the request body
 		kiroPayload, thinkingEnabled := buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, isAgentic, isChatOnly, from, opts.Headers)
 
-		// DEBUG DUMP
-		log.Infof("KIRO DEBUG PAYLOAD: %s", string(kiroPayload))
-
 		log.Debugf("kiro: stream trying endpoint %d/%d: %s (Name: %s, Origin: %s)",
 			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
 

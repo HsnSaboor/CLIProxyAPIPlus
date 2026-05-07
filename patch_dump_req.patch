@@ -1,0 +1,12 @@
+--- internal/runtime/executor/kiro_executor.go
++++ internal/runtime/executor/kiro_executor.go
+@@ -1189,6 +1189,9 @@
+ 		// Each endpoint requires its matching Origin value in the request body
+ 		kiroPayload, thinkingEnabled := buildKiroPayloadForFormat(body, kiroModelID, profileArn, currentOrigin, isAgentic, isChatOnly, from, opts.Headers)
+ 
++		// DEBUG DUMP
++		log.Infof("KIRO DEBUG PAYLOAD: %s", string(kiroPayload))
++
+ 		log.Debugf("kiro: stream trying endpoint %d/%d: %s (Name: %s, Origin: %s)",
+ 			endpointIdx+1, len(endpointConfigs), url, endpointConfig.Name, currentOrigin)
+ 

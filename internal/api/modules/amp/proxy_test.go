@@ -133,7 +133,7 @@ func TestModifyResponse_GzipScenarios(t *testing.T) {
 			header:   http.Header{},
 			body:     good,
 			status:   404,
-			wantBody: good,
+			wantBody: goodJSON,
 			wantCE:   "",
 		},
 	}

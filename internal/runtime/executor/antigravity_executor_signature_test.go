@@ -40,7 +40,7 @@ func invalidClaudeThinkingPayload() []byte {
 			{
 				"role": "assistant",
 				"content": [
-					{"type": "thinking", "thinking": "bad", "signature": "` + testGeminiSignaturePayload() + `"},
+					{"type": "thinking", "thinking": "bad", "signature": "E!!invalid-base64!!"},
 					{"type": "text", "text": "hello"}
 				]
 			}
