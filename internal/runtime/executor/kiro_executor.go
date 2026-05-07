@@ -1749,16 +1749,28 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 
 	if strings.HasPrefix(model, "kiro-") {
 		if modelInfo := registry.LookupModelInfo(model, "kiro"); modelInfo != nil {
+			// Prefer explicit execution target from registry when present. This preserves
+			// fully-qualified upstream model IDs such as 'kiro-glm-5' that the Kiro API may expect.
+			if modelInfo.ExecutionTarget != "" {
+				log.Debugf("kiro: using registry execution target '%s' for model '%s'", modelInfo.ExecutionTarget, model)
+				return modelInfo.ExecutionTarget
+			}
+			// Fall back to the registry ID if available
+			if modelInfo.ID != "" {
+				log.Debugf("kiro: using registry ID '%s' for model '%s'", modelInfo.ID, model)
+				return modelInfo.ID
+			}
+			// If registry entry exists but no explicit target, infer backend format conservatively
 			if backendID := kiroBackendModelID(model); backendID != "" {
 				log.Debugf("kiro: mapped registry model '%s' to backend ID '%s'", model, backendID)
 				return backendID
 			}
 		}
 
-		if backendID := kiroBackendModelID(model); backendID != "" {
-			log.Debugf("kiro: inferred backend ID '%s' for model '%s'", backendID, model)
-			return backendID
-		}
+		// No registry entry: prefer passing the model through unchanged (many upstreams accept the kiro- prefix)
+		// Only fall back to the numeric-dot conversion when necessary.
+		log.Debugf("kiro: passing model through unchanged for '%s'", model)
+		return model
 	}
 
 	// Smart fallback: try to infer model type from name patterns
