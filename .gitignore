@@ -68,3 +68,4 @@ _bmad-output/*
 .tldr/
 server
 .gocache/
+chat.txt
