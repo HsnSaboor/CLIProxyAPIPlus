@@ -24,6 +24,35 @@ log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${CYAN}[STEP]${NC} $1"; }
 
+restore_stash() {
+    local stash_ref="$1"
+    if [[ -n "$stash_ref" ]]; then
+        git stash pop --index -q "$stash_ref" >/dev/null 2>&1 || true
+    fi
+}
+
+resolve_latest_release_tag() {
+    local tag
+    tag=$(git tag -l 'v*.*.*-*' --sort=-v:refname | head -1)
+    if [[ -n "$tag" ]]; then
+        echo "$tag"
+        return 0
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+        tag=$(gh release list --limit 100 --json tagName --jq '.[] | .tagName' 2>/dev/null \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' \
+            | sort -Vr \
+            | head -1 || true)
+        if [[ -n "$tag" ]]; then
+            echo "$tag"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 is_service_running() {
     systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
 }
@@ -75,27 +104,29 @@ git_sync() {
     cd "$REPO_DIR"
 
     local stashed=0
+    local stash_ref=""
     if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
         log_info "Stashing uncommitted changes..."
         git stash push -u -m "${SCRIPT_NAME}-autostash-$(date +%Y%m%d-%H%M%S)" >/dev/null
+        stash_ref="stash@{0}"
         stashed=1
     fi
 
-    log_info "Syncing upstream stable tag..."
+    log_info "Refreshing release tags from origin..."
     local fetch_timeout="${FETCH_TIMEOUT:-120}"
-    if ! GIT_TERMINAL_PROMPT=0 timeout "$fetch_timeout" git fetch upstream --tags 2>/dev/null; then
-        log_error "Failed to fetch upstream tags (timeout=${fetch_timeout}s). Check network/remote auth."
-        exit 1
+    if ! GIT_TERMINAL_PROMPT=0 timeout "$fetch_timeout" git fetch origin --tags --prune 2>/dev/null; then
+        log_warning "Failed to refresh origin tags (timeout=${fetch_timeout}s). Continuing with local/gh tag cache."
+    else
+        log_success "Refreshed origin tags"
     fi
-    log_success "Fetched upstream tags"
 
     local latest_tag
-    latest_tag=$(git tag -l 'v*.*.*-*' --sort=-v:refname | head -1)
+    latest_tag=$(resolve_latest_release_tag || true)
     if [[ -z "$latest_tag" ]]; then
         log_error "No stable tag found matching v*.*.*-*"
         exit 1
     fi
-    log_info "Latest upstream tag: $latest_tag"
+    log_info "Latest release tag: $latest_tag"
 
     local current_head
     current_head=$(git rev-parse HEAD)
@@ -124,8 +155,14 @@ git_sync() {
 
     if [[ "$PUSH_TAGS" == "1" ]] && [[ $has_new_commits -eq 1 ]]; then
         log_info "Creating and pushing release tag..."
-        local base_version="${latest_tag%-*}"
-        local patch_num="${latest_tag##*-}"
+        local base_version patch_num
+        if [[ "$latest_tag" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)$ ]]; then
+            base_version="${BASH_REMATCH[1]}"
+            patch_num="${BASH_REMATCH[2]}"
+        else
+            log_error "Unexpected release tag format: $latest_tag"
+            exit 1
+        fi
         local new_tag="${base_version}-$((patch_num + 1))"
         
         if git tag -a "$new_tag" -m "Release $new_tag" 2>/dev/null; then
@@ -138,7 +175,10 @@ git_sync() {
         log_info "No new commits, skipping tag creation"
     fi
 
-    [[ $stashed -eq 1 ]] && log_info "Changes stashed as: ${SCRIPT_NAME}-autostash-$(date +%Y%m%d-%H%M%S)"
+    if [[ $stashed -eq 1 ]]; then
+        log_info "Restoring stashed changes..."
+        restore_stash "$stash_ref"
+    fi
 }
 
 build_binary() {
