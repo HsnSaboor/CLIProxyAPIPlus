@@ -69,3 +69,5 @@ _bmad-output/*
 server
 .gocache/
 chat.txt
+*.orig
+*.patch

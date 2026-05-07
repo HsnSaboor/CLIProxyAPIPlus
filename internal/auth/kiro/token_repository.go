@@ -190,6 +190,9 @@ func (r *FileTokenRepository) readTokenFile(path string) (*Token, error) {
 	// 解析 auth_method (case-insensitive comparison to handle "IdC", "IDC", "idc", etc.)
 	authMethod, _ := metadata["auth_method"].(string)
 	authMethod = strings.ToLower(authMethod)
+	if authMethod != "idc" && authMethod != "builder-id" && authMethod != "kiro-cli" {
+		return nil, nil
+	}
 
 	token := &Token{
 		ID:         filepath.Base(path),
