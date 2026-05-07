@@ -615,6 +615,7 @@ func GetKiroModels() []*ModelInfo {
 			Description:         "MiniMax M2.5 via Kiro",
 			ContextLength:       196000,
 			MaxCompletionTokens: 64000,
+			ExecutionTarget:     "minimax-m2.5",
 		},
 		{
 			ID:                  "kiro-glm-5",
@@ -626,6 +627,7 @@ func GetKiroModels() []*ModelInfo {
 			Description:         "GLM-5 via Kiro",
 			ContextLength:       200000,
 			MaxCompletionTokens: 64000,
+			ExecutionTarget:     "glm-5",
 		},
 		{
 			ID:                  "kiro-qwen3-coder-next",
@@ -790,6 +792,7 @@ func GetKiroModels() []*ModelInfo {
 			Description:         "MiniMax M2.5 optimized for coding agents (chunked writes)",
 			ContextLength:       196000,
 			MaxCompletionTokens: 64000,
+			ExecutionTarget:     "minimax-m2.5",
 		},
 		{
 			ID:                  "kiro-glm-5-agentic",
@@ -801,6 +804,7 @@ func GetKiroModels() []*ModelInfo {
 			Description:         "GLM-5 optimized for coding agents (chunked writes)",
 			ContextLength:       200000,
 			MaxCompletionTokens: 64000,
+			ExecutionTarget:     "glm-5",
 		},
 		{
 			ID:                  "kiro-qwen3-coder-next-agentic",

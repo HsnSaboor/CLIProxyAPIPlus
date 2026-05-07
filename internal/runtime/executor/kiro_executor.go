@@ -1742,10 +1742,12 @@ var defaultKiroModelMap = map[string]string{
 func (e *KiroExecutor) mapModelToKiro(model string) string {
 	model = strings.TrimSpace(model)
 
-	// Handle agentic variants dynamically
+	// Handle agentic and chat variants dynamically
 	baseModel := model
 	if strings.HasSuffix(model, "-agentic") {
 		baseModel = strings.TrimSuffix(model, "-agentic")
+	} else if strings.HasSuffix(model, "-chat") {
+		baseModel = strings.TrimSuffix(model, "-chat")
 	}
 
 	if kiroID, ok := defaultKiroModelMap[baseModel]; ok {
@@ -1769,14 +1771,14 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 				return modelInfo.ID
 			}
 			// If registry entry exists but no explicit target, infer backend format conservatively
-			if backendID := kiroBackendModelID(model); backendID != "" {
+			if backendID := kiroBackendModelID(baseModel); backendID != "" {
 				log.Debugf("kiro: mapped registry model '%s' to backend ID '%s'", model, backendID)
 				return backendID
 			}
 		}
 
 		// No registry entry: infer backend format from the user-facing kiro-* alias.
-		if backendID := kiroBackendModelID(model); backendID != "" {
+		if backendID := kiroBackendModelID(baseModel); backendID != "" {
 			log.Debugf("kiro: inferred backend ID '%s' for model '%s'", backendID, model)
 			return backendID
 		}
@@ -1786,17 +1788,17 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 
 	// If a backend model ID is already provided directly (e.g. "glm-5"),
 	// forward it as-is instead of forcing a Claude fallback.
+	modelLower := strings.ToLower(model)
 	if !strings.HasPrefix(model, "amazonq-") &&
 		!strings.HasPrefix(model, "kiro-") &&
-		!strings.Contains(strings.ToLower(model), "claude") &&
-		!strings.Contains(strings.ToLower(model), "sonnet") &&
-		!strings.Contains(strings.ToLower(model), "haiku") &&
-		!strings.Contains(strings.ToLower(model), "opus") {
+		!strings.Contains(modelLower, "claude") &&
+		!strings.Contains(modelLower, "sonnet") &&
+		!strings.Contains(modelLower, "haiku") &&
+		!strings.Contains(modelLower, "opus") {
 		return model
 	}
 
 	// Smart fallback: try to infer model type from name patterns
-	modelLower := strings.ToLower(model)
 
 	// Check for Haiku variants
 	if strings.Contains(modelLower, "haiku") {

@@ -85,8 +85,10 @@ func NewBackgroundRefresher(repo TokenRepository, opts ...RefresherOption) *Back
 func WithConfig(cfg *config.Config) RefresherOption {
 	return func(r *BackgroundRefresher) {
 		r.oauth = NewKiroOAuth(cfg)
-		r.cliOAuth = NewKiroCLIOAuth(cfg)
 		r.ssoClient = NewSSOOIDCClient(cfg)
+		r.callbackMu.Lock()
+		r.cliOAuth = NewKiroCLIOAuth(cfg)
+		r.callbackMu.Unlock()
 	}
 }
 
@@ -187,10 +189,13 @@ func (r *BackgroundRefresher) refreshSingle(ctx context.Context, token *Token) {
 				token.RefreshToken,
 			)
 		case "kiro-cli":
-			if r.cliOAuth == nil {
+			r.callbackMu.RLock()
+			cliOAuth := r.cliOAuth
+			r.callbackMu.RUnlock()
+			if cliOAuth == nil {
 				return nil, fmt.Errorf("kiro-cli refresh requested but cli oauth is not initialized")
 			}
-			return r.cliOAuth.RefreshToken(ctx, token.RefreshToken)
+			return cliOAuth.RefreshToken(ctx, token.RefreshToken)
 		default:
 			return r.oauth.RefreshTokenWithFingerprint(ctx, token.RefreshToken, token.ID)
 		}

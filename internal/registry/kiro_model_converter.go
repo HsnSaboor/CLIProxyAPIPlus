@@ -196,9 +196,9 @@ func MergeWithStaticMetadata(dynamicModels, staticModels []*ModelInfo) []*ModelI
 		if sm, exists := staticMap[dm.ID]; exists {
 			// Static metadata takes priority, but preserve ExecutionTarget from dynamic if static has none.
 			if sm.ExecutionTarget == "" && dm.ExecutionTarget != "" {
-				merged := *sm
+				merged := cloneModelInfo(sm)
 				merged.ExecutionTarget = dm.ExecutionTarget
-				result = append(result, &merged)
+				result = append(result, merged)
 			} else {
 				result = append(result, sm)
 			}

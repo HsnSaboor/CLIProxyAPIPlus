@@ -81,15 +81,15 @@ func TestRefreshSingle_KiroCLIWithoutCLIOAuthAborts(t *testing.T) {
 
 	token := &Token{
 		ID:           "kiro-cli-test.json",
-		AccessToken:  "still-valid-token",
+		AccessToken:  "expired-token",
 		RefreshToken: "old-refresh",
-		ExpiresAt:    time.Now().Add(30 * time.Minute),
+		ExpiresAt:    time.Now().Add(-time.Hour), // expired: no fallback possible
 		AuthMethod:   "kiro-cli",
 	}
 
 	r.refreshSingle(context.Background(), token)
 
 	if repo.updatedToken != nil {
-		t.Fatal("did not expect persisted update when fallback token is used")
+		t.Fatal("did not expect persisted update when cliOAuth is nil and token is expired")
 	}
 }
