@@ -243,7 +243,7 @@ func (fp *Fingerprint) BuildUserAgent() string {
 }
 
 func (fp *Fingerprint) BuildRustStreamingUserAgent() string {
-	return "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-2.0.0 app/AmazonQ-For-CLI"
+	return "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-2.2.2 app/AmazonQ-For-CLI"
 }
 
 func (fp *Fingerprint) BuildRustStreamingAmzUserAgent() string {
@@ -261,7 +261,7 @@ func (fp *Fingerprint) BuildAmzUserAgent() string {
 }
 
 func (fp *Fingerprint) BuildRustRuntimeUserAgent() string {
-	return "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererruntime/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-2.0.0 app/AmazonQ-For-CLI"
+	return "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererruntime/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-2.2.2 app/AmazonQ-For-CLI"
 }
 
 func (fp *Fingerprint) BuildRustRuntimeAmzUserAgent() string {

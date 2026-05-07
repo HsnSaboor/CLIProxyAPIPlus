@@ -37,7 +37,7 @@ import (
 
 const (
 	// Kiro API common constants
-	kiroContentType  = "application/json"
+	kiroContentType  = "application/x-amz-json-1.0"
 	kiroAcceptStream = "*/*"
 
 	// Event Stream frame size constants for boundary protection
@@ -767,6 +767,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 
 			httpReq.Header.Set("Content-Type", kiroContentType)
 			httpReq.Header.Set("Accept", kiroAcceptStream)
+			httpReq.Header.Set("Accept-Encoding", "gzip")
 			// Only set X-Amz-Target if specified (Q endpoint doesn't require it)
 			if endpointConfig.AmzTarget != "" {
 				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)
@@ -1204,6 +1205,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 
 			httpReq.Header.Set("Content-Type", kiroContentType)
 			httpReq.Header.Set("Accept", kiroAcceptStream)
+			httpReq.Header.Set("Accept-Encoding", "gzip")
 			// Only set X-Amz-Target if specified (Q endpoint doesn't require it)
 			if endpointConfig.AmzTarget != "" {
 				httpReq.Header.Set("X-Amz-Target", endpointConfig.AmzTarget)

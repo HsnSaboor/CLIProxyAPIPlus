@@ -38,12 +38,12 @@ type KiroInferenceConfig struct {
 
 // KiroConversationState holds the conversation context
 type KiroConversationState struct {
-	AgentContinuationID string               `json:"agentContinuationId,omitempty"`
-	AgentTaskType       string               `json:"agentTaskType,omitempty"`
-	ChatTriggerType     string               `json:"chatTriggerType"` // Required: "MANUAL"
 	ConversationID      string               `json:"conversationId"`
-	CurrentMessage      KiroCurrentMessage   `json:"currentMessage"`
 	History             []KiroHistoryMessage `json:"history,omitempty"`
+	CurrentMessage      KiroCurrentMessage   `json:"currentMessage"`
+	ChatTriggerType     string               `json:"chatTriggerType"` // Required: "MANUAL"
+	AgentTaskType       string               `json:"agentTaskType,omitempty"`
+	AgentContinuationID string               `json:"agentContinuationId,omitempty"`
 }
 
 // KiroCurrentMessage wraps the current user message
@@ -71,16 +71,23 @@ type KiroImageSource struct {
 // KiroUserInputMessage represents a user message
 type KiroUserInputMessage struct {
 	Content                 string                       `json:"content"`
-	ModelID                 string                       `json:"modelId"`
-	Origin                  string                       `json:"origin"`
-	Images                  []KiroImage                  `json:"images,omitempty"`
 	UserInputMessageContext *KiroUserInputMessageContext `json:"userInputMessageContext,omitempty"`
+	Origin                  string                       `json:"origin"`
+	ModelID                 string                       `json:"modelId,omitempty"`
+	Images                  []KiroImage                  `json:"images,omitempty"`
 }
 
 // KiroUserInputMessageContext contains tool-related context
 type KiroUserInputMessageContext struct {
+	EnvState    *KiroEnvState     `json:"envState,omitempty"`
 	ToolResults []KiroToolResult  `json:"toolResults,omitempty"`
 	Tools       []KiroToolWrapper `json:"tools,omitempty"`
+}
+
+// KiroEnvState contains environment context sent with the current message
+type KiroEnvState struct {
+	OperatingSystem         string `json:"operatingSystem,omitempty"`
+	CurrentWorkingDirectory string `json:"currentWorkingDirectory,omitempty"`
 }
 
 // KiroToolResult represents a tool execution result
