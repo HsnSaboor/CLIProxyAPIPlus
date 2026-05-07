@@ -54,7 +54,10 @@ resolve_latest_release_tag() {
 }
 
 is_service_running() {
-    systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null
+    if systemctl --user is-active --quiet cliproxyapi.service 2>/dev/null; then
+        return 0
+    fi
+    return 1
 }
 
 stop_service() {
