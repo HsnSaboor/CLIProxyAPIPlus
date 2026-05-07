@@ -332,9 +332,9 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 func normalizeOrigin(origin string) string {
 	switch origin {
 	case "KIRO_CLI":
-		return "CLI"
+		return "KIRO_CLI"
 	case "KIRO_AI_EDITOR":
-		return "AI_EDITOR"
+		return "KIRO_AI_EDITOR"
 	case "AMAZON_Q":
 		return "CLI"
 	case "KIRO_IDE":

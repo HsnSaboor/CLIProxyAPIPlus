@@ -1713,6 +1713,11 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"kiro-claude-sonnet-4":            "claude-sonnet-4",
 		"kiro-claude-sonnet-4-20250514":   "claude-sonnet-4",
 		"kiro-claude-haiku-4-5":           "claude-haiku-4.5",
+		"kiro-deepseek-3-2":               "deepseek-3.2",
+		"kiro-minimax-m2-5":               "minimax-m2.5",
+		"kiro-minimax-m2-1":               "minimax-m2.1",
+		"kiro-glm-5":                      "glm-5",
+		"kiro-qwen3-coder-next":           "qwen3-coder-next",
 		"kiro-auto":                       "auto",
 		// Native format (no prefix) - used by Kiro IDE directly
 		"claude-opus-4-6":            "claude-opus-4.6",
@@ -1728,6 +1733,11 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"claude-sonnet-4.5":          "claude-sonnet-4.5",
 		"claude-sonnet-4":            "claude-sonnet-4",
 		"claude-sonnet-4-20250514":   "claude-sonnet-4",
+		"deepseek-3-2":               "deepseek-3.2",
+		"minimax-m2-5":               "minimax-m2.5",
+		"minimax-m2-1":               "minimax-m2.1",
+		"glm-5":                      "glm-5",
+		"qwen3-coder-next":           "qwen3-coder-next",
 		"auto":                       "auto",
 		// Agentic variants (same backend model IDs, but with special system prompt)
 		"claude-opus-4.6-agentic":        "claude-opus-4.6",
@@ -1742,6 +1752,11 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 		"kiro-claude-sonnet-4-5-agentic": "claude-sonnet-4.5",
 		"kiro-claude-sonnet-4-agentic":   "claude-sonnet-4",
 		"kiro-claude-haiku-4-5-agentic":  "claude-haiku-4.5",
+		"kiro-deepseek-3-2-agentic":      "deepseek-3.2",
+		"kiro-minimax-m2-5-agentic":      "minimax-m2.5",
+		"kiro-minimax-m2-1-agentic":      "minimax-m2.1",
+		"kiro-glm-5-agentic":             "glm-5",
+		"kiro-qwen3-coder-next-agentic":  "qwen3-coder-next",
 	}
 	if kiroID, ok := modelMap[model]; ok {
 		return kiroID
