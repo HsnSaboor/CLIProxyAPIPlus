@@ -1818,6 +1818,9 @@ func convertKiroAPIModels(apiModels []*kiroauth.KiroModel) []*ModelInfo {
 			MaxCompletionTokens: 64000,
 			Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
 		}
+		if target := strings.TrimSpace(m.ModelID); target != "" {
+			info.ExecutionTarget = target
+		}
 
 		if m.MaxInputTokens > 0 {
 			info.ContextLength = m.MaxInputTokens
@@ -1945,6 +1948,7 @@ func generateKiroAgenticVariants(models []*ModelInfo) []*ModelInfo {
 			Description:         m.Description + " - Optimized for coding agents (chunked writes)",
 			ContextLength:       m.ContextLength,
 			MaxCompletionTokens: m.MaxCompletionTokens,
+			ExecutionTarget:     m.ExecutionTarget,
 		}
 
 		// Copy thinking support if present

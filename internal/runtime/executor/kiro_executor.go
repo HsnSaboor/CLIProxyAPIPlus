@@ -1755,8 +1755,11 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 				log.Debugf("kiro: using registry execution target '%s' for model '%s'", modelInfo.ExecutionTarget, model)
 				return modelInfo.ExecutionTarget
 			}
-			// Fall back to the registry ID if available
-			if modelInfo.ID != "" {
+			// Fall back to registry ID only when it already looks like a backend ID
+			// (i.e. not a user-facing kiro-/amazonq- alias).
+			if modelInfo.ID != "" &&
+				!strings.HasPrefix(modelInfo.ID, "kiro-") &&
+				!strings.HasPrefix(modelInfo.ID, "amazonq-") {
 				log.Debugf("kiro: using registry ID '%s' for model '%s'", modelInfo.ID, model)
 				return modelInfo.ID
 			}
@@ -1767,9 +1770,23 @@ func (e *KiroExecutor) mapModelToKiro(model string) string {
 			}
 		}
 
-		// No registry entry: prefer passing the model through unchanged (many upstreams accept the kiro- prefix)
-		// Only fall back to the numeric-dot conversion when necessary.
+		// No registry entry: infer backend format from the user-facing kiro-* alias.
+		if backendID := kiroBackendModelID(model); backendID != "" {
+			log.Debugf("kiro: inferred backend ID '%s' for model '%s'", backendID, model)
+			return backendID
+		}
 		log.Debugf("kiro: passing model through unchanged for '%s'", model)
+		return model
+	}
+
+	// If a backend model ID is already provided directly (e.g. "glm-5"),
+	// forward it as-is instead of forcing a Claude fallback.
+	if !strings.HasPrefix(model, "amazonq-") &&
+		!strings.HasPrefix(model, "kiro-") &&
+		!strings.Contains(strings.ToLower(model), "claude") &&
+		!strings.Contains(strings.ToLower(model), "sonnet") &&
+		!strings.Contains(strings.ToLower(model), "haiku") &&
+		!strings.Contains(strings.ToLower(model), "opus") {
 		return model
 	}
 
