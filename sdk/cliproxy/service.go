@@ -1702,11 +1702,11 @@ func (s *Service) fetchKiroModels(a *coreauth.Auth) []*ModelInfo {
 		return registry.GetKiroModels()
 	}
 
-	// Convert API models to ModelInfo
-	models := convertKiroAPIModels(apiModels)
-
-	// Generate agentic variants
-	models = generateKiroAgenticVariants(models)
+	// Convert API models to ModelInfo using canonical registry pipeline.
+	apiModelInfos := toKiroAPIModels(apiModels)
+	models := registry.ConvertKiroAPIModels(apiModelInfos)
+	models = registry.MergeWithStaticMetadata(models, registry.GetKiroModels())
+	models = registry.GenerateAgenticVariants(models)
 
 	log.Infof("kiro: successfully fetched %d models from API (including agentic variants)", len(models))
 	return models
@@ -1789,181 +1789,21 @@ func (s *Service) extractKiroTokenData(a *coreauth.Auth) *kiroauth.KiroTokenData
 	}
 }
 
-// convertKiroAPIModels converts Kiro API models to ModelInfo slice.
-func convertKiroAPIModels(apiModels []*kiroauth.KiroModel) []*ModelInfo {
-	if len(apiModels) == 0 {
-		return nil
-	}
-
-	now := time.Now().Unix()
-	models := make([]*ModelInfo, 0, len(apiModels))
-
-	for _, m := range apiModels {
-		if m == nil || m.ModelID == "" {
-			continue
-		}
-
-		// Create model ID with kiro- prefix
-		modelID := "kiro-" + normalizeKiroModelID(m.ModelID)
-
-		info := &ModelInfo{
-			ID:                  modelID,
-			Object:              "model",
-			Created:             now,
-			OwnedBy:             "aws",
-			Type:                "kiro",
-			DisplayName:         formatKiroDisplayName(m.ModelName, m.RateMultiplier),
-			Description:         m.Description,
-			ContextLength:       200000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
-		}
-		if target := strings.TrimSpace(m.ModelID); target != "" {
-			info.ExecutionTarget = target
-		}
-
-		if m.MaxInputTokens > 0 {
-			info.ContextLength = m.MaxInputTokens
-		}
-
-		models = append(models, info)
-	}
-
-	return models
-}
-
-// normalizeKiroModelID normalizes a Kiro model ID by converting dots to dashes
-// and removing common prefixes.
-func normalizeKiroModelID(modelID string) string {
-	// Remove common prefixes
-	modelID = strings.TrimPrefix(modelID, "anthropic.")
-	modelID = strings.TrimPrefix(modelID, "amazon.")
-
-	// Replace dots with dashes for consistency
-	modelID = strings.ReplaceAll(modelID, ".", "-")
-
-	// Replace underscores with dashes
-	modelID = strings.ReplaceAll(modelID, "_", "-")
-
-	return strings.ToLower(modelID)
-}
-
-// formatKiroDisplayName formats the display name with rate multiplier info.
-func formatKiroDisplayName(modelName string, rateMultiplier float64) string {
-	if modelName == "" {
-		return ""
-	}
-
-	displayName := "Kiro " + modelName
-	if rateMultiplier > 0 && rateMultiplier != 1.0 {
-		displayName += fmt.Sprintf(" (%.1fx credit)", rateMultiplier)
-	}
-
-	return displayName
-}
-
-// generateKiroAgenticVariants generates agentic variants for Kiro models.
-// Agentic variants have optimized system prompts for coding agents.
-func generateKiroAgenticVariants(models []*ModelInfo) []*ModelInfo {
-	if len(models) == 0 {
-		return models
-	}
-
-	result := make([]*ModelInfo, 0, len(models)*2)
-	result = append(result, models...)
-
-	// [새로 추가] KiroExecutor가 지원하는 가상 Friendly ID들을 명시적으로 추가
-	// 이를 통해 사용자가 OAuthModelAlias에서 이 이름들을 타겟으로 사용할 수 있게 함
-	virtualModels := []struct {
-		ID          string
-		DisplayName string
-	}{
-		{"kiro-claude-sonnet-4-5", "Kiro Claude Sonnet 4.5"},
-		{"kiro-claude-sonnet-4", "Kiro Claude Sonnet 4"},
-		{"kiro-claude-haiku-4-5", "Kiro Claude Haiku 4.5"},
-		{"kiro-claude-sonnet-4-5-agentic", "Kiro Claude Sonnet 4.5 (Agentic)"},
-		{"kiro-claude-sonnet-4-agentic", "Kiro Claude Sonnet 4 (Agentic)"},
-		{"kiro-claude-haiku-4-5-agentic", "Kiro Claude Haiku 4.5 (Agentic)"},
-	}
-
-	seen := make(map[string]bool)
-	for _, m := range models {
-		seen[m.ID] = true
-	}
-
-	// 가상 모델 중 아직 등록되지 않은 것만 추가
-	addedVirtuals := 0
-	for _, vm := range virtualModels {
-		if !seen[vm.ID] {
-			virtual := &ModelInfo{
-				ID:                  vm.ID,
-				Object:              "model",
-				Created:             time.Now().Unix(),
-				OwnedBy:             "aws",
-				Type:                "kiro",
-				DisplayName:         vm.DisplayName,
-				Description:         "Virtual model compatible with Kiro Executor",
-				ContextLength:       200000,
-				MaxCompletionTokens: 64000,
-				Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
-			}
-			result = append(result, virtual)
-			seen[vm.ID] = true
-			addedVirtuals++
-		}
-	}
-	if addedVirtuals > 0 {
-		log.Debugf("generateKiroAgenticVariants: added %d virtual models", addedVirtuals)
-	}
-
-	for _, m := range models {
+// toKiroAPIModels adapts kiroauth.KiroModel to registry.KiroAPIModel to bridge the import cycle.
+func toKiroAPIModels(src []*kiroauth.KiroModel) []*registry.KiroAPIModel {
+	out := make([]*registry.KiroAPIModel, 0, len(src))
+	for _, m := range src {
 		if m == nil {
 			continue
 		}
-
-		// Skip if already an agentic variant
-		if strings.HasSuffix(m.ID, "-agentic") {
-			continue
-		}
-
-		// Skip auto models from agentic variant generation
-		if strings.Contains(m.ID, "-auto") {
-			continue
-		}
-
-		// Skip if agentic variant already exists (from virtual models)
-		agenticID := m.ID + "-agentic"
-		if seen[agenticID] {
-			continue
-		}
-
-		// Create agentic variant
-		agentic := &ModelInfo{
-			ID:                  agenticID,
-			Object:              m.Object,
-			Created:             m.Created,
-			OwnedBy:             m.OwnedBy,
-			Type:                m.Type,
-			DisplayName:         m.DisplayName + " (Agentic)",
-			Description:         m.Description + " - Optimized for coding agents (chunked writes)",
-			ContextLength:       m.ContextLength,
-			MaxCompletionTokens: m.MaxCompletionTokens,
-			ExecutionTarget:     m.ExecutionTarget,
-		}
-
-		// Copy thinking support if present
-		if m.Thinking != nil {
-			agentic.Thinking = &registry.ThinkingSupport{
-				Min:            m.Thinking.Min,
-				Max:            m.Thinking.Max,
-				ZeroAllowed:    m.Thinking.ZeroAllowed,
-				DynamicAllowed: m.Thinking.DynamicAllowed,
-			}
-		}
-
-		result = append(result, agentic)
-		seen[agenticID] = true
+		out = append(out, &registry.KiroAPIModel{
+			ModelID:        m.ModelID,
+			ModelName:      m.ModelName,
+			Description:    m.Description,
+			RateMultiplier: m.RateMultiplier,
+			RateUnit:       m.RateUnit,
+			MaxInputTokens: m.MaxInputTokens,
+		})
 	}
-
-	return result
+	return out
 }

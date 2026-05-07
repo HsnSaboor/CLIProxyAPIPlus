@@ -86,6 +86,8 @@ func ConvertKiroAPIModels(kiroModels []*KiroAPIModel) []*ModelInfo {
 			// Use MaxInputTokens from API if available, otherwise use default
 			ContextLength:       getContextLength(km.MaxInputTokens),
 			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
+			// Raw model ID used by the executor for upstream routing
+			ExecutionTarget: km.ModelID,
 			// All Kiro models support thinking
 			Thinking: cloneThinkingSupport(DefaultKiroThinkingSupport),
 		}
@@ -141,6 +143,7 @@ func GenerateAgenticVariants(models []*ModelInfo) []*ModelInfo {
 			Description:         generateAgenticDescription(model.Description),
 			ContextLength:       model.ContextLength,
 			MaxCompletionTokens: model.MaxCompletionTokens,
+			ExecutionTarget:     model.ExecutionTarget,
 			Thinking:            cloneThinkingSupport(model.Thinking),
 		}
 
@@ -191,8 +194,14 @@ func MergeWithStaticMetadata(dynamicModels, staticModels []*ModelInfo) []*ModelI
 
 		// Check if static metadata exists for this model
 		if sm, exists := staticMap[dm.ID]; exists {
-			// Static metadata takes priority - use static model
-			result = append(result, sm)
+			// Static metadata takes priority, but preserve ExecutionTarget from dynamic if static has none.
+			if sm.ExecutionTarget == "" && dm.ExecutionTarget != "" {
+				merged := *sm
+				merged.ExecutionTarget = dm.ExecutionTarget
+				result = append(result, &merged)
+			} else {
+				result = append(result, sm)
+			}
 		} else {
 			// No static metadata - use dynamic model
 			result = append(result, dm)
