@@ -176,7 +176,7 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	}
 
 	// Normalize origin value for Kiro API compatibility
-	origin = normalizeOrigin(origin)
+	origin = kirocommon.NormalizeOrigin(origin)
 	log.Debugf("kiro: normalized origin value: %s", origin)
 
 	messages := gjson.GetBytes(claudeBody, "messages")
@@ -326,22 +326,6 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	}
 
 	return result, thinkingEnabled
-}
-
-// normalizeOrigin normalizes origin value for Kiro API compatibility
-func normalizeOrigin(origin string) string {
-	switch origin {
-	case "KIRO_CLI":
-		return "KIRO_CLI"
-	case "KIRO_AI_EDITOR":
-		return "KIRO_AI_EDITOR"
-	case "AMAZON_Q":
-		return "CLI"
-	case "KIRO_IDE":
-		return "AI_EDITOR"
-	default:
-		return origin
-	}
 }
 
 // extractMetadataFromMessages extracts metadata from messages[].additional_kwargs (LangChain format).
