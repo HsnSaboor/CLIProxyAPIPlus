@@ -3,6 +3,7 @@
 // and integration with various AI API handlers (OpenAI, Claude, Gemini).
 // The server supports hot-reloading of clients and configuration.
 package api
+
 import (
 	"context"
 	"crypto/subtle"
@@ -14,24 +15,25 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/access"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules"
-	ampmodule "github.com/router-for-me/CLIProxyAPI/v7/internal/api/modules/amp"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -44,7 +46,22 @@ import (
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
+
 const oauthCallbackSuccessHTML = `<html><head><meta charset="utf-8"><title>Authentication successful</title><script>setTimeout(function(){window.close();},5000);</script></head><body><h1>Authentication successful!</h1><p>You can close this window.</p><p>This window will close automatically in 5 seconds.</p></body></html>`
+
+var corsExposedResponseHeaders = []string{
+	"X-CPA-VERSION",
+	"X-CPA-COMMIT",
+	"X-CPA-BUILD-DATE",
+	"X-CPA-SUPPORT-PLUGIN",
+	"X-CPA-HOME-VERSION",
+	"X-CPA-HOME-BUILD-DATE",
+	"X-SERVER-VERSION",
+	"X-SERVER-BUILD-DATE",
+}
+
+var corsExposedResponseHeadersJoined = strings.Join(corsExposedResponseHeaders, ", ")
+
 type serverOptionConfig struct {
 	extraMiddleware      []gin.HandlerFunc
 	engineConfigurator   func(*gin.Engine)
@@ -55,9 +72,14 @@ type serverOptionConfig struct {
 	keepAliveTimeout     time.Duration
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
+	postAuthPersistHook  auth.PostAuthHook
+	pluginHost           *pluginhost.Host
+	configReloadHook     func(context.Context, *config.Config)
 }
+
 // ServerOption customises HTTP server construction.
 type ServerOption func(*serverOptionConfig)
+
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
 	logsDir := logging.ResolveLogDirectory(cfg)
@@ -65,30 +87,46 @@ func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.
 	logger.SetHomeEnabled(cfg != nil && cfg.Home.Enabled)
 	return logger
 }
+
+func effectiveSDKConfig(cfg *config.Config) *config.SDKConfig {
+	if cfg == nil {
+		return nil
+	}
+	sdkCfg := cfg.SDKConfig
+	if cfg.CommercialMode {
+		sdkCfg.RequestLog = false
+	}
+	return &sdkCfg
+}
+
 // WithMiddleware appends additional Gin middleware during server construction.
 func WithMiddleware(mw ...gin.HandlerFunc) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.extraMiddleware = append(cfg.extraMiddleware, mw...)
 	}
 }
+
 // WithEngineConfigurator allows callers to mutate the Gin engine prior to middleware setup.
 func WithEngineConfigurator(fn func(*gin.Engine)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.engineConfigurator = fn
 	}
 }
+
 // WithRouterConfigurator appends a callback after default routes are registered.
 func WithRouterConfigurator(fn func(*gin.Engine, *handlers.BaseAPIHandler, *config.Config)) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.routerConfigurator = fn
 	}
 }
+
 // WithLocalManagementPassword stores a runtime-only management password accepted for localhost requests.
 func WithLocalManagementPassword(password string) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.localPassword = password
 	}
 }
+
 // WithKeepAliveEndpoint enables a keep-alive endpoint with the provided timeout and callback.
 func WithKeepAliveEndpoint(timeout time.Duration, onTimeout func()) ServerOption {
 	return func(cfg *serverOptionConfig) {
@@ -100,68 +138,109 @@ func WithKeepAliveEndpoint(timeout time.Duration, onTimeout func()) ServerOption
 		cfg.keepAliveOnTimeout = onTimeout
 	}
 }
+
 // WithRequestLoggerFactory customises request logger creation.
 func WithRequestLoggerFactory(factory func(*config.Config, string) logging.RequestLogger) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.requestLoggerFactory = factory
 	}
 }
+
 // WithPostAuthHook registers a hook to be called after auth record creation.
 func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.postAuthHook = hook
 	}
 }
+
+// WithPostAuthPersistHook registers a hook to be called after auth persistence.
+func WithPostAuthPersistHook(hook auth.PostAuthHook) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.postAuthPersistHook = hook
+	}
+}
+
+// WithPluginHost registers dynamic plugin HTTP adapters with the server.
+func WithPluginHost(host *pluginhost.Host) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.pluginHost = host
+	}
+}
+
+// WithConfigReloadHook registers a callback used after management saves config changes.
+func WithConfigReloadHook(hook func(context.Context, *config.Config)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.configReloadHook = hook
+	}
+}
+
 // Server represents the main API server.
 // It encapsulates the Gin engine, HTTP server, handlers, and configuration.
 type Server struct {
 	// engine is the Gin web framework engine instance.
 	engine *gin.Engine
+
 	// server is the underlying HTTP server.
 	server *http.Server
+
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
 	muxBaseListener net.Listener
+
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
 	muxHTTPListener *muxListener
+
 	// handlers contains the API handlers for processing requests.
 	handlers *handlers.BaseAPIHandler
+
 	// cfg holds the current server configuration.
 	cfg *config.Config
+
 	// oldConfigYaml stores a YAML snapshot of the previous configuration for change detection.
 	// This prevents issues when the config object is modified in place by Management API.
 	oldConfigYaml []byte
+
 	// accessManager handles request authentication providers.
 	accessManager *sdkaccess.Manager
+
 	// requestLogger is the request logger instance for dynamic configuration updates.
 	requestLogger logging.RequestLogger
 	loggerToggle  func(bool)
+
 	// configFilePath is the absolute path to the YAML config file for persistence.
 	configFilePath string
+
 	// currentPath is the absolute path to the current working directory.
 	currentPath string
+
 	// wsRoutes tracks registered websocket upgrade paths.
 	wsRouteMu     sync.Mutex
 	wsRoutes      map[string]struct{}
 	wsAuthChanged func(bool, bool)
 	wsAuthEnabled atomic.Bool
+
 	// management handler
-	mgmt              *managementHandlers.Handler
-	apiKeyIPBlacklist *managementHandlers.APIKeyIPBlacklistStore
-	// ampModule is the Amp routing module for model mapping hot-reload
-	ampModule *ampmodule.AmpModule
+	mgmt *managementHandlers.Handler
+
+	// pluginHost owns dynamic plugin Management API route dispatch.
+	pluginHost *pluginhost.Host
+
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
 	managementRoutesEnabled atomic.Bool
+
 	// envManagementSecret indicates whether MANAGEMENT_PASSWORD is configured.
 	envManagementSecret bool
+
 	localPassword string
+
 	keepAliveEnabled   bool
 	keepAliveTimeout   time.Duration
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
 }
+
 // NewServer creates and initializes a new API server instance.
 // It sets up the Gin engine, middleware, routes, and handlers.
 //
@@ -183,18 +262,20 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if !cfg.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
+
 	// Create gin engine
 	engine := gin.New()
 	if optionState.engineConfigurator != nil {
 		optionState.engineConfigurator(engine)
 	}
+
 	// Add middleware
-	engine.Use(blockScannerProbeMiddleware())
-		engine.Use(logging.GinLogrusLogger(cfg))
+	engine.Use(logging.GinLogrusLogger(cfg))
 	engine.Use(logging.GinLogrusRecovery())
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
 	}
+
 	// Add request logging middleware (positioned after recovery, before auth)
 	// Resolve logs directory relative to the configuration file directory.
 	var requestLogger logging.RequestLogger
@@ -210,43 +291,51 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 			}
 		}
 	}
+
 	engine.Use(corsMiddleware())
 	wd, err := os.Getwd()
 	if err != nil {
 		wd = configFilePath
 	}
+
 	envAdminPassword, envAdminPasswordSet := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envAdminPassword = strings.TrimSpace(envAdminPassword)
 	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
+
 	// Create server instance
 	s := &Server{
 		engine:              engine,
-		handlers:            handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
+		handlers:            handlers.NewBaseAPIHandlers(effectiveSDKConfig(cfg), authManager),
 		cfg:                 cfg,
 		accessManager:       accessManager,
-		apiKeyIPBlacklist:   managementHandlers.NewAPIKeyIPBlacklistStore(managementHandlers.DefaultAPIKeyIPBlacklistPolicy()),
 		requestLogger:       requestLogger,
 		loggerToggle:        toggle,
 		configFilePath:      configFilePath,
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
+		pluginHost:          optionState.pluginHost,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
+	s.handlers.SetPluginHost(optionState.pluginHost)
+	if optionState.pluginHost != nil {
+		optionState.pluginHost.SetModelExecutor(s.handlers)
+		optionState.pluginHost.SetAuthManager(authManager)
+	}
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
-		authManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
-		authManager.SetFallbackModels(cfg.Routing.FallbackModels)
-		authManager.SetFallbackChain(cfg.Routing.FallbackChain, cfg.Routing.FallbackMaxDepth)
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetPluginHost(optionState.pluginHost)
+	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -255,33 +344,23 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
-	s.mgmt.SetOnConfigApplied(func(updatedCfg *config.Config) {
-		if updatedCfg == nil {
-			return
-		}
-		s.UpdateClients(updatedCfg)
-	})
+	if optionState.postAuthPersistHook != nil {
+		s.mgmt.SetPostAuthPersistHook(optionState.postAuthPersistHook)
+	}
 	s.localPassword = optionState.localPassword
+
 	// Home heartbeat gate: when home is enabled, block all endpoints with 503 until the
 	// subscribe-config heartbeat connection is healthy.
 	engine.Use(s.homeHeartbeatMiddleware())
+
 	// Setup routes
 	s.setupRoutes()
-	// Register Amp module using V2 interface with Context
-	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager, s.apiKeyIPBlacklist))
-	ctx := modules.Context{
-		Engine:         engine,
-		BaseHandler:    s.handlers,
-		Config:         cfg,
-		AuthMiddleware: AuthMiddleware(accessManager, s.apiKeyIPBlacklist),
-	}
-	if err := modules.RegisterModule(ctx, s.ampModule); err != nil {
-		log.Errorf("Failed to register Amp module: %v", err)
-	}
+
 	// Apply additional router configurators from options
 	if optionState.routerConfigurator != nil {
 		optionState.routerConfigurator(engine, s.handlers, cfg)
 	}
+
 	// Register management routes when configuration or environment secrets are available,
 	// or when a local management password is provided (e.g. TUI mode).
 	hasManagementSecret := cfg.RemoteManagement.SecretKey != "" || envManagementSecret || s.localPassword != ""
@@ -290,47 +369,22 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	if hasManagementSecret {
 		s.registerManagementRoutes()
 	}
+	s.refreshPluginManagementRoutes()
+	engine.NoRoute(s.pluginManagementNoRoute)
+
 	if optionState.keepAliveEnabled {
 		s.enableKeepAlive(optionState.keepAliveTimeout, optionState.keepAliveOnTimeout)
 	}
+
 	// Create HTTP server
 	s.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler: engine,
 	}
+
 	return s
 }
-func blockScannerProbeMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if isScannerProbePath(c.Request.URL.Path) {
-			c.AbortWithStatus(http.StatusForbidden)
-			return
-		}
-		c.Next()
-	}
-}
-func isScannerProbePath(path string) bool {
-	lower := strings.ToLower(path)
-	segments := strings.Split(lower, "/")
-	for _, segment := range segments {
-		if segment == "" {
-			continue
-		}
-		if segment == ".git" || segment == ".aws" || segment == ".svn" || segment == ".hg" {
-			return true
-		}
-		if segment == "wp-config.php" || strings.HasPrefix(segment, "wp-config.") {
-			return true
-		}
-		if strings.HasPrefix(segment, ".env") || strings.HasSuffix(segment, ".env") || strings.Contains(segment, ".env.") {
-			return true
-		}
-		if strings.HasSuffix(segment, ".bak") || strings.HasSuffix(segment, ".backup") || strings.HasSuffix(segment, ".sql") || strings.HasSuffix(segment, ".log") || strings.HasSuffix(segment, ".php") {
-			return true
-		}
-	}
-	return false
-}
+
 func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s == nil || s.cfg == nil || !s.cfg.Home.Enabled {
@@ -339,7 +393,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		}
 		if c != nil && c.Request != nil {
 			path := c.Request.URL.Path
-			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || path == "/management.html" {
+			if strings.HasPrefix(path, "/v0/management/") || path == "/v0/management" || strings.HasPrefix(path, "/v0/resource/plugins/") || path == "/management.html" {
 				c.Next()
 				return
 			}
@@ -352,6 +406,7 @@ func (s *Server) homeHeartbeatMiddleware() gin.HandlerFunc {
 		c.Next()
 	}
 }
+
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
@@ -360,26 +415,28 @@ func (s *Server) setupRoutes() {
 			c.Status(http.StatusOK)
 			return
 		}
+
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	}
 	s.engine.GET("/healthz", healthzHandler)
 	s.engine.HEAD("/healthz", healthzHandler)
+
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
-	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist))
+	v1.Use(AuthMiddleware(s.accessManager))
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
 		v1.POST("/completions", openaiHandlers.Completions)
 		v1.POST("/images/generations", openaiHandlers.ImagesGenerations)
 		v1.POST("/images/edits", openaiHandlers.ImagesEdits)
-		v1.POST("/videos", openaiHandlers.VideosCreate)
+		v1.POST("/videos", openaiHandlers.XAIVideosGenerations)
 		v1.POST("/videos/generations", openaiHandlers.XAIVideosGenerations)
 		v1.POST("/videos/edits", openaiHandlers.XAIVideosEdits)
 		v1.POST("/videos/extensions", openaiHandlers.XAIVideosExtensions)
@@ -390,24 +447,35 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
+
+	openaiV1 := s.engine.Group("/openai/v1")
+	openaiV1.Use(AuthMiddleware(s.accessManager))
+	{
+		openaiV1.POST("/videos", openaiHandlers.VideosCreate)
+		openaiV1.GET("/videos/:video_id/content", openaiHandlers.VideosContent)
+		openaiV1.GET("/videos/:video_id", openaiHandlers.VideosRetrieve)
+	}
+
 	// Codex CLI direct route aliases (chatgpt_base_url compatible)
 	codexDirect := s.engine.Group("/backend-api/codex")
-	codexDirect.Use(AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist))
+	codexDirect.Use(AuthMiddleware(s.accessManager))
 	{
 		codexDirect.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		codexDirect.POST("/responses", openaiResponsesHandlers.Responses)
 		codexDirect.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
+
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist))
+	v1beta.Use(AuthMiddleware(s.accessManager))
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
 		v1beta.GET("/models/*action", s.geminiGetHandler(geminiHandlers))
 	}
+
 	// Root endpoint
-	s.engine.GET("/", s.apiKeyIPBlacklistMiddleware(), func(c *gin.Context) {
+	s.engine.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "CLI Proxy API Server",
 			"endpoints": []string{
@@ -417,7 +485,7 @@ func (s *Server) setupRoutes() {
 			},
 		})
 	})
-	s.engine.POST("/v1internal:method", geminiCLIHandlers.CLIHandler)
+
 	// OAuth callback endpoints (reuse main server port)
 	// These endpoints receive provider redirects and persist
 	// the short-lived code/state for the waiting goroutine.
@@ -434,6 +502,7 @@ func (s *Server) setupRoutes() {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
+
 	s.engine.GET("/codex/callback", func(c *gin.Context) {
 		code := c.Query("code")
 		state := c.Query("state")
@@ -447,19 +516,7 @@ func (s *Server) setupRoutes() {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
-	s.engine.GET("/google/callback", func(c *gin.Context) {
-		code := c.Query("code")
-		state := c.Query("state")
-		errStr := c.Query("error")
-		if errStr == "" {
-			errStr = c.Query("error_description")
-		}
-		if state != "" {
-			_, _ = managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "gemini", state, code, errStr)
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(http.StatusOK, oauthCallbackSuccessHTML)
-	})
+
 	s.engine.GET("/antigravity/callback", func(c *gin.Context) {
 		code := c.Query("code")
 		state := c.Query("state")
@@ -473,6 +530,7 @@ func (s *Server) setupRoutes() {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
+
 	s.engine.GET("/xai/callback", func(c *gin.Context) {
 		code := c.Query("code")
 		state := c.Query("state")
@@ -486,8 +544,10 @@ func (s *Server) setupRoutes() {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
+
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
+
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
 // The handler is served as-is without additional middleware beyond the standard stack already configured.
 func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
@@ -508,7 +568,8 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	}
 	s.wsRoutes[trimmed] = struct{}{}
 	s.wsRouteMu.Unlock()
-	authMiddleware := AuthMiddleware(s.accessManager, s.apiKeyIPBlacklist)
+
+	authMiddleware := AuthMiddleware(s.accessManager)
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {
 			c.Next()
@@ -520,8 +581,10 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 		handler.ServeHTTP(c.Writer, c.Request)
 		c.Abort()
 	}
+
 	s.engine.GET(trimmed, conditionalAuth, finalHandler)
 }
+
 func (s *Server) registerManagementRoutes() {
 	if s == nil || s.engine == nil || s.mgmt == nil {
 		return
@@ -529,7 +592,12 @@ func (s *Server) registerManagementRoutes() {
 	if !s.managementRoutesRegistered.CompareAndSwap(false, true) {
 		return
 	}
+
 	log.Info("management routes registered after secret key configuration")
+
+	s.engine.POST("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.PostOAuthCallback)
+	s.engine.GET("/v0/management/oauth-callback", s.managementAvailabilityMiddleware(), s.mgmt.GetOAuthCallback)
+
 	mgmt := s.engine.Group("/v0/management")
 	mgmt.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
 	{
@@ -537,42 +605,64 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
 		mgmt.GET("/latest-version", s.mgmt.GetLatestVersion)
+		mgmt.GET("/plugins", s.mgmt.ListPlugins)
+		mgmt.GET("/plugin-store", s.mgmt.ListPluginStore)
+		mgmt.POST("/plugin-store/:id/install", s.mgmt.InstallPluginFromStore)
+		mgmt.DELETE("/plugins/:id", s.mgmt.DeletePlugin)
+		mgmt.PATCH("/plugins/:id/enabled", s.mgmt.PatchPluginEnabled)
+		mgmt.GET("/plugins/:id/config", s.mgmt.GetPluginConfig)
+		mgmt.PUT("/plugins/:id/config", s.mgmt.PutPluginConfig)
+		mgmt.PATCH("/plugins/:id/config", s.mgmt.PatchPluginConfig)
+
 		mgmt.GET("/debug", s.mgmt.GetDebug)
 		mgmt.PUT("/debug", s.mgmt.PutDebug)
 		mgmt.PATCH("/debug", s.mgmt.PutDebug)
+
 		mgmt.GET("/logging-to-file", s.mgmt.GetLoggingToFile)
 		mgmt.PUT("/logging-to-file", s.mgmt.PutLoggingToFile)
 		mgmt.PATCH("/logging-to-file", s.mgmt.PutLoggingToFile)
+
 		mgmt.GET("/logs-max-total-size-mb", s.mgmt.GetLogsMaxTotalSizeMB)
 		mgmt.PUT("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
 		mgmt.PATCH("/logs-max-total-size-mb", s.mgmt.PutLogsMaxTotalSizeMB)
+
 		mgmt.GET("/error-logs-max-files", s.mgmt.GetErrorLogsMaxFiles)
 		mgmt.PUT("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
 		mgmt.PATCH("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
+
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
+
 		mgmt.GET("/proxy-url", s.mgmt.GetProxyURL)
 		mgmt.PUT("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.PATCH("/proxy-url", s.mgmt.PutProxyURL)
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
+
 		mgmt.POST("/api-call", s.mgmt.APICall)
+
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
 		mgmt.PATCH("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
+
 		mgmt.GET("/quota-exceeded/switch-preview-model", s.mgmt.GetSwitchPreviewModel)
 		mgmt.PUT("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
+		mgmt.POST("/reset-quota", s.mgmt.ResetQuota)
+
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)
 		mgmt.PATCH("/api-keys", s.mgmt.PatchAPIKeys)
 		mgmt.DELETE("/api-keys", s.mgmt.DeleteAPIKeys)
 		mgmt.GET("/api-key-usage", s.mgmt.GetAPIKeyUsage)
 		mgmt.GET("/usage-queue", s.mgmt.GetUsageQueue)
+		mgmt.GET("/weight-robin-queue", s.mgmt.GetWeightRobinQueue)
+
 		mgmt.GET("/gemini-api-key", s.mgmt.GetGeminiKeys)
 		mgmt.PUT("/gemini-api-key", s.mgmt.PutGeminiKeys)
 		mgmt.PATCH("/gemini-api-key", s.mgmt.PatchGeminiKey)
 		mgmt.DELETE("/gemini-api-key", s.mgmt.DeleteGeminiKey)
+
 		mgmt.GET("/logs", s.mgmt.GetLogs)
 		mgmt.DELETE("/logs", s.mgmt.DeleteLogs)
 		mgmt.GET("/request-error-logs", s.mgmt.GetRequestErrorLogs)
@@ -584,72 +674,89 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/ws-auth", s.mgmt.GetWebsocketAuth)
 		mgmt.PUT("/ws-auth", s.mgmt.PutWebsocketAuth)
 		mgmt.PATCH("/ws-auth", s.mgmt.PutWebsocketAuth)
-		mgmt.GET("/ampcode", s.mgmt.GetAmpCode)
-		mgmt.GET("/ampcode/upstream-url", s.mgmt.GetAmpUpstreamURL)
-		mgmt.PUT("/ampcode/upstream-url", s.mgmt.PutAmpUpstreamURL)
-		mgmt.PATCH("/ampcode/upstream-url", s.mgmt.PutAmpUpstreamURL)
-		mgmt.DELETE("/ampcode/upstream-url", s.mgmt.DeleteAmpUpstreamURL)
-		mgmt.GET("/ampcode/upstream-api-key", s.mgmt.GetAmpUpstreamAPIKey)
-		mgmt.PUT("/ampcode/upstream-api-key", s.mgmt.PutAmpUpstreamAPIKey)
-		mgmt.PATCH("/ampcode/upstream-api-key", s.mgmt.PutAmpUpstreamAPIKey)
-		mgmt.DELETE("/ampcode/upstream-api-key", s.mgmt.DeleteAmpUpstreamAPIKey)
-		mgmt.GET("/ampcode/restrict-management-to-localhost", s.mgmt.GetAmpRestrictManagementToLocalhost)
-		mgmt.PUT("/ampcode/restrict-management-to-localhost", s.mgmt.PutAmpRestrictManagementToLocalhost)
-		mgmt.PATCH("/ampcode/restrict-management-to-localhost", s.mgmt.PutAmpRestrictManagementToLocalhost)
-		mgmt.GET("/ampcode/model-mappings", s.mgmt.GetAmpModelMappings)
-		mgmt.PUT("/ampcode/model-mappings", s.mgmt.PutAmpModelMappings)
-		mgmt.PATCH("/ampcode/model-mappings", s.mgmt.PatchAmpModelMappings)
-		mgmt.DELETE("/ampcode/model-mappings", s.mgmt.DeleteAmpModelMappings)
-		mgmt.GET("/ampcode/force-model-mappings", s.mgmt.GetAmpForceModelMappings)
-		mgmt.PUT("/ampcode/force-model-mappings", s.mgmt.PutAmpForceModelMappings)
-		mgmt.PATCH("/ampcode/force-model-mappings", s.mgmt.PutAmpForceModelMappings)
-		mgmt.GET("/ampcode/upstream-api-keys", s.mgmt.GetAmpUpstreamAPIKeys)
-		mgmt.PUT("/ampcode/upstream-api-keys", s.mgmt.PutAmpUpstreamAPIKeys)
-		mgmt.PATCH("/ampcode/upstream-api-keys", s.mgmt.PatchAmpUpstreamAPIKeys)
-		mgmt.DELETE("/ampcode/upstream-api-keys", s.mgmt.DeleteAmpUpstreamAPIKeys)
+
 		mgmt.GET("/request-retry", s.mgmt.GetRequestRetry)
 		mgmt.PUT("/request-retry", s.mgmt.PutRequestRetry)
 		mgmt.PATCH("/request-retry", s.mgmt.PutRequestRetry)
 		mgmt.GET("/max-retry-interval", s.mgmt.GetMaxRetryInterval)
 		mgmt.PUT("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
 		mgmt.PATCH("/max-retry-interval", s.mgmt.PutMaxRetryInterval)
+
 		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
 		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
 		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
 		mgmt.PATCH("/routing/strategy", s.mgmt.PutRoutingStrategy)
+
+		mgmt.GET("/routing/mode", s.mgmt.GetRoutingMode)
+		mgmt.PUT("/routing/mode", s.mgmt.PutRoutingMode)
+
+		mgmt.GET("/routing/fallback-models", s.mgmt.GetFallbackModels)
+		mgmt.PUT("/routing/fallback-models", s.mgmt.PutFallbackModels)
+
+		mgmt.GET("/routing/fallback-chain", s.mgmt.GetFallbackChain)
+		mgmt.PUT("/routing/fallback-chain", s.mgmt.PutFallbackChain)
+
+		mgmt.GET("/routing/token-threshold-rules", s.mgmt.GetTokenThresholdRules)
+		mgmt.PUT("/routing/token-threshold-rules", s.mgmt.PutTokenThresholdRules)
+
+		mgmt.GET("/request-log-success-body", s.mgmt.GetRequestLogSuccessBody)
+		mgmt.PUT("/request-log-success-body", s.mgmt.PutRequestLogSuccessBody)
+
+		mgmt.GET("/detailed-api-error-body-log-format", s.mgmt.GetDetailedAPIErrorBodyLogFormat)
+		mgmt.PUT("/detailed-api-error-body-log-format", s.mgmt.PutDetailedAPIErrorBodyLogFormat)
+
+		mgmt.GET("/detailed-api-error-body-log-limit", s.mgmt.GetDetailedAPIErrorBodyLogLimit)
+		mgmt.PUT("/detailed-api-error-body-log-limit", s.mgmt.PutDetailedAPIErrorBodyLogLimit)
+
+		mgmt.GET("/api-key-ip-blacklist", s.mgmt.GetAPIKeyIPBlacklist)
+		mgmt.POST("/api-key-ip-blacklist", s.mgmt.PostAPIKeyIPBlacklist)
+		mgmt.DELETE("/api-key-ip-blacklist", s.mgmt.DeleteAPIKeyIPBlacklist)
+
+		mgmt.GET("/copilot-quota", s.mgmt.GetCopilotQuota)
+
 		mgmt.GET("/claude-api-key", s.mgmt.GetClaudeKeys)
 		mgmt.PUT("/claude-api-key", s.mgmt.PutClaudeKeys)
 		mgmt.PATCH("/claude-api-key", s.mgmt.PatchClaudeKey)
 		mgmt.DELETE("/claude-api-key", s.mgmt.DeleteClaudeKey)
+
 		mgmt.GET("/codex-api-key", s.mgmt.GetCodexKeys)
 		mgmt.PUT("/codex-api-key", s.mgmt.PutCodexKeys)
 		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
 		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
-		mgmt.GET("/ollama-api-key", s.mgmt.GetOllamaKeys)
-		mgmt.PUT("/ollama-api-key", s.mgmt.PutOllamaKeys)
-		mgmt.PATCH("/ollama-api-key", s.mgmt.PatchOllamaKey)
-		mgmt.DELETE("/ollama-api-key", s.mgmt.DeleteOllamaKey)
-		mgmt.GET("/api-key-ip-blacklist", s.mgmt.GetAPIKeyIPBlacklist)
-		mgmt.POST("/api-key-ip-blacklist", s.mgmt.PostAPIKeyIPBlacklist)
-		mgmt.DELETE("/api-key-ip-blacklist", s.mgmt.DeleteAPIKeyIPBlacklist)
+
+		mgmt.GET("/commandcode-api-key", s.mgmt.GetCommandCodeKeys)
+		mgmt.PUT("/commandcode-api-key", s.mgmt.PutCommandCodeKeys)
+		mgmt.PATCH("/commandcode-api-key", s.mgmt.PatchCommandCodeKey)
+		mgmt.DELETE("/commandcode-api-key", s.mgmt.DeleteCommandCodeKey)
+
+		mgmt.GET("/mistral-api-key", s.mgmt.GetMistralKeys)
+		mgmt.PUT("/mistral-api-key", s.mgmt.PutMistralKeys)
+		mgmt.PATCH("/mistral-api-key", s.mgmt.PatchMistralKey)
+		mgmt.DELETE("/mistral-api-key", s.mgmt.DeleteMistralKey)
+
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
 		mgmt.DELETE("/openai-compatibility", s.mgmt.DeleteOpenAICompat)
+
 		mgmt.GET("/vertex-api-key", s.mgmt.GetVertexCompatKeys)
 		mgmt.PUT("/vertex-api-key", s.mgmt.PutVertexCompatKeys)
 		mgmt.PATCH("/vertex-api-key", s.mgmt.PatchVertexCompatKey)
 		mgmt.DELETE("/vertex-api-key", s.mgmt.DeleteVertexCompatKey)
+
 		mgmt.GET("/oauth-excluded-models", s.mgmt.GetOAuthExcludedModels)
 		mgmt.PUT("/oauth-excluded-models", s.mgmt.PutOAuthExcludedModels)
 		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
 		mgmt.DELETE("/oauth-excluded-models", s.mgmt.DeleteOAuthExcludedModels)
+
 		mgmt.GET("/oauth-model-alias", s.mgmt.GetOAuthModelAlias)
 		mgmt.PUT("/oauth-model-alias", s.mgmt.PutOAuthModelAlias)
 		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
+
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
@@ -659,33 +766,123 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
+		mgmt.POST("/gitlab-pat", s.mgmt.RequestGitLabPATToken)
+
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
 		mgmt.GET("/codex-auth-url", s.mgmt.RequestCodexToken)
-		mgmt.GET("/gemini-cli-auth-url", s.mgmt.RequestGeminiCLIToken)
 		mgmt.GET("/antigravity-auth-url", s.mgmt.RequestAntigravityToken)
 		mgmt.GET("/kimi-auth-url", s.mgmt.RequestKimiToken)
 		mgmt.GET("/xai-auth-url", s.mgmt.RequestXAIToken)
-		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
 }
+
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if s == nil || s.cfg == nil {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-		if s.cfg.Home.Enabled {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-		if !s.managementRoutesEnabled.Load() {
-			c.AbortWithStatus(http.StatusNotFound)
+		if !s.managementAvailable(c) {
 			return
 		}
 		c.Next()
 	}
 }
+
+func (s *Server) managementAvailable(c *gin.Context) bool {
+	if s == nil || s.cfg == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return false
+	}
+	if s.cfg.Home.Enabled {
+		c.AbortWithStatus(http.StatusNotFound)
+		return false
+	}
+	if !s.managementRoutesEnabled.Load() {
+		c.AbortWithStatus(http.StatusNotFound)
+		return false
+	}
+	return true
+}
+
+func (s *Server) refreshPluginManagementRoutes() {
+	if s == nil || s.pluginHost == nil || s.engine == nil {
+		return
+	}
+	s.pluginHost.RegisterManagementRoutes(context.Background(), s.registeredManagementRouteKeys())
+}
+
+// RefreshPluginManagementRoutes rebuilds plugin-owned Management API routes.
+func (s *Server) RefreshPluginManagementRoutes() {
+	s.refreshPluginManagementRoutes()
+}
+
+func (s *Server) registeredManagementRouteKeys() map[string]struct{} {
+	out := make(map[string]struct{})
+	if s == nil || s.engine == nil {
+		return out
+	}
+	for _, route := range s.engine.Routes() {
+		if strings.HasPrefix(route.Path, "/v0/management/") || route.Path == "/v0/management" {
+			out[strings.ToUpper(strings.TrimSpace(route.Method))+" "+route.Path] = struct{}{}
+		}
+	}
+	return out
+}
+
+func (s *Server) pluginManagementNoRoute(c *gin.Context) {
+	if s == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		if c != nil {
+			c.AbortWithStatus(http.StatusNotFound)
+		}
+		return
+	}
+	path := c.Request.URL.Path
+	if strings.HasPrefix(path, "/v0/resource/plugins/") {
+		s.pluginResourceNoRoute(c)
+		return
+	}
+	if path != "/v0/management" && !strings.HasPrefix(path, "/v0/management/") {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if s.pluginHost == nil || s.mgmt == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if !s.managementAvailable(c) {
+		return
+	}
+	s.mgmt.Middleware()(c)
+	if c.IsAborted() {
+		return
+	}
+	if s.mgmt.ServePluginAuthURL(c) {
+		c.Abort()
+		return
+	}
+	if s.pluginHost.ServeManagementHTTP(c.Writer, c.Request) {
+		c.Abort()
+		return
+	}
+	c.AbortWithStatus(http.StatusNotFound)
+}
+
+func (s *Server) pluginResourceNoRoute(c *gin.Context) {
+	if s == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		if c != nil {
+			c.AbortWithStatus(http.StatusNotFound)
+		}
+		return
+	}
+	if s.cfg == nil || s.cfg.Home.Enabled || s.pluginHost == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if s.pluginHost.ServeResourceHTTP(c.Writer, c.Request) {
+		c.Abort()
+		return
+	}
+	c.AbortWithStatus(http.StatusNotFound)
+}
+
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
 	cfg := s.cfg
 	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
@@ -697,6 +894,7 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+
 	if _, err := os.Stat(filePath); err != nil {
 		if os.IsNotExist(err) {
 			// Synchronously ensure management.html is available with a detached context.
@@ -711,20 +909,26 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 			return
 		}
 	}
+
 	c.File(filePath)
 }
+
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
 	if timeout <= 0 || onTimeout == nil {
 		return
 	}
+
 	s.keepAliveEnabled = true
 	s.keepAliveTimeout = timeout
 	s.keepAliveOnTimeout = onTimeout
 	s.keepAliveHeartbeat = make(chan struct{}, 1)
 	s.keepAliveStop = make(chan struct{}, 1)
+
 	s.engine.GET("/keep-alive", s.handleKeepAlive)
+
 	go s.watchKeepAlive()
 }
+
 func (s *Server) handleKeepAlive(c *gin.Context) {
 	if s.localPassword != "" {
 		provided := strings.TrimSpace(c.GetHeader("Authorization"))
@@ -742,9 +946,11 @@ func (s *Server) handleKeepAlive(c *gin.Context) {
 			return
 		}
 	}
+
 	s.signalKeepAlive()
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
+
 func (s *Server) signalKeepAlive() {
 	if !s.keepAliveEnabled {
 		return
@@ -754,12 +960,15 @@ func (s *Server) signalKeepAlive() {
 	default:
 	}
 }
+
 func (s *Server) watchKeepAlive() {
 	if !s.keepAliveEnabled {
 		return
 	}
+
 	timer := time.NewTimer(s.keepAliveTimeout)
 	defer timer.Stop()
+
 	for {
 		select {
 		case <-timer.C:
@@ -781,10 +990,21 @@ func (s *Server) watchKeepAlive() {
 		}
 	}
 }
+
+// isAnthropicModelsRequest reports whether a /v1/models request should be served in
+// Anthropic format. Anthropic API clients send the Anthropic-Version header; Claude
+// Code additionally uses a claude-cli User-Agent.
+func isAnthropicModelsRequest(c *gin.Context) bool {
+	if c.GetHeader("Anthropic-Version") != "" {
+		return true
+	}
+	return strings.HasPrefix(c.GetHeader("User-Agent"), "claude-cli")
+}
+
 // unifiedModelsHandler creates a unified handler for the /v1/models endpoint
-// that routes to different handlers based on the User-Agent header.
-// If User-Agent starts with "claude-cli", it routes to Claude handler,
-// otherwise it routes to OpenAI handler.
+// that routes to different handlers based on the request.
+// Anthropic API requests (Anthropic-Version header, or a claude-cli User-Agent)
+// route to the Claude handler, otherwise they route to the OpenAI handler.
 func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if _, ok := c.Request.URL.Query()["client_version"]; ok {
@@ -795,26 +1015,27 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 			openaiHandler.OpenAIModels(c)
 			return
 		}
+
 		if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
 			s.handleHomeModels(c)
 			return
 		}
-		userAgent := c.GetHeader("User-Agent")
-		// Route to Claude handler if User-Agent starts with "claude-cli"
-		if strings.HasPrefix(userAgent, "claude-cli") {
-			// log.Debugf("Routing /v1/models to Claude handler for User-Agent: %s", userAgent)
+
+		// Route to Claude handler for Anthropic API requests.
+		if isAnthropicModelsRequest(c) {
 			claudeHandler.ClaudeModels(c)
 		} else {
-			// log.Debugf("Routing /v1/models to OpenAI handler for User-Agent: %s", userAgent)
 			openaiHandler.OpenAIModels(c)
 		}
 	}
 }
+
 func (s *Server) handleHomeCodexClientModels(c *gin.Context) {
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
 	}
+
 	models := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
 		model := map[string]any{
@@ -833,55 +1054,51 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context) {
 		}
 		models = append(models, model)
 	}
+
 	c.JSON(http.StatusOK, openai.CodexClientModelsResponse(models))
 }
+
 func (s *Server) geminiModelsHandler(geminiHandler *gemini.GeminiAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
 			s.handleHomeGeminiModels(c)
 			return
 		}
+
 		geminiHandler.GeminiModels(c)
 	}
 }
+
 func (s *Server) geminiGetHandler(geminiHandler *gemini.GeminiAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
 			s.handleHomeGeminiModel(c)
 			return
 		}
+
 		geminiHandler.GeminiGetHandler(c)
 	}
 }
+
 type homeModelEntry struct {
-	id          string
-	created     int64
-	ownedBy     string
-	displayName string
+	id                  string
+	created             int64
+	ownedBy             string
+	displayName         string
+	contextLength       int
+	maxCompletionTokens int
 }
+
 func (s *Server) handleHomeModels(c *gin.Context) {
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
 	}
-	userAgent := c.GetHeader("User-Agent")
-	isClaude := strings.HasPrefix(userAgent, "claude-cli")
+
+	isClaude := isAnthropicModelsRequest(c)
+
 	if isClaude {
-		out := make([]map[string]any, 0, len(entries))
-		for _, entry := range entries {
-			model := map[string]any{
-				"id":       entry.id,
-				"object":   "model",
-				"owned_by": entry.ownedBy,
-			}
-			if entry.created > 0 {
-				model["created_at"] = entry.created
-			}
-			if entry.displayName != "" {
-				model["display_name"] = entry.displayName
-			}
-			out = append(out, model)
-		}
+		out := formatHomeClaudeModels(entries)
 		firstID := ""
 		lastID := ""
 		if len(out) > 0 {
@@ -900,6 +1117,7 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		})
 		return
 	}
+
 	filtered := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
 		model := map[string]any{
@@ -919,20 +1137,60 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 		"data":   filtered,
 	})
 }
+
+func formatHomeClaudeModels(entries []homeModelEntry) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, formatHomeClaudeModel(entry))
+	}
+	return out
+}
+
+func formatHomeClaudeModel(entry homeModelEntry) map[string]any {
+	displayName := entry.displayName
+	if displayName == "" {
+		displayName = entry.id
+	}
+	maxInput := entry.contextLength
+	if maxInput <= 0 {
+		maxInput = registry.DefaultClaudeMaxInputTokens
+	}
+	maxOutput := entry.maxCompletionTokens
+	if maxOutput <= 0 {
+		maxOutput = registry.DefaultClaudeMaxOutputTokens
+	}
+	model := map[string]any{
+		"id":               entry.id,
+		"object":           "model",
+		"owned_by":         entry.ownedBy,
+		"type":             "model",
+		"display_name":     displayName,
+		"max_input_tokens": maxInput,
+		"max_tokens":       maxOutput,
+	}
+	if entry.created > 0 {
+		model["created_at"] = time.Unix(entry.created, 0).UTC().Format(time.RFC3339)
+	}
+	return model
+}
+
 func (s *Server) handleHomeGeminiModels(c *gin.Context) {
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
 	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"models": formatHomeGeminiModels(entries),
 	})
 }
+
 func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 	entries, ok := s.loadHomeModelEntries(c)
 	if !ok {
 		return
 	}
+
 	action := strings.TrimPrefix(c.Param("action"), "/")
 	action = strings.TrimSpace(action)
 	for _, entry := range entries {
@@ -941,6 +1199,7 @@ func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 			return
 		}
 	}
+
 	c.JSON(http.StatusNotFound, handlers.ErrorResponse{
 		Error: handlers.ErrorDetail{
 			Message: "Not Found",
@@ -948,6 +1207,7 @@ func (s *Server) handleHomeGeminiModel(c *gin.Context) {
 		},
 	})
 }
+
 func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {
 	if s == nil || c == nil || c.Request == nil {
 		return nil, false
@@ -962,7 +1222,8 @@ func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {
 		})
 		return nil, false
 	}
-	raw, errGet := client.GetModels(c.Request.Context())
+
+	raw, errGet := client.GetModels(c.Request.Context(), c.Request.Header, c.Request.URL.Query())
 	if errGet != nil {
 		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
@@ -972,6 +1233,17 @@ func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {
 		})
 		return nil, false
 	}
+
+	if statusCode, ok := homeModelsAuthStatus(raw); ok {
+		c.JSON(statusCode, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: homeModelsErrorMessage(raw),
+				Type:    "authentication_error",
+			},
+		})
+		return nil, false
+	}
+
 	entries, errDecode := decodeHomeModels(raw)
 	if errDecode != nil {
 		c.JSON(http.StatusBadGateway, handlers.ErrorResponse{
@@ -982,8 +1254,10 @@ func (s *Server) loadHomeModelEntries(c *gin.Context) ([]homeModelEntry, bool) {
 		})
 		return nil, false
 	}
+
 	return entries, true
 }
+
 func formatHomeGeminiModels(entries []homeModelEntry) []map[string]any {
 	out := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
@@ -991,6 +1265,7 @@ func formatHomeGeminiModels(entries []homeModelEntry) []map[string]any {
 	}
 	return out
 }
+
 func formatHomeGeminiModel(entry homeModelEntry) map[string]any {
 	name := entry.id
 	if !strings.HasPrefix(name, "models/") {
@@ -1007,6 +1282,7 @@ func formatHomeGeminiModel(entry homeModelEntry) map[string]any {
 		"supportedGenerationMethods": []string{"generateContent"},
 	}
 }
+
 func homeGeminiModelMatches(entry homeModelEntry, action string) bool {
 	id := strings.TrimSpace(entry.id)
 	if id == "" || action == "" {
@@ -1016,10 +1292,76 @@ func homeGeminiModelMatches(entry homeModelEntry, action string) bool {
 	normalizedID := strings.TrimPrefix(id, "models/")
 	return action == id || action == "models/"+id || normalizedAction == normalizedID
 }
+
+// homeModelsAuthStatus inspects a home models response for an authentication/error envelope.
+// It returns the HTTP status code to surface (401 for credential issues, 502 otherwise)
+// and true when the payload is an error response rather than model data.
+func homeModelsAuthStatus(raw []byte) (int, bool) {
+	errType := homeModelsErrorType(raw)
+	if errType == "" {
+		return 0, false
+	}
+	if errType == "no_credentials" || errType == "invalid_credential" {
+		return http.StatusUnauthorized, true
+	}
+	return http.StatusBadGateway, true
+}
+
+func homeModelsErrorType(raw []byte) string {
+	top, ok := unmarshalHomeModelsTopLevel(raw)
+	if !ok {
+		return ""
+	}
+	rawErr, exists := top["error"]
+	if !exists {
+		return ""
+	}
+	var errObj struct {
+		Type string `json:"type"`
+	}
+	if errUnmarshal := json.Unmarshal(rawErr, &errObj); errUnmarshal != nil {
+		return ""
+	}
+	return strings.TrimSpace(errObj.Type)
+}
+
+func homeModelsErrorMessage(raw []byte) string {
+	top, ok := unmarshalHomeModelsTopLevel(raw)
+	if !ok {
+		return "home models request failed"
+	}
+	rawErr, exists := top["error"]
+	if !exists {
+		return "home models request failed"
+	}
+	var errObj struct {
+		Message string `json:"message"`
+	}
+	if errUnmarshal := json.Unmarshal(rawErr, &errObj); errUnmarshal != nil {
+		return "home models request failed"
+	}
+	if msg := strings.TrimSpace(errObj.Message); msg != "" {
+		return msg
+	}
+	return "home models request failed"
+}
+
+func unmarshalHomeModelsTopLevel(raw []byte) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var top map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(raw, &top); errUnmarshal != nil {
+		return nil, false
+	}
+	return top, true
+}
+
 func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("home models payload is empty")
 	}
+
 	var bySection map[string][]map[string]any
 	if err := json.Unmarshal(raw, &bySection); err != nil {
 		return nil, fmt.Errorf("parse home models payload: %w", err)
@@ -1027,6 +1369,7 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 	if len(bySection) == 0 {
 		return nil, fmt.Errorf("home models payload has no sections")
 	}
+
 	seen := make(map[string]struct{})
 	out := make([]homeModelEntry, 0, 256)
 	for _, models := range bySection {
@@ -1045,19 +1388,7 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 				continue
 			}
 			seen[id] = struct{}{}
-			created := int64(0)
-			switch v := model["created"].(type) {
-			case float64:
-				created = int64(v)
-			case int64:
-				created = v
-			case int:
-				created = int64(v)
-			case json.Number:
-				if n, err := v.Int64(); err == nil {
-					created = n
-				}
-			}
+
 			ownedBy, _ := model["owned_by"].(string)
 			ownedBy = strings.TrimSpace(ownedBy)
 			displayName, _ := model["display_name"].(string)
@@ -1066,20 +1397,47 @@ func decodeHomeModels(raw []byte) ([]homeModelEntry, error) {
 				displayName, _ = model["displayName"].(string)
 				displayName = strings.TrimSpace(displayName)
 			}
+
 			out = append(out, homeModelEntry{
-				id:          id,
-				created:     created,
-				ownedBy:     ownedBy,
-				displayName: displayName,
+				id:                  id,
+				created:             homeModelInt64Value(model, "created"),
+				ownedBy:             ownedBy,
+				displayName:         displayName,
+				contextLength:       int(homeModelInt64Value(model, "context_length", "contextLength", "inputTokenLimit", "max_input_tokens")),
+				maxCompletionTokens: int(homeModelInt64Value(model, "max_completion_tokens", "maxCompletionTokens", "outputTokenLimit", "max_tokens")),
 			})
 		}
 	}
+
 	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
 	if len(out) == 0 {
 		return nil, fmt.Errorf("home models payload contains no models")
 	}
 	return out, nil
 }
+
+func homeModelInt64Value(model map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		switch value := model[key].(type) {
+		case float64:
+			return int64(value)
+		case int64:
+			return value
+		case int:
+			return int64(value)
+		case json.Number:
+			if n, errInt := value.Int64(); errInt == nil {
+				return n
+			}
+		case string:
+			if n, errParse := strconv.ParseInt(strings.TrimSpace(value), 10, 64); errParse == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
 // Start begins listening for and serving HTTP or HTTPS requests.
 // It's a blocking call and will only return on an unrecoverable error.
 //
@@ -1089,11 +1447,13 @@ func (s *Server) Start() error {
 	if s == nil || s.server == nil {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
+
 	addr := s.server.Addr
 	listener, errListen := net.Listen("tcp", addr)
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}
+
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
 		certPath := strings.TrimSpace(s.cfg.TLS.Cert)
@@ -1111,6 +1471,7 @@ func (s *Server) Start() error {
 			}
 			return fmt.Errorf("failed to start HTTPS server: %v", errLoad)
 		}
+
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{certPair},
 			NextProtos:   []string{"h2", "http/1.1"},
@@ -1124,17 +1485,21 @@ func (s *Server) Start() error {
 	} else {
 		log.Debugf("Starting API server on %s", addr)
 	}
+
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
+
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
+
 	go func() {
 		httpErrCh <- s.server.Serve(httpListener)
 	}()
 	go func() {
 		acceptErrCh <- s.acceptMuxConnections(listener, httpListener)
 	}()
+
 	select {
 	case errServe := <-httpErrCh:
 		if s.muxBaseListener != nil {
@@ -1176,6 +1541,7 @@ func (s *Server) Start() error {
 		return nil
 	}
 }
+
 // Stop gracefully shuts down the API server without interrupting any
 // active connections.
 //
@@ -1186,12 +1552,14 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+
 	if s.keepAliveEnabled {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
 		}
 	}
+
 	if s.muxHTTPListener != nil {
 		_ = s.muxHTTPListener.Close()
 	}
@@ -1200,13 +1568,16 @@ func (s *Server) Stop(ctx context.Context) error {
 			log.Debugf("failed to close shared listener: %v", errClose)
 		}
 	}
+
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
 	}
+
 	log.Debug("API server stopped")
 	return nil
 }
+
 // corsMiddleware returns a Gin middleware handler that adds CORS headers
 // to every response, allowing cross-origin requests.
 //
@@ -1217,13 +1588,17 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "*")
+		c.Header("Access-Control-Expose-Headers", corsExposedResponseHeadersJoined)
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
+
 		c.Next()
 	}
 }
+
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 	if s == nil || s.accessManager == nil || newCfg == nil {
 		return
@@ -1232,6 +1607,7 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
 		return
 	}
 }
+
 // UpdateClients updates the server's client list and configuration.
 // This method is called when the configuration or authentication tokens change.
 //
@@ -1244,6 +1620,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if len(s.oldConfigYaml) > 0 {
 		_ = yaml.Unmarshal(s.oldConfigYaml, &oldCfg)
 	}
+
 	// Update request logger enabled state if it has changed
 	previousRequestLog := false
 	if oldCfg != nil {
@@ -1256,44 +1633,55 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			toggler.SetEnabled(cfg.RequestLog)
 		}
 	}
+
 	if oldCfg == nil || oldCfg.Home.Enabled != cfg.Home.Enabled {
 		if setter, ok := s.requestLogger.(interface{ SetHomeEnabled(bool) }); ok {
 			setter.SetHomeEnabled(cfg.Home.Enabled)
 		}
 	}
+
 	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
 		if err := logging.ConfigureLogOutput(cfg); err != nil {
 			log.Errorf("failed to reconfigure log output: %v", err)
 		}
 	}
+
 	if oldCfg == nil || oldCfg.UsageStatisticsEnabled != cfg.UsageStatisticsEnabled {
 		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	}
+
 	if oldCfg == nil || oldCfg.RedisUsageQueueRetentionSeconds != cfg.RedisUsageQueueRetentionSeconds {
 		redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	}
+
 	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {
 		if setter, ok := s.requestLogger.(interface{ SetErrorLogsMaxFiles(int) }); ok {
 			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
 		}
 	}
+
 	if oldCfg == nil || oldCfg.DisableCooling != cfg.DisableCooling {
 		auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 	}
+	if oldCfg == nil || oldCfg.TransientErrorCooldownSeconds != cfg.TransientErrorCooldownSeconds {
+		auth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
+	}
+
 	if oldCfg != nil && oldCfg.DisableImageGeneration != cfg.DisableImageGeneration {
 		log.Infof("disable-image-generation updated: %v -> %v", oldCfg.DisableImageGeneration, cfg.DisableImageGeneration)
 	}
+
 	applySignatureCacheConfig(oldCfg, cfg)
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
-		s.handlers.AuthManager.SetOAuthModelAlias(cfg.OAuthModelAlias)
-		s.handlers.AuthManager.SetFallbackModels(cfg.Routing.FallbackModels)
-		s.handlers.AuthManager.SetFallbackChain(cfg.Routing.FallbackChain, cfg.Routing.FallbackMaxDepth)
 	}
+
 	// Update log level dynamically when debug flag changes
 	if oldCfg == nil || oldCfg.Debug != cfg.Debug {
 		util.SetLogLevel(cfg)
 	}
+
 	prevSecretEmpty := true
 	if oldCfg != nil {
 		prevSecretEmpty = oldCfg.RemoteManagement.SecretKey == ""
@@ -1326,6 +1714,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 	}
 	redisqueue.SetEnabled(s.managementRoutesEnabled.Load() || (cfg != nil && cfg.Home.Enabled))
+
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
@@ -1335,23 +1724,21 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	managementasset.SetCurrentConfig(cfg)
 	// Save YAML snapshot for next comparison
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
-	s.handlers.UpdateClients(&cfg.SDKConfig)
+
+	s.handlers.UpdateClients(effectiveSDKConfig(cfg))
+	s.handlers.SetPluginHost(s.pluginHost)
+	if s.pluginHost != nil {
+		s.pluginHost.SetModelExecutor(s.handlers)
+		s.pluginHost.SetAuthManager(s.handlers.AuthManager)
+	}
+
 	if s.mgmt != nil {
 		s.mgmt.SetConfig(cfg)
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
+		s.mgmt.SetPluginHost(s.pluginHost)
 	}
-	// Notify Amp module only when Amp config has changed.
-	ampConfigChanged := oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode)
-	if ampConfigChanged {
-		if s.ampModule != nil {
-			log.Debugf("triggering amp module config update")
-			if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
-				log.Errorf("failed to update Amp module config: %v", err)
-			}
-		} else {
-			log.Warnf("amp module is nil, skipping config update")
-		}
-	}
+	s.refreshPluginManagementRoutes()
+
 	// Count client sources from configuration and auth store.
 	authEntries := 0
 	if cfg != nil && !cfg.Home.Enabled {
@@ -1373,6 +1760,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		}
 		openAICompatCount += len(entry.APIKeyEntries)
 	}
+
 	total := authEntries + geminiAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + vertexAICompatCount + openAICompatCount
 	fmt.Printf("server clients and configuration updated: %d clients (%d auth entries + %d Gemini API keys + %d Claude API keys + %d Codex keys + %d Vertex-compat + %d OpenAI-compat)\n",
 		total,
@@ -1384,56 +1772,28 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		openAICompatCount,
 	)
 }
+
 func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 	if s == nil {
 		return
 	}
 	s.wsAuthChanged = fn
 }
+
 // (management handlers moved to internal/api/handlers/management)
-func (s *Server) apiKeyIPBlacklistMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if s.apiKeyIPBlacklist != nil {
-			if blockedEntry, blocked := s.apiKeyIPBlacklist.IsBlocked(c.ClientIP()); blocked {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-					"error":                   "IP blocked due to repeated invalid API key attempts",
-					"blocked-until":           blockedEntry.BlockedUntil,
-					"remaining-block-seconds": blockedEntry.RemainingBlockSeconds,
-				})
-				return
-			}
-		}
-		c.Next()
-	}
-}
+
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,
 // it allows all requests (legacy behaviour).
-func AuthMiddleware(manager *sdkaccess.Manager, apiKeyIPBlacklist ...*managementHandlers.APIKeyIPBlacklistStore) gin.HandlerFunc {
-	var blacklist *managementHandlers.APIKeyIPBlacklistStore
-	if len(apiKeyIPBlacklist) > 0 {
-		blacklist = apiKeyIPBlacklist[0]
-	}
+func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if manager == nil {
 			c.Next()
 			return
 		}
-		if blacklist != nil {
-			if blockedEntry, blocked := blacklist.IsBlocked(c.ClientIP()); blocked {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
-					"error":                   "IP blocked due to repeated invalid API key attempts",
-					"blocked-until":           blockedEntry.BlockedUntil,
-					"remaining-block-seconds": blockedEntry.RemainingBlockSeconds,
-				})
-				return
-			}
-		}
+
 		result, err := manager.Authenticate(c.Request.Context(), c.Request)
 		if err == nil {
-			if blacklist != nil && result != nil && result.ProviderType == sdkaccess.AccessProviderTypeConfigAPIKey {
-				blacklist.ResetFailures(c.ClientIP())
-			}
 			if result != nil {
 				c.Set("userApiKey", result.Principal)
 				c.Set("accessProvider", result.Provider)
@@ -1444,22 +1804,22 @@ func AuthMiddleware(manager *sdkaccess.Manager, apiKeyIPBlacklist ...*management
 			c.Next()
 			return
 		}
+
 		statusCode := err.HTTPStatusCode()
-		if blacklist != nil && statusCode == http.StatusUnauthorized && sdkaccess.IsAuthErrorCode(err, sdkaccess.AuthErrorCodeInvalidCredential) && strings.EqualFold(strings.TrimSpace(err.ProviderType), sdkaccess.AccessProviderTypeConfigAPIKey) {
-			blacklist.RecordFailure(c.ClientIP())
-		}
 		if statusCode >= http.StatusInternalServerError {
 			log.Errorf("authentication middleware error: %v", err)
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}
 }
+
 func configuredSignatureCacheEnabled(cfg *config.Config) bool {
 	if cfg != nil && cfg.AntigravitySignatureCacheEnabled != nil {
 		return *cfg.AntigravitySignatureCacheEnabled
 	}
 	return true
 }
+
 func applySignatureCacheConfig(oldCfg, cfg *config.Config) {
 	newVal := configuredSignatureCacheEnabled(cfg)
 	newStrict := configuredSignatureBypassStrict(cfg)
@@ -1468,15 +1828,18 @@ func applySignatureCacheConfig(oldCfg, cfg *config.Config) {
 		cache.SetSignatureBypassStrictMode(newStrict)
 		return
 	}
+
 	oldVal := configuredSignatureCacheEnabled(oldCfg)
 	if oldVal != newVal {
 		cache.SetSignatureCacheEnabled(newVal)
 	}
+
 	oldStrict := configuredSignatureBypassStrict(oldCfg)
 	if oldStrict != newStrict {
 		cache.SetSignatureBypassStrictMode(newStrict)
 	}
 }
+
 func configuredSignatureBypassStrict(cfg *config.Config) bool {
 	if cfg != nil && cfg.AntigravitySignatureBypassStrict != nil {
 		return *cfg.AntigravitySignatureBypassStrict

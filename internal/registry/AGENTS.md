@@ -23,7 +23,7 @@ registry/
 | Task | Location | Notes |
 |------|----------|-------|
 | Static model list | `model_definitions.go`, `models/models.json` | Provider-specific fallback. |
-| Runtime registration | `model_registry.go` | Client/provider/model availability. |
+| Runtime registration | `model_registry.go` | Client/provider/model availability. Mistral과 CommandCode도 여기에 등록됨. |
 | Remote refresh | `model_updater.go` | Interacts with `--local-model`. |
 | Provider normalization | `*_model_converter.go` | Keep conversion near provider. |
 
@@ -32,6 +32,8 @@ registry/
 - Prefer registry APIs over direct model string comparisons.
 - Static fallback lookup must be provider-scoped; do not borrow another provider's model definition.
 - GitHub Copilot exposure is a five-model allowlist only: `claude-haiku-4.5`, `gemini-2.5-pro`, `gemini-3-pro-preview`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`.
+- `buildConfigModels` dedup key is `(alias|name)` — supports same alias (e.g. higher-coding) mapped to many upstream models without dropping entries from registry/round-robin.
+- Aliased models participate equally in round-robin for both OAuth and API-key providers.
 
 ## ANTI-PATTERNS
 

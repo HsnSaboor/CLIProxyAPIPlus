@@ -113,16 +113,16 @@ func TestEnsureIndexUsesOAuthTypeAndAbsolutePath(t *testing.T) {
 
 	relPath := "test-oauth.json"
 	absPath := filepath.Join(wd, relPath)
-	expectedSeed := "gemini:" + filepath.Clean(absPath)
+	expectedSeed := "antigravity:" + filepath.Clean(absPath)
 	expectedIndex := stableAuthIndex(expectedSeed)
 
 	a := &Auth{
-		Provider: "gemini-cli",
+		Provider: "antigravity",
 		Attributes: map[string]string{
 			"path": relPath,
 		},
 		Metadata: map[string]any{
-			"type": "gemini",
+			"type": "antigravity",
 		},
 	}
 
@@ -167,8 +167,8 @@ func TestRecentRequestsSnapshotIncludesCounts(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).In(time.Local)
 	a := &Auth{}
 
-	a.recordRecentRequest(now, true)
-	a.recordRecentRequest(now, false)
+	a.recordRecentRequest(now, true, "")
+	a.recordRecentRequest(now, false, "test_error")
 
 	got := a.RecentRequestsSnapshot(now)
 	if len(got) != recentRequestBucketCount {
@@ -186,8 +186,8 @@ func TestRecentRequestsSnapshotBucketAdvanceMovesCounts(t *testing.T) {
 	next := now.Add(10 * time.Minute)
 	a := &Auth{}
 
-	a.recordRecentRequest(now, true)
-	a.recordRecentRequest(next, false)
+	a.recordRecentRequest(now, true, "")
+	a.recordRecentRequest(next, false, "test_error")
 
 	got := a.RecentRequestsSnapshot(next)
 	if len(got) != recentRequestBucketCount {

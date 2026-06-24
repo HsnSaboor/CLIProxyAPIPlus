@@ -15,9 +15,10 @@ import (
 type schedulerStrategy int
 
 const (
-	schedulerStrategyCustom schedulerStrategy = iota
-	schedulerStrategyRoundRobin
-	schedulerStrategyFillFirst
+	schedulerStrategyCurrent    schedulerStrategy = -1
+	schedulerStrategyCustom     schedulerStrategy = 0
+	schedulerStrategyRoundRobin schedulerStrategy = 1
+	schedulerStrategyFillFirst  schedulerStrategy = 2
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -238,16 +239,23 @@ func (s *authScheduler) removeAuth(authID string) {
 
 // pickSingle returns the next auth for a single provider/model request using scheduler state.
 func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+	return s.pickSingleWithStrategy(ctx, provider, model, opts, tried, schedulerStrategyCurrent)
+}
+
+func (s *authScheduler) pickSingleWithStrategy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, strategy schedulerStrategy) (*Auth, error) {
 	if s == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	providerKey := strings.ToLower(strings.TrimSpace(provider))
 	modelKey := canonicalModelKey(model)
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
-	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerKey == "codex" && pinnedAuthID == ""
+	preferWebsocket := cliproxyexecutor.DownstreamWebsocket(ctx) && providerPrefersWebsocketTransport(providerKey) && pinnedAuthID == ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strategy == schedulerStrategyCurrent {
+		strategy = s.strategy
+	}
 	providerState := s.providers[providerKey]
 	if providerState == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -270,14 +278,27 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, strategy, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
 }
 
+func providerPrefersWebsocketTransport(providerKey string) bool {
+	switch strings.ToLower(strings.TrimSpace(providerKey)) {
+	case "codex", "xai":
+		return true
+	default:
+		return false
+	}
+}
+
 // pickMixed returns the next auth and provider for a mixed-provider request.
 func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, string, error) {
+	return s.pickMixedWithStrategy(ctx, providers, model, opts, tried, schedulerStrategyCurrent)
+}
+
+func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}, strategy schedulerStrategy) (*Auth, string, error) {
 	if s == nil {
 		return nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -289,7 +310,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		// When a single provider is eligible, reuse pickSingle so provider-specific preferences
 		// (for example Codex websocket transport) are applied consistently.
 		providerKey := normalized[0]
-		picked, errPick := s.pickSingle(ctx, providerKey, model, opts, tried)
+		picked, errPick := s.pickSingleWithStrategy(ctx, providerKey, model, opts, tried, strategy)
 		if errPick != nil {
 			return nil, "", errPick
 		}
@@ -303,6 +324,9 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if strategy == schedulerStrategyCurrent {
+		strategy = s.strategy
+	}
 	if pinnedAuthID != "" {
 		providerKey := s.authProviders[pinnedAuthID]
 		if providerKey == "" || !containsProvider(normalized, providerKey) {
@@ -323,7 +347,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, strategy, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -357,13 +381,13 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
 	}
 
-	if s.strategy == schedulerStrategyFillFirst {
+	if strategy == schedulerStrategyFillFirst {
 		for providerIndex, providerKey := range normalized {
 			shard := candidateShards[providerIndex]
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, strategy, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -510,7 +534,7 @@ func (s *authScheduler) upsertAuthLocked(auth *Auth, now time.Time) {
 		return
 	}
 	authID := strings.TrimSpace(auth.ID)
-	providerKey := effectiveProviderKey(auth)
+	providerKey := executorKeyFromAuth(auth)
 	if authID == "" || providerKey == "" || auth.Disabled {
 		s.removeAuthLocked(authID)
 		return
@@ -557,7 +581,7 @@ func (s *authScheduler) ensureProviderLocked(providerKey string) *providerSchedu
 
 // buildScheduledAuthMeta extracts the scheduling metadata needed for shard bookkeeping.
 func buildScheduledAuthMeta(auth *Auth) *scheduledAuthMeta {
-	providerKey := effectiveProviderKey(auth)
+	providerKey := executorKeyFromAuth(auth)
 	virtualParent := ""
 	if auth.Attributes != nil {
 		virtualParent = strings.TrimSpace(auth.Attributes["gemini_virtual_parent"])

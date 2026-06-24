@@ -7,9 +7,6 @@ const (
 	// Gemini represents the Google Gemini provider identifier.
 	Gemini = "gemini"
 
-	// GeminiCLI represents the Google Gemini CLI provider identifier.
-	GeminiCLI = "gemini-cli"
-
 	// Codex represents the OpenAI Codex provider identifier.
 	Codex = "codex"
 
@@ -33,4 +30,10 @@ const (
 
 	// Cline represents the Cline AI provider identifier.
 	Cline = "cline"
+
+	// CommandCode represents the Command Code provider identifier.
+	CommandCode = "commandcode"
+
+	// Mistral represents the Mistral AI provider identifier.
+	Mistral = "mistral"
 )

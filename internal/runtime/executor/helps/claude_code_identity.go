@@ -1,0 +1,290 @@
+package helps
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
+// ClaudeCodeIdentity represents the device/session identity used by Claude Code.
+// It is used to construct the metadata.user_id JSON string.
+type ClaudeCodeIdentity struct {
+	DeviceID     string
+	AccountUUID  string
+	SessionID    string
+}
+
+// Global identity cache to ensure stable identities for a given seed.
+var (
+	claudeCodeIdentityCache            = make(map[string]*ClaudeCodeIdentity)
+	claudeCodeIdentityCacheMu          sync.RWMutex
+	claudeCodeIdentityCacheCleanupOnce sync.Once
+	claudeCodeIdentityCacheSizeLimit   = 1000
+)
+
+// claudeCodeBootstrapCache caches bootstrap results (account_uuid lookups).
+// Negative results are cached for 5 minutes, positive for 24 hours.
+var (
+	claudeCodeBootstrapResults = make(map[string]*bootstrapResult)
+	claudeCodeBootstrapMu      sync.RWMutex
+)
+
+type bootstrapResult struct {
+	accountUUID string
+	expiresAt   int64
+}
+
+const (
+	claudeCodeBootstrapTTL          = 24 * time.Hour
+	claudeCodeBootstrapNegativeTTL = 5 * time.Minute
+	claudeCodeBootstrapURL          = "https://api.anthropic.com/api/claude_cli/bootstrap"
+	claudeCodeBootstrapTimeout      = 5 * time.Second
+)
+
+// GetClaudeCodeIdentity returns a stable identity for the given seed (typically the access token).
+func GetClaudeCodeIdentity(seed string) *ClaudeCodeIdentity {
+	if seed == "" {
+		seed = "anonymous"
+	}
+
+	claudeCodeIdentityCacheMu.Lock()
+	defer claudeCodeIdentityCacheMu.Unlock()
+
+	if cached, ok := claudeCodeIdentityCache[seed]; ok {
+		// Return a copy to prevent mutation
+		return &ClaudeCodeIdentity{
+			DeviceID:     cached.DeviceID,
+			AccountUUID:  cached.AccountUUID,
+			SessionID:    cached.SessionID,
+		}
+	}
+
+	// Generate new identity
+	identity := &ClaudeCodeIdentity{
+		DeviceID:  generateRandomHex(32),
+		SessionID: uuid.New().String(),
+	}
+
+	// Ensure cache size limit (LRU-like eviction)
+	if len(claudeCodeIdentityCache) >= claudeCodeIdentityCacheSizeLimit {
+		// Remove oldest entry
+		var oldest string
+		for k := range claudeCodeIdentityCache {
+			oldest = k
+			break
+		}
+		delete(claudeCodeIdentityCache, oldest)
+	}
+
+	claudeCodeIdentityCache[seed] = identity
+	return &ClaudeCodeIdentity{
+		DeviceID:     identity.DeviceID,
+		AccountUUID:  identity.AccountUUID,
+		SessionID:    identity.SessionID,
+	}
+}
+
+// ResolveClaudeCodeIdentity resolves the full identity including account_uuid from the Claude bootstrap API.
+// If accessToken does not start with "sk-ant-oat", returns identity without account_uuid.
+func ResolveClaudeCodeIdentity(ctx context.Context, accessToken string, model string) *ClaudeCodeIdentity {
+	identity := GetClaudeCodeIdentity(accessToken)
+
+	// Only OAuth tokens can be resolved
+	if accessToken == "" || len(accessToken) < 8 || !strings.HasPrefix(accessToken, "sk-ant-oat") {
+		return identity
+	}
+
+	// Check bootstrap cache
+	claudeCodeBootstrapMu.RLock()
+	if cached, ok := claudeCodeBootstrapResults[accessToken]; ok {
+		if time.Now().UnixMilli() < cached.expiresAt {
+			if cached.accountUUID != "" {
+				identity.AccountUUID = cached.accountUUID
+			}
+			claudeCodeBootstrapMu.RUnlock()
+			return identity
+		}
+	}
+	claudeCodeBootstrapMu.RUnlock()
+
+	// Fetch account_uuid from bootstrap API
+	accountUUID := fetchClaudeCodeAccountUUID(ctx, accessToken, model)
+	if accountUUID != "" {
+		identity.AccountUUID = accountUUID
+		SetBootstrapAccountUUID(accessToken, accountUUID)
+	}
+	return identity
+}
+
+// fetchClaudeCodeAccountUUID performs the actual HTTP fetch to the bootstrap API
+func fetchClaudeCodeAccountUUID(ctx context.Context, accessToken, model string) string {
+	url := claudeCodeBootstrapURL
+	
+	// Build query parameters
+	query := url + "?entrypoint=cli"
+	if model != "" {
+		query += "&model=" + model
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, query, nil)
+	if err != nil {
+		return ""
+	}
+
+	// Set headers matching Claude Code
+	req.Header.Set("accept", "application/json, text/plain, */*")
+	req.Header.Set("authorization", "Bearer "+accessToken)
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	req.Header.Set("user-agent", "claude-code/2.1.177")
+
+	client := &http.Client{Timeout: claudeCodeBootstrapTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	var result struct {
+		OAuthAccount struct {
+			AccountUUID string `json:"account_uuid"`
+		} `json:"oauth_account"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return ""
+	}
+
+	return result.OAuthAccount.AccountUUID
+}
+
+// SetBootstrapAccountUUID sets the account UUID for an access token (called by executor after HTTP lookup).
+func SetBootstrapAccountUUID(accessToken, accountUUID string) {
+	claudeCodeBootstrapMu.Lock()
+	defer claudeCodeBootstrapMu.Unlock()
+
+	ttl := claudeCodeBootstrapNegativeTTL
+	if accountUUID != "" {
+		ttl = claudeCodeBootstrapTTL
+	}
+
+	claudeCodeBootstrapResults[accessToken] = &bootstrapResult{
+		accountUUID: accountUUID,
+		expiresAt:   time.Now().Add(ttl).UnixMilli(),
+	}
+}
+
+// BuildClaudeCodeMetadataUserID creates the JSON user_id string for metadata.user_id.
+// Returns empty string if accountUUID is empty.
+func BuildClaudeCodeMetadataUserID(identity *ClaudeCodeIdentity) string {
+	if identity == nil || identity.AccountUUID == "" {
+		return ""
+	}
+	data := map[string]string{
+		"device_id":    identity.DeviceID,
+		"account_uuid": identity.AccountUUID,
+		"session_id":   identity.SessionID,
+	}
+	b, _ := json.Marshal(data)
+	return string(b)
+}
+
+// ApplyClaudeCodeMetadata injects the metadata.user_id into the request body.
+func ApplyClaudeCodeMetadata(body []byte, identity *ClaudeCodeIdentity) ([]byte, bool) {
+	if identity == nil {
+		return body, false
+	}
+	userID := BuildClaudeCodeMetadataUserID(identity)
+	if userID == "" {
+		return body, false
+	}
+	result, err := sjson.SetBytes(body, "metadata.user_id", userID)
+	if err != nil {
+		return body, false
+	}
+	return result, true
+}
+
+func generateRandomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// OrderClaudeCodeBody reorders the JSON body fields to match Claude Code's expected field order.
+//
+// It uses order-preserving sjson writes (NOT json.Marshal over a map, which Go
+// alphabetizes) so the emitted wire bytes keep the canonical key order required for
+// cortexkit/anthropic-auth byte-parity. The canonical order mirrors claude-code.ts
+// BODY_FIELD_ORDER; any keys outside that list are appended in their original order.
+func OrderClaudeCodeBody(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+
+	root := gjson.ParseBytes(body)
+	if !root.IsObject() {
+		return body, nil
+	}
+
+	// Target field order per anthropic-auth claude-code.ts BODY_FIELD_ORDER.
+	fieldOrder := []string{
+		"model",
+		"messages",
+		"system",
+		"tools",
+		"tool_choice",
+		"metadata",
+		"max_tokens",
+		"temperature",
+		"thinking",
+		"context_management",
+		"output_config",
+		"diagnostics",
+		"stream",
+		"speed",
+	}
+
+	ordered := []byte("{}")
+	seen := make(map[string]bool, len(fieldOrder))
+
+	// Emit canonical fields first, in reference order, preserving raw JSON values.
+	for _, field := range fieldOrder {
+		if v := root.Get(field); v.Exists() {
+			var err error
+			ordered, err = sjson.SetRawBytes(ordered, field, []byte(v.Raw))
+			if err != nil {
+				return nil, err
+			}
+			seen[field] = true
+		}
+	}
+	// Append any remaining keys in their original insertion order.
+	var setErr error
+	root.ForEach(func(k, v gjson.Result) bool {
+		key := k.String()
+		if seen[key] {
+			return true
+		}
+		ordered, setErr = sjson.SetRawBytes(ordered, key, []byte(v.Raw))
+		return setErr == nil
+	})
+	if setErr != nil {
+		return nil, setErr
+	}
+
+	return ordered, nil
+}

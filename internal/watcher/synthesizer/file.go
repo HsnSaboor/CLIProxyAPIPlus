@@ -1,6 +1,7 @@
 package synthesizer
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,8 +12,10 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 // FileSynthesizer generates Auth entries from OAuth JSON files.
@@ -76,10 +79,50 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		return nil
 	}
 	t, _ := metadata["type"].(string)
-	if t == "" {
+	provider := strings.ToLower(strings.TrimSpace(t))
+	if provider == "gemini" {
+		provider = "gemini-cli"
+	}
+	if ctx.PluginAuthParser != nil {
+		auths, handled, errParse := parsePluginFileAuths(ctx.PluginAuthParser, pluginapi.AuthParseRequest{
+			Provider: provider,
+			Path:     fullPath,
+			FileName: filepath.Base(fullPath),
+			RawJSON:  data,
+		})
+		if errParse == nil && handled {
+			auths = compactPluginAuths(auths)
+			if len(auths) == 0 {
+				return nil
+			}
+			perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
+			for index, auth := range auths {
+				if auth == nil {
+					continue
+				}
+				if len(auths) > 1 {
+					coreauth.MarkPluginVirtualAuth(auth, fullPath, index)
+				}
+				auth.CreatedAt = now
+				auth.UpdatedAt = now
+				if auth.Attributes == nil {
+					auth.Attributes = make(map[string]string)
+				}
+				auth.Attributes["path"] = fullPath
+				auth.Attributes["source"] = fullPath
+				coreauth.SetOAuthModelAliasesAttribute(auth, perAccountModelAliases)
+				ApplyAuthExcludedModelsMeta(auth, cfg, perAccountExcluded, "oauth")
+				coreauth.ApplyCustomHeadersFromMetadata(auth)
+				syncPriorityFromMetadata(auth, metadata)
+			}
+			return auths
+		}
+	}
+	if provider == "" || provider == "gemini-cli" {
 		return nil
 	}
-	provider := canonicalizeAuthProvider(t)
+
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
@@ -120,6 +163,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 
 	// Read per-account excluded models from the OAuth JSON file.
 	perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
+	perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
 
 	a := &coreauth.Auth{
 		ID:       id,
@@ -183,6 +227,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
+	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
@@ -379,8 +424,92 @@ func normalizeFileBillingClass(raw string) string {
 	}
 }
 
+func parsePluginFileAuths(parser PluginAuthParser, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+	if parser == nil {
+		return nil, false, nil
+	}
+	if multiParser, ok := parser.(PluginMultiAuthParser); ok {
+		return multiParser.ParseAuths(context.Background(), req)
+	}
+	auth, handled, errParse := parser.ParseAuth(context.Background(), req)
+	if errParse != nil || !handled || auth == nil {
+		return nil, handled, errParse
+	}
+	return []*coreauth.Auth{auth}, true, nil
+}
+
+func compactPluginAuths(auths []*coreauth.Auth) []*coreauth.Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	out := auths[:0]
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		out = append(out, auth)
+	}
+	return out
+}
+
+// extractOAuthModelAliasesFromMetadata reads per-account model aliases from OAuth JSON metadata.
+// Supports both "model_aliases" and "model-aliases" keys.
+func extractOAuthModelAliasesFromMetadata(metadata map[string]any) []config.OAuthModelAlias {
+	if metadata == nil {
+		return nil
+	}
+	raw, ok := metadata["model_aliases"]
+	if !ok {
+		raw, ok = metadata["model-aliases"]
+	}
+	if !ok || raw == nil {
+		return nil
+	}
+	data, errMarshal := json.Marshal(raw)
+	if errMarshal != nil {
+		return nil
+	}
+	var aliases []config.OAuthModelAlias
+	if errUnmarshal := json.Unmarshal(data, &aliases); errUnmarshal != nil {
+		return nil
+	}
+	cfg := config.Config{
+		OAuthModelAlias: map[string][]config.OAuthModelAlias{
+			"auth": aliases,
+		},
+	}
+	cfg.SanitizeOAuthModelAlias()
+	return cfg.OAuthModelAlias["auth"]
+}
+
 // extractExcludedModelsFromMetadata reads per-account excluded models from the OAuth JSON metadata.
 // Supports both "excluded_models" and "excluded-models" keys, and accepts both []string and []interface{}.
+// syncPriorityFromMetadata reads the "priority" key from OAuth JSON metadata
+// and writes it into auth.Attributes["priority"] if it is a valid integer.
+// Plugin auth parser and standard auth file paths both use this to ensure
+// weight-robin picks up priority from auth files consistently.
+func syncPriorityFromMetadata(auth *coreauth.Auth, metadata map[string]any) {
+	if auth == nil || metadata == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	rawPriority, ok := metadata["priority"]
+	if !ok {
+		return
+	}
+	switch v := rawPriority.(type) {
+	case float64:
+		auth.Attributes["priority"] = strconv.Itoa(int(v))
+	case string:
+		priority := strings.TrimSpace(v)
+		if _, errAtoi := strconv.Atoi(priority); errAtoi == nil {
+			auth.Attributes["priority"] = priority
+		}
+	}
+}
+
 func extractExcludedModelsFromMetadata(metadata map[string]any) []string {
 	if metadata == nil {
 		return nil

@@ -311,14 +311,15 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
-		APIKey         *string               `json:"api-key"`
-		Prefix         *string               `json:"prefix"`
-		BaseURL        *string               `json:"base-url"`
-		ProxyURL       *string               `json:"proxy-url"`
-		BillingClass   *string               `json:"billing-class"`
-		Models         *[]config.ClaudeModel `json:"models"`
-		Headers        *map[string]string    `json:"headers"`
-		ExcludedModels *[]string             `json:"excluded-models"`
+		APIKey                  *string               `json:"api-key"`
+		Prefix                  *string               `json:"prefix"`
+		BaseURL                 *string               `json:"base-url"`
+		ProxyURL                *string               `json:"proxy-url"`
+		BillingClass            *string               `json:"billing-class"`
+		Models                  *[]config.ClaudeModel `json:"models"`
+		Headers                 *map[string]string    `json:"headers"`
+		ExcludedModels          *[]string             `json:"excluded-models"`
+		RebuildMidSystemMessage *bool                 `json:"rebuild-mid-system-message"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -374,6 +375,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.RebuildMidSystemMessage != nil {
+		entry.RebuildMidSystemMessage = *body.Value.RebuildMidSystemMessage
 	}
 	normalizeClaudeKey(&entry)
 	h.cfg.ClaudeKey[targetIndex] = entry
@@ -1117,21 +1121,21 @@ func (h *Handler) DeleteCodexKey(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
 }
 
-// ollama-api-key: []OllamaKey
-func (h *Handler) GetOllamaKeys(c *gin.Context) {
-	c.JSON(200, gin.H{"ollama-api-key": h.ollamaKeysWithAuthIndex()})
+// commandcode-api-key: []CommandCodeKey
+func (h *Handler) GetCommandCodeKeys(c *gin.Context) {
+	c.JSON(200, gin.H{"commandcode-api-key": h.commandCodeKeysWithAuthIndex()})
 }
 
-func (h *Handler) PutOllamaKeys(c *gin.Context) {
+func (h *Handler) PutCommandCodeKeys(c *gin.Context) {
 	data, err := c.GetRawData()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "failed to read body"})
 		return
 	}
-	var arr []config.OllamaKey
+	var arr []config.CommandCodeKey
 	if err = json.Unmarshal(data, &arr); err != nil {
 		var obj struct {
-			Items []config.OllamaKey `json:"items"`
+			Items []config.CommandCodeKey `json:"items"`
 		}
 		if err2 := json.Unmarshal(data, &obj); err2 != nil || len(obj.Items) == 0 {
 			c.JSON(400, gin.H{"error": "invalid body"})
@@ -1139,36 +1143,39 @@ func (h *Handler) PutOllamaKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
-	filtered := make([]config.OllamaKey, 0, len(arr))
+	// Filter out commandcode entries with empty base-url (treat as removed)
+	filtered := make([]config.CommandCodeKey, 0, len(arr))
 	for i := range arr {
 		entry := arr[i]
-		normalizeOllamaKey(&entry)
-		if entry.APIKey == "" {
+		normalizeCommandCodeKey(&entry)
+		if entry.BaseURL == "" {
 			continue
 		}
 		filtered = append(filtered, entry)
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.cfg.OllamaKey = filtered
-	h.cfg.SanitizeOllamaKeys()
+	h.cfg.CommandCodeKey = filtered
+	h.cfg.SanitizeCommandCodeKeys()
 	h.persistLocked(c)
 }
 
-func (h *Handler) PatchOllamaKey(c *gin.Context) {
-	type ollamaKeyPatch struct {
-		APIKey         *string               `json:"api-key"`
-		Prefix         *string               `json:"prefix"`
-		BaseURL        *string               `json:"base-url"`
-		ProxyURL       *string               `json:"proxy-url"`
-		Models         *[]config.OllamaModel `json:"models"`
-		Headers        *map[string]string    `json:"headers"`
-		ExcludedModels *[]string             `json:"excluded-models"`
+func (h *Handler) PatchCommandCodeKey(c *gin.Context) {
+	type commandCodeKeyPatch struct {
+		APIKey         *string                    `json:"api-key"`
+		Priority       *int                       `json:"priority"`
+		Prefix         *string                    `json:"prefix"`
+		BaseURL        *string                    `json:"base-url"`
+		ProxyURL       *string                    `json:"proxy-url"`
+		Models         *[]config.CommandCodeModel `json:"models"`
+		Headers        *map[string]string         `json:"headers"`
+		ExcludedModels *[]string                  `json:"excluded-models"`
+		DisableCooling *bool                      `json:"disable-cooling"`
 	}
 	var body struct {
-		Index *int            `json:"index"`
-		Match *string         `json:"match"`
-		Value *ollamaKeyPatch `json:"value"`
+		Index *int                 `json:"index"`
+		Match *string              `json:"match"`
+		Value *commandCodeKeyPatch `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
 		c.JSON(400, gin.H{"error": "invalid body"})
@@ -1178,13 +1185,13 @@ func (h *Handler) PatchOllamaKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	targetIndex := -1
-	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.OllamaKey) {
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.CommandCodeKey) {
 		targetIndex = *body.Index
 	}
 	if targetIndex == -1 && body.Match != nil {
 		match := strings.TrimSpace(*body.Match)
-		for i := range h.cfg.OllamaKey {
-			if h.cfg.OllamaKey[i].APIKey == match {
+		for i := range h.cfg.CommandCodeKey {
+			if h.cfg.CommandCodeKey[i].APIKey == match {
 				targetIndex = i
 				break
 			}
@@ -1195,21 +1202,31 @@ func (h *Handler) PatchOllamaKey(c *gin.Context) {
 		return
 	}
 
-	entry := h.cfg.OllamaKey[targetIndex]
+	entry := h.cfg.CommandCodeKey[targetIndex]
 	if body.Value.APIKey != nil {
 		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
 	}
 	if body.Value.Prefix != nil {
 		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
 	}
 	if body.Value.BaseURL != nil {
-		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
+		trimmed := strings.TrimSpace(*body.Value.BaseURL)
+		if trimmed == "" {
+			h.cfg.CommandCodeKey = append(h.cfg.CommandCodeKey[:targetIndex], h.cfg.CommandCodeKey[targetIndex+1:]...)
+			h.cfg.SanitizeCommandCodeKeys()
+			h.persistLocked(c)
+			return
+		}
+		entry.BaseURL = trimmed
 	}
 	if body.Value.ProxyURL != nil {
 		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
 	}
 	if body.Value.Models != nil {
-		entry.Models = append([]config.OllamaModel(nil), (*body.Value.Models)...)
+		entry.Models = append([]config.CommandCodeModel(nil), (*body.Value.Models)...)
 	}
 	if body.Value.Headers != nil {
 		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
@@ -1217,35 +1234,237 @@ func (h *Handler) PatchOllamaKey(c *gin.Context) {
 	if body.Value.ExcludedModels != nil {
 		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
 	}
-	normalizeOllamaKey(&entry)
-	h.cfg.OllamaKey[targetIndex] = entry
-	h.cfg.SanitizeOllamaKeys()
+	if body.Value.DisableCooling != nil {
+		entry.DisableCooling = *body.Value.DisableCooling
+	}
+	normalizeCommandCodeKey(&entry)
+	h.cfg.CommandCodeKey[targetIndex] = entry
+	h.cfg.SanitizeCommandCodeKeys()
 	h.persistLocked(c)
 }
 
-func (h *Handler) DeleteOllamaKey(c *gin.Context) {
+func (h *Handler) DeleteCommandCodeKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
-		base := strings.TrimSpace(c.Query("base-url"))
-		out := make([]config.OllamaKey, 0, len(h.cfg.OllamaKey))
-		for _, v := range h.cfg.OllamaKey {
-			if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
-				continue
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.CommandCodeKey, 0, len(h.cfg.CommandCodeKey))
+			for _, v := range h.cfg.CommandCodeKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
+				out = append(out, v)
 			}
-			out = append(out, v)
+			h.cfg.CommandCodeKey = out
+			h.cfg.SanitizeCommandCodeKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.OllamaKey = out
-		h.cfg.SanitizeOllamaKeys()
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.CommandCodeKey {
+			if strings.TrimSpace(h.cfg.CommandCodeKey[i].APIKey) == val {
+				matchCount++
+			}
+		}
+		if matchCount == 1 {
+			for i := range h.cfg.CommandCodeKey {
+				if strings.TrimSpace(h.cfg.CommandCodeKey[i].APIKey) == val {
+					matchIndex = i
+					break
+				}
+			}
+		}
+		if matchIndex != -1 {
+			h.cfg.CommandCodeKey = append(h.cfg.CommandCodeKey[:matchIndex], h.cfg.CommandCodeKey[matchIndex+1:]...)
+		}
+		h.cfg.SanitizeCommandCodeKeys()
 		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
 		var idx int
 		_, err := fmt.Sscanf(idxStr, "%d", &idx)
-		if err == nil && idx >= 0 && idx < len(h.cfg.OllamaKey) {
-			h.cfg.OllamaKey = append(h.cfg.OllamaKey[:idx], h.cfg.OllamaKey[idx+1:]...)
-			h.cfg.SanitizeOllamaKeys()
+		if err == nil && idx >= 0 && idx < len(h.cfg.CommandCodeKey) {
+			h.cfg.CommandCodeKey = append(h.cfg.CommandCodeKey[:idx], h.cfg.CommandCodeKey[idx+1:]...)
+			h.cfg.SanitizeCommandCodeKeys()
+			h.persistLocked(c)
+			return
+		}
+	}
+	c.JSON(400, gin.H{"error": "missing api-key or index"})
+}
+
+// mistral-api-key: []MistralKey
+func (h *Handler) GetMistralKeys(c *gin.Context) {
+	c.JSON(200, gin.H{"mistral-api-key": h.mistralKeysWithAuthIndex()})
+}
+
+func (h *Handler) PutMistralKeys(c *gin.Context) {
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.MistralKey
+	if err = json.Unmarshal(data, &arr); err != nil {
+		var obj struct {
+			Items []config.MistralKey `json:"items"`
+		}
+		if err2 := json.Unmarshal(data, &obj); err2 != nil || len(obj.Items) == 0 {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		arr = obj.Items
+	}
+	filtered := make([]config.MistralKey, 0, len(arr))
+	for i := range arr {
+		entry := arr[i]
+		normalizeMistralKey(&entry)
+		if entry.BaseURL == "" {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.MistralKey = filtered
+	h.cfg.SanitizeMistralKeys()
+	h.persistLocked(c)
+}
+
+func (h *Handler) PatchMistralKey(c *gin.Context) {
+	type mistralKeyPatch struct {
+		APIKey         *string                `json:"api-key"`
+		Priority       *int                   `json:"priority"`
+		Prefix         *string                `json:"prefix"`
+		BaseURL        *string                `json:"base-url"`
+		ProxyURL       *string                `json:"proxy-url"`
+		Models         *[]config.MistralModel `json:"models"`
+		Headers        *map[string]string     `json:"headers"`
+		ExcludedModels *[]string              `json:"excluded-models"`
+		DisableCooling *bool                  `json:"disable-cooling"`
+	}
+	var body struct {
+		Index *int             `json:"index"`
+		Match *string          `json:"match"`
+		Value *mistralKeyPatch `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	targetIndex := -1
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.MistralKey) {
+		targetIndex = *body.Index
+	}
+	if targetIndex == -1 && body.Match != nil {
+		match := strings.TrimSpace(*body.Match)
+		for i := range h.cfg.MistralKey {
+			if h.cfg.MistralKey[i].APIKey == match {
+				targetIndex = i
+				break
+			}
+		}
+	}
+	if targetIndex == -1 {
+		c.JSON(404, gin.H{"error": "item not found"})
+		return
+	}
+
+	entry := h.cfg.MistralKey[targetIndex]
+	if body.Value.APIKey != nil {
+		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
+	if body.Value.Prefix != nil {
+		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+	}
+	if body.Value.BaseURL != nil {
+		trimmed := strings.TrimSpace(*body.Value.BaseURL)
+		if trimmed == "" {
+h.cfg.MistralKey = append(h.cfg.MistralKey[:targetIndex], h.cfg.MistralKey[targetIndex+1:]...)
+		h.cfg.SanitizeMistralKeys()
+		h.persistLocked(c)
+			return
+		}
+		entry.BaseURL = trimmed
+	}
+	if body.Value.ProxyURL != nil {
+		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.Models != nil {
+		entry.Models = append([]config.MistralModel(nil), (*body.Value.Models)...)
+	}
+	if body.Value.Headers != nil {
+		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.ExcludedModels != nil {
+		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.DisableCooling != nil {
+		entry.DisableCooling = *body.Value.DisableCooling
+	}
+	normalizeMistralKey(&entry)
+	h.cfg.MistralKey[targetIndex] = entry
+	h.cfg.SanitizeMistralKeys()
+	h.persistLocked(c)
+}
+
+func (h *Handler) DeleteMistralKey(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.MistralKey, 0, len(h.cfg.MistralKey))
+			for _, v := range h.cfg.MistralKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
+				out = append(out, v)
+			}
+			h.cfg.MistralKey = out
+			h.cfg.SanitizeMistralKeys()
+			h.persistLocked(c)
+			return
+		}
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.MistralKey {
+			if strings.TrimSpace(h.cfg.MistralKey[i].APIKey) == val {
+				matchCount++
+			}
+		}
+		if matchCount == 1 {
+			for i := range h.cfg.MistralKey {
+				if strings.TrimSpace(h.cfg.MistralKey[i].APIKey) == val {
+					matchIndex = i
+					break
+				}
+			}
+		}
+		if matchIndex != -1 {
+			h.cfg.MistralKey = append(h.cfg.MistralKey[:matchIndex], h.cfg.MistralKey[matchIndex+1:]...)
+		}
+		h.cfg.SanitizeMistralKeys()
+		h.persistLocked(c)
+		return
+	}
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, err := fmt.Sscanf(idxStr, "%d", &idx)
+		if err == nil && idx >= 0 && idx < len(h.cfg.MistralKey) {
+			h.cfg.MistralKey = append(h.cfg.MistralKey[:idx], h.cfg.MistralKey[idx+1:]...)
+			h.cfg.SanitizeMistralKeys()
 			h.persistLocked(c)
 			return
 		}
@@ -1340,7 +1559,7 @@ func normalizeCodexKey(entry *config.CodexKey) {
 	entry.Models = normalized
 }
 
-func normalizeOllamaKey(entry *config.OllamaKey) {
+func normalizeCommandCodeKey(entry *config.CommandCodeKey) {
 	if entry == nil {
 		return
 	}
@@ -1354,7 +1573,34 @@ func normalizeOllamaKey(entry *config.OllamaKey) {
 	if len(entry.Models) == 0 {
 		return
 	}
-	normalized := make([]config.OllamaModel, 0, len(entry.Models))
+	normalized := make([]config.CommandCodeModel, 0, len(entry.Models))
+	for i := range entry.Models {
+		model := entry.Models[i]
+		model.Name = strings.TrimSpace(model.Name)
+		model.Alias = strings.TrimSpace(model.Alias)
+		if model.Name == "" && model.Alias == "" {
+			continue
+		}
+		normalized = append(normalized, model)
+	}
+	entry.Models = normalized
+}
+
+func normalizeMistralKey(entry *config.MistralKey) {
+	if entry == nil {
+		return
+	}
+	entry.APIKey = strings.TrimSpace(entry.APIKey)
+	entry.Prefix = strings.TrimSpace(entry.Prefix)
+	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
+	entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
+	entry.BillingClass = config.BillingClass(normalizeBillingClassValue(string(entry.BillingClass)))
+	entry.Headers = config.NormalizeHeaders(entry.Headers)
+	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
+	if len(entry.Models) == 0 {
+		return
+	}
+	normalized := make([]config.MistralModel, 0, len(entry.Models))
 	for i := range entry.Models {
 		model := entry.Models[i]
 		model.Name = strings.TrimSpace(model.Name)
@@ -1414,304 +1660,4 @@ func sanitizedOAuthModelAlias(entries map[string][]config.OAuthModelAlias) map[s
 		return nil
 	}
 	return cfg.OAuthModelAlias
-}
-
-// GetAmpCode returns the complete ampcode configuration.
-func (h *Handler) GetAmpCode(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"ampcode": config.AmpCode{}})
-		return
-	}
-	c.JSON(200, gin.H{"ampcode": h.cfg.AmpCode})
-}
-
-// GetAmpUpstreamURL returns the ampcode upstream URL.
-func (h *Handler) GetAmpUpstreamURL(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"upstream-url": ""})
-		return
-	}
-	c.JSON(200, gin.H{"upstream-url": h.cfg.AmpCode.UpstreamURL})
-}
-
-// PutAmpUpstreamURL updates the ampcode upstream URL.
-func (h *Handler) PutAmpUpstreamURL(c *gin.Context) {
-	h.updateStringField(c, func(v string) { h.cfg.AmpCode.UpstreamURL = strings.TrimSpace(v) })
-}
-
-// DeleteAmpUpstreamURL clears the ampcode upstream URL.
-func (h *Handler) DeleteAmpUpstreamURL(c *gin.Context) {
-	h.cfg.AmpCode.UpstreamURL = ""
-	h.persist(c)
-}
-
-// GetAmpUpstreamAPIKey returns the ampcode upstream API key.
-func (h *Handler) GetAmpUpstreamAPIKey(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"upstream-api-key": ""})
-		return
-	}
-	c.JSON(200, gin.H{"upstream-api-key": h.cfg.AmpCode.UpstreamAPIKey})
-}
-
-// PutAmpUpstreamAPIKey updates the ampcode upstream API key.
-func (h *Handler) PutAmpUpstreamAPIKey(c *gin.Context) {
-	h.updateStringField(c, func(v string) { h.cfg.AmpCode.UpstreamAPIKey = strings.TrimSpace(v) })
-}
-
-// DeleteAmpUpstreamAPIKey clears the ampcode upstream API key.
-func (h *Handler) DeleteAmpUpstreamAPIKey(c *gin.Context) {
-	h.cfg.AmpCode.UpstreamAPIKey = ""
-	h.persist(c)
-}
-
-// GetAmpRestrictManagementToLocalhost returns the localhost restriction setting.
-func (h *Handler) GetAmpRestrictManagementToLocalhost(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"restrict-management-to-localhost": true})
-		return
-	}
-	c.JSON(200, gin.H{"restrict-management-to-localhost": h.cfg.AmpCode.RestrictManagementToLocalhost})
-}
-
-// PutAmpRestrictManagementToLocalhost updates the localhost restriction setting.
-func (h *Handler) PutAmpRestrictManagementToLocalhost(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.AmpCode.RestrictManagementToLocalhost = v })
-}
-
-// GetAmpModelMappings returns the ampcode model mappings.
-func (h *Handler) GetAmpModelMappings(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"model-mappings": []config.AmpModelMapping{}})
-		return
-	}
-	c.JSON(200, gin.H{"model-mappings": h.cfg.AmpCode.ModelMappings})
-}
-
-// PutAmpModelMappings replaces all ampcode model mappings.
-func (h *Handler) PutAmpModelMappings(c *gin.Context) {
-	var body struct {
-		Value []config.AmpModelMapping `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
-		return
-	}
-	h.cfg.AmpCode.ModelMappings = body.Value
-	h.persist(c)
-}
-
-// PatchAmpModelMappings adds or updates model mappings.
-func (h *Handler) PatchAmpModelMappings(c *gin.Context) {
-	var body struct {
-		Value []config.AmpModelMapping `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
-		return
-	}
-
-	existing := make(map[string]int)
-	for i, m := range h.cfg.AmpCode.ModelMappings {
-		existing[strings.TrimSpace(m.From)] = i
-	}
-
-	for _, newMapping := range body.Value {
-		from := strings.TrimSpace(newMapping.From)
-		if idx, ok := existing[from]; ok {
-			h.cfg.AmpCode.ModelMappings[idx] = newMapping
-		} else {
-			h.cfg.AmpCode.ModelMappings = append(h.cfg.AmpCode.ModelMappings, newMapping)
-			existing[from] = len(h.cfg.AmpCode.ModelMappings) - 1
-		}
-	}
-	h.persist(c)
-}
-
-// DeleteAmpModelMappings removes specified model mappings by "from" field.
-func (h *Handler) DeleteAmpModelMappings(c *gin.Context) {
-	var body struct {
-		Value []string `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil || len(body.Value) == 0 {
-		h.cfg.AmpCode.ModelMappings = nil
-		h.persist(c)
-		return
-	}
-
-	toRemove := make(map[string]bool)
-	for _, from := range body.Value {
-		toRemove[strings.TrimSpace(from)] = true
-	}
-
-	newMappings := make([]config.AmpModelMapping, 0, len(h.cfg.AmpCode.ModelMappings))
-	for _, m := range h.cfg.AmpCode.ModelMappings {
-		if !toRemove[strings.TrimSpace(m.From)] {
-			newMappings = append(newMappings, m)
-		}
-	}
-	h.cfg.AmpCode.ModelMappings = newMappings
-	h.persist(c)
-}
-
-// GetAmpForceModelMappings returns whether model mappings are forced.
-func (h *Handler) GetAmpForceModelMappings(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"force-model-mappings": false})
-		return
-	}
-	c.JSON(200, gin.H{"force-model-mappings": h.cfg.AmpCode.ForceModelMappings})
-}
-
-// PutAmpForceModelMappings updates the force model mappings setting.
-func (h *Handler) PutAmpForceModelMappings(c *gin.Context) {
-	h.updateBoolField(c, func(v bool) { h.cfg.AmpCode.ForceModelMappings = v })
-}
-
-// GetAmpUpstreamAPIKeys returns the ampcode upstream API keys mapping.
-func (h *Handler) GetAmpUpstreamAPIKeys(c *gin.Context) {
-	if h == nil || h.cfg == nil {
-		c.JSON(200, gin.H{"upstream-api-keys": []config.AmpUpstreamAPIKeyEntry{}})
-		return
-	}
-	c.JSON(200, gin.H{"upstream-api-keys": h.cfg.AmpCode.UpstreamAPIKeys})
-}
-
-// PutAmpUpstreamAPIKeys replaces all ampcode upstream API keys mappings.
-func (h *Handler) PutAmpUpstreamAPIKeys(c *gin.Context) {
-	var body struct {
-		Value []config.AmpUpstreamAPIKeyEntry `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
-		return
-	}
-	// Normalize entries: trim whitespace, filter empty
-	normalized := normalizeAmpUpstreamAPIKeyEntries(body.Value)
-	h.cfg.AmpCode.UpstreamAPIKeys = normalized
-	h.persist(c)
-}
-
-// PatchAmpUpstreamAPIKeys adds or updates upstream API keys entries.
-// Matching is done by upstream-api-key value.
-func (h *Handler) PatchAmpUpstreamAPIKeys(c *gin.Context) {
-	var body struct {
-		Value []config.AmpUpstreamAPIKeyEntry `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
-		return
-	}
-
-	existing := make(map[string]int)
-	for i, entry := range h.cfg.AmpCode.UpstreamAPIKeys {
-		existing[strings.TrimSpace(entry.UpstreamAPIKey)] = i
-	}
-
-	for _, newEntry := range body.Value {
-		upstreamKey := strings.TrimSpace(newEntry.UpstreamAPIKey)
-		if upstreamKey == "" {
-			continue
-		}
-		normalizedEntry := config.AmpUpstreamAPIKeyEntry{
-			UpstreamAPIKey: upstreamKey,
-			APIKeys:        normalizeAPIKeysList(newEntry.APIKeys),
-		}
-		if idx, ok := existing[upstreamKey]; ok {
-			h.cfg.AmpCode.UpstreamAPIKeys[idx] = normalizedEntry
-		} else {
-			h.cfg.AmpCode.UpstreamAPIKeys = append(h.cfg.AmpCode.UpstreamAPIKeys, normalizedEntry)
-			existing[upstreamKey] = len(h.cfg.AmpCode.UpstreamAPIKeys) - 1
-		}
-	}
-	h.persist(c)
-}
-
-// DeleteAmpUpstreamAPIKeys removes specified upstream API keys entries.
-// Body must be JSON: {"value": ["<upstream-api-key>", ...]}.
-// If "value" is an empty array, clears all entries.
-// If JSON is invalid or "value" is missing/null, returns 400 and does not persist any change.
-func (h *Handler) DeleteAmpUpstreamAPIKeys(c *gin.Context) {
-	var body struct {
-		Value []string `json:"value"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(400, gin.H{"error": "invalid body"})
-		return
-	}
-
-	if body.Value == nil {
-		c.JSON(400, gin.H{"error": "missing value"})
-		return
-	}
-
-	// Empty array means clear all
-	if len(body.Value) == 0 {
-		h.cfg.AmpCode.UpstreamAPIKeys = nil
-		h.persist(c)
-		return
-	}
-
-	toRemove := make(map[string]bool)
-	for _, key := range body.Value {
-		trimmed := strings.TrimSpace(key)
-		if trimmed == "" {
-			continue
-		}
-		toRemove[trimmed] = true
-	}
-	if len(toRemove) == 0 {
-		c.JSON(400, gin.H{"error": "empty value"})
-		return
-	}
-
-	newEntries := make([]config.AmpUpstreamAPIKeyEntry, 0, len(h.cfg.AmpCode.UpstreamAPIKeys))
-	for _, entry := range h.cfg.AmpCode.UpstreamAPIKeys {
-		if !toRemove[strings.TrimSpace(entry.UpstreamAPIKey)] {
-			newEntries = append(newEntries, entry)
-		}
-	}
-	h.cfg.AmpCode.UpstreamAPIKeys = newEntries
-	h.persist(c)
-}
-
-// normalizeAmpUpstreamAPIKeyEntries normalizes a list of upstream API key entries.
-func normalizeAmpUpstreamAPIKeyEntries(entries []config.AmpUpstreamAPIKeyEntry) []config.AmpUpstreamAPIKeyEntry {
-	if len(entries) == 0 {
-		return nil
-	}
-	out := make([]config.AmpUpstreamAPIKeyEntry, 0, len(entries))
-	for _, entry := range entries {
-		upstreamKey := strings.TrimSpace(entry.UpstreamAPIKey)
-		if upstreamKey == "" {
-			continue
-		}
-		apiKeys := normalizeAPIKeysList(entry.APIKeys)
-		out = append(out, config.AmpUpstreamAPIKeyEntry{
-			UpstreamAPIKey: upstreamKey,
-			APIKeys:        apiKeys,
-		})
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// normalizeAPIKeysList trims and filters empty strings from a list of API keys.
-func normalizeAPIKeysList(keys []string) []string {
-	if len(keys) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		trimmed := strings.TrimSpace(k)
-		if trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
 }

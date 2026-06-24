@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -26,11 +24,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cmd"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/managementasset"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/store"
 	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/tui"
@@ -69,119 +70,14 @@ func setKiroIncognitoMode(cfg *config.Config, useIncognito, noIncognito bool) {
 	}
 }
 
-
-func parseHomeFlagConfig(rawAddr string, password string) (config.HomeConfig, error) {
-	rawAddr = strings.TrimSpace(rawAddr)
-	if rawAddr == "" {
-		return config.HomeConfig{}, fmt.Errorf("address is empty")
+func shouldStartExampleAPIKeyWarningServer(cfg *config.Config, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode bool) bool {
+	if cfg == nil || commandMode || homeMode || cloudConfigMissing {
+		return false
 	}
-
-	if strings.Contains(rawAddr, "://") {
-		return parseHomeURLConfig(rawAddr, password)
+	if tuiMode && !standalone {
+		return false
 	}
-
-	host, portStr, errSplit := net.SplitHostPort(rawAddr)
-	if errSplit != nil {
-		return config.HomeConfig{}, fmt.Errorf("expected host:port, redis://host:port, or rediss://host:port: %w", errSplit)
-	}
-
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return config.HomeConfig{}, fmt.Errorf("host is empty")
-	}
-
-	port, errPort := parseHomePort(portStr)
-	if errPort != nil {
-		return config.HomeConfig{}, errPort
-	}
-
-	return config.HomeConfig{
-		Enabled:  true,
-		Host:     host,
-		Port:     port,
-		Password: password,
-	}, nil
-}
-
-func parseHomeURLConfig(rawAddr string, password string) (config.HomeConfig, error) {
-	parsed, errParse := url.Parse(rawAddr)
-	if errParse != nil {
-		return config.HomeConfig{}, fmt.Errorf("parse URL: %w", errParse)
-	}
-
-	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
-	if scheme != "redis" && scheme != "rediss" {
-		return config.HomeConfig{}, fmt.Errorf("unsupported URL scheme %q", parsed.Scheme)
-	}
-
-	host := strings.TrimSpace(parsed.Hostname())
-	if host == "" {
-		return config.HomeConfig{}, fmt.Errorf("host is empty")
-	}
-
-	port, errPort := parseHomePort(parsed.Port())
-	if errPort != nil {
-		return config.HomeConfig{}, errPort
-	}
-
-	if password == "" && parsed.User != nil {
-		if urlPassword, ok := parsed.User.Password(); ok {
-			password = urlPassword
-		}
-	}
-
-	homeCfg := config.HomeConfig{
-		Enabled:  true,
-		Host:     host,
-		Port:     port,
-		Password: password,
-	}
-	query := parsed.Query()
-	homeCfg.DisableClusterDiscovery = parseHomeBoolQuery(query, "disable-cluster-discovery", "disable_cluster_discovery")
-
-	if scheme == "rediss" {
-		homeCfg.TLS.Enable = true
-		homeCfg.TLS.ServerName = strings.TrimSpace(firstHomeQueryValue(query, "server-name", "server_name"))
-		homeCfg.TLS.InsecureSkipVerify = parseHomeBoolQuery(query, "insecure-skip-verify", "insecure_skip_verify", "skip_verify")
-		homeCfg.TLS.CACert = strings.TrimSpace(firstHomeQueryValue(query, "ca-cert", "ca_cert"))
-	}
-
-	return homeCfg, nil
-}
-
-func parseHomePort(rawPort string) (int, error) {
-	rawPort = strings.TrimSpace(rawPort)
-	if rawPort == "" {
-		return 0, fmt.Errorf("port is empty")
-	}
-
-	port, errPort := strconv.Atoi(rawPort)
-	if errPort != nil || port <= 0 || port > 65535 {
-		return 0, fmt.Errorf("invalid port %q", rawPort)
-	}
-
-	return port, nil
-}
-
-func firstHomeQueryValue(values url.Values, keys ...string) string {
-	for _, key := range keys {
-		if value := values.Get(key); value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func parseHomeBoolQuery(values url.Values, keys ...string) bool {
-	for _, key := range keys {
-		value := strings.TrimSpace(values.Get(key))
-		if value == "" {
-			continue
-		}
-		parsed, errParse := strconv.ParseBool(value)
-		return errParse == nil && parsed
-	}
-	return false
+	return safemode.HasExampleAPIKeys(cfg.APIKeys)
 }
 
 // main is the entry point of the application.
@@ -226,8 +122,7 @@ func main() {
 	var vertexImportPrefix string
 	var configPath string
 	var password string
-	var homeAddr string
-	var homePassword string
+	var homeJWT string
 	var homeDisableClusterDiscovery bool
 	var tuiMode bool
 	var standalone bool
@@ -273,9 +168,8 @@ func main() {
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
 	flag.StringVar(&vertexImportPrefix, "vertex-import-prefix", "", "Prefix for Vertex model namespacing (use with -vertex-import)")
 	flag.StringVar(&password, "password", "", "")
-	flag.StringVar(&homeAddr, "home", "", "Home control plane address in host:port, redis://host:port, or rediss://host:port format (loads config from home and skips local config file)")
-	flag.BoolVar(&homeDisableClusterDiscovery, "home-disable-cluster-discovery", false, "Disable Home CLUSTER NODES discovery and keep using the configured -home address")
-	flag.StringVar(&homePassword, "home-password", "", "Home control plane password (Redis AUTH)")
+	flag.StringVar(&homeJWT, "home-jwt", "", "Home control plane JWT for mTLS certificate bootstrap and connection")
+	flag.BoolVar(&homeDisableClusterDiscovery, "home-disable-cluster-discovery", false, "Disable Home CLUSTER NODES discovery and keep using the configured -home-jwt address")
 	flag.BoolVar(&tuiMode, "tui", false, "Start with terminal management UI")
 	flag.BoolVar(&standalone, "standalone", false, "In TUI mode, start an embedded local server")
 	flag.BoolVar(&localModel, "local-model", false, "Use embedded model catalog only, skip remote model fetching")
@@ -305,6 +199,12 @@ func main() {
 			}
 			_, _ = fmt.Fprint(out, s+"\n")
 		})
+	}
+
+	pluginHost := pluginhost.New()
+	if bootstrapCfg := loadPluginBootstrapConfig(pluginBootstrapConfigPath(os.Args[1:], DefaultConfigPath)); bootstrapCfg != nil {
+		pluginHost.ApplyConfig(context.Background(), bootstrapCfg)
+		pluginHost.RegisterCommandLineFlags(context.Background(), flag.CommandLine)
 	}
 
 	// Parse the command-line flags.
@@ -362,6 +262,13 @@ func main() {
 		return "", false
 	}
 	writableBase := util.WritablePath()
+
+	if strings.TrimSpace(homeJWT) == "" {
+		if v, ok := lookupEnv("HOME_JWT", "home_jwt"); ok {
+			homeJWT = v
+		}
+	}
+
 	if value, ok := lookupEnv("PGSTORE_DSN", "pgstore_dsn"); ok {
 		usePostgresStore = true
 		pgStoreDSN = value
@@ -425,12 +332,13 @@ func main() {
 	// Determine and load the configuration file.
 	// Prefer the Postgres store when configured, otherwise fallback to git or local files.
 	var configFilePath string
-	if strings.TrimSpace(homeAddr) != "" {
+	if strings.TrimSpace(homeJWT) != "" {
 		configLoadedFromHome = true
-		trimmedHomePassword := strings.TrimSpace(homePassword)
-		homeCfg, errHomeCfg := parseHomeFlagConfig(homeAddr, trimmedHomePassword)
+		ctxHome, cancelHome := context.WithTimeout(context.Background(), 30*time.Second)
+		homeCfg, errHomeCfg := home.ConfigFromJWT(ctxHome, homeJWT)
+		cancelHome()
 		if errHomeCfg != nil {
-			log.Errorf("invalid -home address %q: %v", homeAddr, errHomeCfg)
+			log.Errorf("invalid -home-jwt: %v", errHomeCfg)
 			return
 		}
 		if homeDisableClusterDiscovery {
@@ -439,9 +347,9 @@ func main() {
 		homeClient := home.New(homeCfg)
 		defer homeClient.Close()
 
-		ctxHome, cancelHome := context.WithTimeout(context.Background(), 30*time.Second)
-		raw, errGetConfig := homeClient.GetConfig(ctxHome)
-		cancelHome()
+		ctxHomeConfig, cancelHomeConfig := context.WithTimeout(context.Background(), 30*time.Second)
+		raw, errGetConfig := homeClient.GetConfig(ctxHomeConfig)
+		cancelHomeConfig()
 		if errGetConfig != nil {
 			log.Errorf("failed to fetch config from home: %v", errGetConfig)
 			return
@@ -458,6 +366,13 @@ func main() {
 		parsed.Home = homeCfg
 		parsed.Port = 8317 // Default to 8317 for home mode, can be overridden by home config
 		parsed.UsageStatisticsEnabled = true
+		ctxHomePlugins, cancelHomePlugins := context.WithTimeout(context.Background(), 30*time.Second)
+		errHomePlugins := homeplugins.Sync(ctxHomePlugins, parsed, pluginHost)
+		cancelHomePlugins()
+		if errHomePlugins != nil {
+			log.Errorf("failed to fetch plugins from home: %v", errHomePlugins)
+			return
+		}
 		cfg = parsed
 
 		// Keep a non-empty config path for downstream components (log paths, management assets, etc),
@@ -660,6 +575,7 @@ func main() {
 	redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	coreauth.SetTransientErrorCooldownSeconds(cfg.TransientErrorCooldownSeconds)
 
 	if err = logging.ConfigureLogOutput(cfg); err != nil {
 		log.Errorf("failed to configure log output: %v", err)
@@ -685,6 +601,16 @@ func main() {
 		CallbackPort: oauthCallbackPort,
 	}
 
+	commandMode := vertexImport != "" || login || antigravityLogin || codexLogin || codexDeviceLogin || claudeLogin || kimiLogin || xaiLogin
+	cloudConfigMissing := isCloudDeploy && !configFileExists
+	homeMode := configLoadedFromHome || (cfg != nil && cfg.Home.Enabled)
+	if shouldStartExampleAPIKeyWarningServer(cfg, commandMode, tuiMode, standalone, cloudConfigMissing, homeMode) {
+		matches := safemode.ExampleAPIKeys(cfg.APIKeys)
+		log.WithField("api_keys", strings.Join(matches, ",")).Error("unsafe example API key configured; starting warning-only server")
+		cmd.StartExampleAPIKeyWarningServer(cfg, configFilePath, matches)
+		return
+	}
+
 	// Register the shared token store once so all components use the same persistence backend.
 	if usePostgresStore {
 		sdkAuth.RegisterTokenStore(pgStoreInst)
@@ -698,6 +624,15 @@ func main() {
 
 	// Register built-in access providers before constructing services.
 	configaccess.Register(&cfg.SDKConfig)
+	pluginHost.ApplyConfig(context.Background(), cfg)
+	if pluginHost.HasTriggeredCommandLineFlags() {
+		if exitCode, handled := pluginHost.ExecuteCommandLine(context.Background(), os.Args[0], os.Args[1:], configFilePath, flag.CommandLine); handled {
+			if exitCode != 0 {
+				os.Exit(exitCode)
+			}
+			return
+		}
+	}
 
 	// Handle different command modes based on the provided flags.
 
@@ -834,7 +769,7 @@ func main() {
 					password = localMgmtPassword
 				}
 
-				cancel, done := cmd.StartServiceBackground(cfg, configFilePath, password)
+				cancel, done := cmd.StartServiceBackgroundWithPluginHost(cfg, configFilePath, password, pluginHost)
 
 				client := tui.NewClient(cfg.Port, password)
 				ready := false
@@ -890,6 +825,65 @@ func main() {
 			}
 
 			cmd.StartService(cfg, configFilePath, password)
+
+			cmd.StartServiceWithPluginHost(cfg, configFilePath, password, pluginHost)
+
 		}
 	}
+}
+
+func pluginBootstrapConfigPath(args []string, defaultPath string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			return defaultPluginBootstrapConfigPath(defaultPath)
+		case arg == "-config" || arg == "--config":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return defaultPluginBootstrapConfigPath(defaultPath)
+		case strings.HasPrefix(arg, "-config="):
+			return strings.TrimPrefix(arg, "-config=")
+		case strings.HasPrefix(arg, "--config="):
+			return strings.TrimPrefix(arg, "--config=")
+		}
+	}
+	return defaultPluginBootstrapConfigPath(defaultPath)
+}
+
+func defaultPluginBootstrapConfigPath(defaultPath string) string {
+	if strings.TrimSpace(defaultPath) != "" {
+		return defaultPath
+	}
+	wd, errGetwd := os.Getwd()
+	if errGetwd != nil {
+		return "config.yaml"
+	}
+	return filepath.Join(wd, "config.yaml")
+}
+
+func loadPluginBootstrapConfig(path string) *config.Config {
+	raw, errReadFile := os.ReadFile(path)
+	if errReadFile != nil {
+		if !errors.Is(errReadFile, os.ErrNotExist) {
+			log.Warnf("failed to read plugin bootstrap config: %v", errReadFile)
+		}
+		cfg := &config.Config{}
+		cfg.NormalizePluginsConfig()
+		return cfg
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		cfg := &config.Config{}
+		cfg.NormalizePluginsConfig()
+		return cfg
+	}
+	cfg, errParseConfig := config.ParseConfigBytes(raw)
+	if errParseConfig != nil {
+		log.Warnf("failed to parse plugin bootstrap config: %v", errParseConfig)
+		cfg = &config.Config{}
+		cfg.NormalizePluginsConfig()
+		return cfg
+	}
+	return cfg
 }

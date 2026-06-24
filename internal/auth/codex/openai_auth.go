@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 // OAuth configuration constants for OpenAI Codex
@@ -34,6 +35,8 @@ type CodexAuth struct {
 	httpClient *http.Client
 	cfg        *config.Config
 }
+
+var codexRefreshGroup singleflight.Group
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
@@ -96,17 +99,34 @@ func (o *CodexAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string,
 		"client_id":                  {ClientID},
 		"response_type":              {"code"},
 		"redirect_uri":               {RedirectURI},
-		"scope":                      {"openid email profile offline_access"},
+		"scope":                      {"openid profile email offline_access"},
 		"state":                      {state},
 		"code_challenge":             {pkceCodes.CodeChallenge},
 		"code_challenge_method":      {"S256"},
-		"prompt":                     {"login"},
 		"id_token_add_organizations": {"true"},
 		"codex_cli_simplified_flow":  {"true"},
+		"originator":                 {"opencode"},
 	}
 
 	authURL := fmt.Sprintf("%s?%s", o.authEndpoint(), params.Encode())
 	return authURL, nil
+}
+
+// extractAccountIDAndEmail parses an ID token and returns the account ID and email.
+// Returns empty strings when the token is missing or unparseable.
+func extractAccountIDAndEmail(idToken string) (accountID, email string) {
+	if idToken == "" {
+		return "", ""
+	}
+	claims, err := ParseJWTToken(idToken)
+	if err != nil {
+		log.Warnf("Failed to parse ID token: %v", err)
+		return "", ""
+	}
+	if claims == nil {
+		return "", ""
+	}
+	return claims.GetAccountID(), claims.GetUserEmail()
 }
 
 // ExchangeCodeForTokens exchanges an authorization code for access and refresh tokens.
@@ -142,7 +162,6 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
 
 	resp, err := o.httpClient.Do(req)
 	if err != nil {
@@ -175,17 +194,13 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
-	// Extract account ID from ID token
-	claims, err := ParseJWTToken(tokenResp.IDToken)
-	if err != nil {
-		log.Warnf("Failed to parse ID token: %v", err)
-	}
+	accountID, email := extractAccountIDAndEmail(tokenResp.IDToken)
 
-	accountID := ""
-	email := ""
-	if claims != nil {
-		accountID = claims.GetAccountID()
-		email = claims.GetUserEmail()
+	if accountID == "" && tokenResp.AccessToken != "" {
+		// Fallback: try to extract account ID from access token
+		if claims, err := ParseJWTToken(tokenResp.AccessToken); err == nil && claims != nil {
+			accountID = claims.GetAccountID()
+		}
 	}
 
 	// Create token data
@@ -214,12 +229,28 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
+	result, err, _ := codexRefreshGroup.Do(refreshToken, func() (interface{}, error) {
+		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
+	})
+	if err != nil {
+		return nil, err
+	}
+	tokenData, ok := result.(*CodexTokenData)
+	if !ok || tokenData == nil {
+		return nil, fmt.Errorf("token refresh failed: invalid single-flight result")
+	}
+	return tokenData, nil
+}
+
+func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
 	data := url.Values{
 		"client_id":     {ClientID},
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshToken},
-		"scope":         {"openid profile email"},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", o.tokenEndpoint(true), strings.NewReader(data.Encode()))
@@ -228,19 +259,20 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
 
-	resp, err := o.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("token refresh request failed: %w", err)
+	resp, errDo := o.httpClient.Do(req)
+	if errDo != nil {
+		return nil, fmt.Errorf("token refresh request failed: %w", errDo)
 	}
 	defer func() {
-		_ = resp.Body.Close()
+		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("token refresh response body close error: %v", errClose)
+		}
 	}()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read refresh response: %w", err)
+	body, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		return nil, fmt.Errorf("failed to read refresh response: %w", errRead)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -255,21 +287,21 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 		ExpiresIn    int    `json:"expires_in"`
 	}
 
-	if err = json.Unmarshal(body, &tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to parse refresh response: %w", err)
+	if errUnmarshal := json.Unmarshal(body, &tokenResp); errUnmarshal != nil {
+		return nil, fmt.Errorf("failed to parse refresh response: %w", errUnmarshal)
 	}
 
 	// Extract account ID from ID token
-	claims, err := ParseJWTToken(tokenResp.IDToken)
-	if err != nil {
-		log.Warnf("Failed to parse refreshed ID token: %v", err)
+	claims, errParseJWT := ParseJWTToken(tokenResp.IDToken)
+	if errParseJWT != nil {
+		log.Warnf("Failed to parse refreshed ID token: %v", errParseJWT)
 	}
 
 	accountID := ""
 	email := ""
 	if claims != nil {
 		accountID = claims.GetAccountID()
-		email = claims.Email
+		email = claims.GetUserEmail()
 	}
 
 	return &CodexTokenData{

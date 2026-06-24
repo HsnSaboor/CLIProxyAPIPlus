@@ -23,8 +23,13 @@ type codexKeyWithAuthIndex struct {
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
-type ollamaKeyWithAuthIndex struct {
-	config.OllamaKey
+type commandCodeKeyWithAuthIndex struct {
+	config.CommandCodeKey
+	AuthIndex string `json:"auth-index,omitempty"`
+}
+
+type mistralKeyWithAuthIndex struct {
+	config.MistralKey
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
@@ -169,7 +174,7 @@ func (h *Handler) codexKeysWithAuthIndex() []codexKeyWithAuthIndex {
 	return out
 }
 
-func (h *Handler) ollamaKeysWithAuthIndex() []ollamaKeyWithAuthIndex {
+func (h *Handler) commandCodeKeysWithAuthIndex() []commandCodeKeyWithAuthIndex {
 	if h == nil {
 		return nil
 	}
@@ -182,17 +187,46 @@ func (h *Handler) ollamaKeysWithAuthIndex() []ollamaKeyWithAuthIndex {
 	}
 
 	idGen := synthesizer.NewStableIDGenerator()
-	out := make([]ollamaKeyWithAuthIndex, len(h.cfg.OllamaKey))
-	for i := range h.cfg.OllamaKey {
-		entry := h.cfg.OllamaKey[i]
+	out := make([]commandCodeKeyWithAuthIndex, len(h.cfg.CommandCodeKey))
+	for i := range h.cfg.CommandCodeKey {
+		entry := h.cfg.CommandCodeKey[i]
 		authIndex := ""
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("ollama:apikey", key, entry.BaseURL)
+			id, _ := idGen.Next("commandcode:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
 		}
-		out[i] = ollamaKeyWithAuthIndex{
-			OllamaKey: entry,
-			AuthIndex: authIndex,
+		out[i] = commandCodeKeyWithAuthIndex{
+			CommandCodeKey: entry,
+			AuthIndex:      authIndex,
+		}
+	}
+	return out
+}
+
+func (h *Handler) mistralKeysWithAuthIndex() []mistralKeyWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+
+	idGen := synthesizer.NewStableIDGenerator()
+	out := make([]mistralKeyWithAuthIndex, len(h.cfg.MistralKey))
+	for i := range h.cfg.MistralKey {
+		entry := h.cfg.MistralKey[i]
+		authIndex := ""
+		if key := strings.TrimSpace(entry.APIKey); key != "" {
+			id, _ := idGen.Next("mistral:apikey", key, entry.BaseURL)
+			authIndex = liveIndexByID[id]
+		}
+		out[i] = mistralKeyWithAuthIndex{
+			MistralKey: entry,
+			AuthIndex:  authIndex,
 		}
 	}
 	return out

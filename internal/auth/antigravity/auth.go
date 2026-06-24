@@ -3,6 +3,7 @@ package antigravity
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,6 +29,13 @@ type TokenResponse struct {
 // userInfo represents Google user profile
 type userInfo struct {
 	Email string `json:"email"`
+}
+
+// antigravityState is the reconstructed PKCE state returned from the OAuth
+// provider's redirect. The reference cortexkit client uses the same shape.
+type antigravityState struct {
+	Index    string `json:"index"`    // PKCE verifier – kept as "index" for compatibility with the reference client's decode path
+	ProjectId string `json:"projectId"`
 }
 
 // AntigravityAuth handles Antigravity OAuth authentication
@@ -76,12 +84,88 @@ func (o *AntigravityAuth) userinfoEndpoint() string {
 	return UserInfoEndpoint
 }
 
-func (o *AntigravityAuth) loadCodeAssistUserAgent() string {
+func (o *AntigravityAuth) shortUserAgent() string {
+	return misc.AntigravityRequestUserAgent("")
+}
+
+func (o *AntigravityAuth) nodeUserAgent() string {
 	return misc.AntigravityLoadCodeAssistUserAgent("")
 }
 
+func antigravityLoadCodeAssistMetadata() map[string]string {
+	return map[string]string{
+		"ideType": "ANTIGRAVITY",
+	}
+}
+
+func antigravityControlPlaneMetadata(userAgent string) map[string]string {
+	return map[string]string{
+		"ide_type":    "ANTIGRAVITY",
+		"ide_version": misc.AntigravityVersionFromUserAgent(userAgent),
+		"ide_name":    "antigravity",
+	}
+}
+
+func extractCloudaicompanionProject(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	for _, key := range []string{"cloudaicompanionProject", "projectId", "project"} {
+		switch value := data[key].(type) {
+		case string:
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		case map[string]any:
+			if id, ok := value["id"].(string); ok {
+				if trimmed := strings.TrimSpace(id); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func defaultAntigravityTierID(loadResp map[string]any) string {
+	if tiers, okTiers := loadResp["allowedTiers"].([]any); okTiers {
+		for _, rawTier := range tiers {
+			tier, okTier := rawTier.(map[string]any)
+			if !okTier {
+				continue
+			}
+			if isDefault, okDefault := tier["isDefault"].(bool); !okDefault || !isDefault {
+				continue
+			}
+			if id, okID := tier["id"].(string); okID {
+				if trimmed := strings.TrimSpace(id); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+	}
+	if currentTier, okTier := loadResp["currentTier"].(map[string]any); okTier {
+		if id, okID := currentTier["id"].(string); okID {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return "free-tier"
+}
+
 // BuildAuthURL generates the OAuth authorization URL.
-func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string) string {
+//
+// state is opaque from the caller's perspective — for PKCE flows it is expected
+// to be the base64url(JSON) state produced by encodeAntigravityState which
+// embeds the PKCE verifier and optional projectId, matching the cortexkit
+// reference client.
+//
+// redirectURI is the local OAuth callback URI to embed in the request.
+//
+// pkceCodes is required for Google OAuth on public clients; pass nil only when
+// running against a custom authorization server that does not require PKCE.
+func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string, pkceCodes *PKCECodes) string {
 	if strings.TrimSpace(redirectURI) == "" {
 		redirectURI = fmt.Sprintf("http://localhost:%d/oauth-callback", CallbackPort)
 	}
@@ -93,23 +177,49 @@ func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string) string {
 	params.Set("response_type", "code")
 	params.Set("scope", strings.Join(Scopes, " "))
 	params.Set("state", state)
+	if pkceCodes != nil {
+		params.Set("code_challenge", pkceCodes.CodeChallenge)
+		params.Set("code_challenge_method", "S256")
+	}
 	return o.authEndpoint() + "?" + params.Encode()
 }
 
-// ExchangeCodeForTokens exchanges authorization code for access and refresh tokens
-func (o *AntigravityAuth) ExchangeCodeForTokens(ctx context.Context, code, redirectURI string) (*TokenResponse, error) {
+// ExchangeCodeForTokens exchanges authorization code for access and refresh tokens.
+//
+// state must be the value originally passed to BuildAuthURL. For PKCE flows
+// the state encodes the verifier; this function decodes the state and sends
+// the code_verifier in the token POST body, matching the cortexkit
+// reference client.
+//
+// When state does not carry a PKCE verifier (legacy flows), pkceCodes can be
+// passed explicitly to provide the code_verifier directly.
+func (o *AntigravityAuth) ExchangeCodeForTokens(ctx context.Context, code, redirectURI, state string, pkceCodes *PKCECodes) (*TokenResponse, error) {
+	verifier := ""
+	if decoded, ok := DecodeAntigravityState(state); ok {
+		verifier = decoded.Index
+	}
+	if verifier == "" && pkceCodes != nil {
+		verifier = pkceCodes.CodeVerifier
+	}
+
 	data := url.Values{}
 	data.Set("code", code)
 	data.Set("client_id", ClientID)
 	data.Set("client_secret", ClientSecret)
 	data.Set("redirect_uri", redirectURI)
 	data.Set("grant_type", "authorization_code")
+	if verifier != "" {
+		data.Set("code_verifier", verifier)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.tokenEndpoint(), strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("antigravity token exchange: create request: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("User-Agent", GeminicliUserAgent)
 
 	resp, errDo := o.httpClient.Do(req)
 	if errDo != nil {
@@ -151,7 +261,7 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 		return "", fmt.Errorf("antigravity userinfo: create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", o.loadCodeAssistUserAgent())
+	req.Header.Set("User-Agent", GeminicliUserAgent)
 
 	resp, errDo := o.httpClient.Do(req)
 	if errDo != nil {
@@ -187,13 +297,9 @@ func (o *AntigravityAuth) FetchUserInfo(ctx context.Context, accessToken string)
 
 // FetchProjectID retrieves the project ID for the authenticated user via loadCodeAssist
 func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string) (string, error) {
-	userAgent := o.loadCodeAssistUserAgent()
+	userAgent := o.shortUserAgent()
 	loadReqBody := map[string]any{
-		"metadata": map[string]string{
-			"ide_type":    "ANTIGRAVITY",
-			"ide_version": misc.AntigravityVersionFromUserAgent(userAgent),
-			"ide_name":    "antigravity",
-		},
+		"metadata": antigravityLoadCodeAssistMetadata(),
 	}
 
 	rawBody, errMarshal := json.Marshal(loadReqBody)
@@ -207,9 +313,9 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 		return "", fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("X-Goog-Api-Client", misc.AntigravityGoogAPIClientUA)
 
 	resp, errDo := o.httpClient.Do(req)
 	if errDo != nil {
@@ -235,39 +341,15 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 		return "", fmt.Errorf("decode response: %w", errDecode)
 	}
 
-	// Extract projectID from response
-	projectID := ""
-	if id, ok := loadResp["cloudaicompanionProject"].(string); ok {
-		projectID = strings.TrimSpace(id)
-	}
-	if projectID == "" {
-		if projectMap, ok := loadResp["cloudaicompanionProject"].(map[string]any); ok {
-			if id, okID := projectMap["id"].(string); okID {
-				projectID = strings.TrimSpace(id)
-			}
-		}
-	}
+	projectID := extractCloudaicompanionProject(loadResp)
 
 	if projectID == "" {
-		tierID := "legacy-tier"
-		if tiers, okTiers := loadResp["allowedTiers"].([]any); okTiers {
-			for _, rawTier := range tiers {
-				tier, okTier := rawTier.(map[string]any)
-				if !okTier {
-					continue
-				}
-				if isDefault, okDefault := tier["isDefault"].(bool); okDefault && isDefault {
-					if id, okID := tier["id"].(string); okID && strings.TrimSpace(id) != "" {
-						tierID = strings.TrimSpace(id)
-						break
-					}
-				}
-			}
-		}
-
-		projectID, err = o.OnboardUser(ctx, accessToken, tierID)
+		projectID, err = o.OnboardUser(ctx, accessToken, defaultAntigravityTierID(loadResp))
 		if err != nil {
 			return "", err
+		}
+		if projectID == "" {
+			return "", fmt.Errorf("project id not found in loadCodeAssist or onboardUser response")
 		}
 		return projectID, nil
 	}
@@ -278,14 +360,10 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 // OnboardUser attempts to fetch the project ID via onboardUser by polling for completion
 func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID string) (string, error) {
 	log.Infof("Antigravity: onboarding user with tier: %s", tierID)
-	userAgent := o.loadCodeAssistUserAgent()
+	userAgent := o.nodeUserAgent()
 	requestBody := map[string]any{
-		"tierId": tierID,
-		"metadata": map[string]string{
-			"ide_type":    "ANTIGRAVITY",
-			"ide_version": misc.AntigravityVersionFromUserAgent(userAgent),
-			"ide_name":    "antigravity",
-		},
+		"tier_id":  tierID,
+		"metadata": antigravityControlPlaneMetadata(userAgent),
 	}
 
 	rawBody, errMarshal := json.Marshal(requestBody)
@@ -304,13 +382,14 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 		}
 		reqCtx, cancel = context.WithTimeout(reqCtx, 30*time.Second)
 
-		endpointURL := fmt.Sprintf("%s/%s:onboardUser", APIEndpoint, APIVersion)
+		endpointURL := fmt.Sprintf("%s/%s:onboardUser", DailyAPIEndpoint, APIVersion)
 		req, errRequest := http.NewRequestWithContext(reqCtx, http.MethodPost, endpointURL, strings.NewReader(string(rawBody)))
 		if errRequest != nil {
 			cancel()
 			return "", fmt.Errorf("create request: %w", errRequest)
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Accept", "*/*")
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", userAgent)
 		req.Header.Set("X-Goog-Api-Client", misc.AntigravityGoogAPIClientUA)
@@ -340,18 +419,11 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 			if done, okDone := data["done"].(bool); okDone && done {
 				projectID := ""
 				if responseData, okResp := data["response"].(map[string]any); okResp {
-					switch projectValue := responseData["cloudaicompanionProject"].(type) {
-					case map[string]any:
-						if id, okID := projectValue["id"].(string); okID {
-							projectID = strings.TrimSpace(id)
-						}
-					case string:
-						projectID = strings.TrimSpace(projectValue)
-					}
+					projectID = extractCloudaicompanionProject(responseData)
 				}
 
 				if projectID != "" {
-					log.Infof("Successfully fetched project_id: %s", projectID)
+					log.Infof("Successfully fetched project_id: %s", util.HideAPIKey(projectID))
 					return projectID, nil
 				}
 
@@ -374,5 +446,39 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 		return "", fmt.Errorf("http %d: %s", resp.StatusCode, responseErr)
 	}
 
-	return "", nil
+	return "", fmt.Errorf("onboard user did not complete after %d attempts", maxAttempts)
+}
+
+// EncodeAntigravityState produces a base64url-encoded JSON blob containing the
+// PKCE verifier and the optional project id, matching the cortexkit reference
+// client's state encoding. Exposed as a public function for callers that need
+// to mint a state token before invoking BuildAuthURL.
+func EncodeAntigravityState(verifier, projectID string) (string, error) {
+	payload := antigravityState{Index: verifier, ProjectId: projectID}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("antigravity encode state: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// DecodeAntigravityState parses a state value produced by EncodeAntigravityState
+// and returns the embedded PKCE verifier and project id. The boolean result is
+// false if the state is empty, malformed, or uses an unexpected shape.
+func DecodeAntigravityState(state string) (antigravityState, bool) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return antigravityState{}, false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(state)
+	if err != nil {
+		// The state may be a plain random token from a non-PKCE flow; treat it
+		// as "no embedded verifier" rather than failing the parse.
+		return antigravityState{}, false
+	}
+	var decoded antigravityState
+	if errDecode := json.Unmarshal(raw, &decoded); errDecode != nil {
+		return antigravityState{}, false
+	}
+	return decoded, true
 }

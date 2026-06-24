@@ -108,14 +108,58 @@ type Auth struct {
 }
 
 const (
+	AttributeAuthIndexSeed   = "auth_index_seed"
+	AttributePluginVirtual   = "plugin_virtual"
+	AttributeVirtualSource   = "virtual_source"
+	pluginVirtualAttrEnabled = "true"
+)
+
+// MarkPluginVirtualAuth marks an auth that was expanded from a plugin-owned source file.
+func MarkPluginVirtualAuth(auth *Auth, sourcePath string, ordinal int) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	auth.Attributes[AttributePluginVirtual] = pluginVirtualAttrEnabled
+	sourcePath = strings.TrimSpace(sourcePath)
+	if sourcePath != "" {
+		auth.Attributes[AttributeVirtualSource] = sourcePath
+	}
+	seedID := strings.TrimSpace(auth.ID)
+	if seedID == "" {
+		seedID = strings.TrimSpace(auth.FileName)
+	}
+	if seedID == "" {
+		seedID = strconv.Itoa(ordinal)
+	}
+	auth.Attributes[AttributeAuthIndexSeed] = strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(auth.Provider)),
+		sourcePath,
+		seedID,
+		strconv.Itoa(ordinal),
+	}, "|")
+}
+
+// IsPluginVirtualAuth reports whether an auth was expanded from a plugin-owned source file.
+func IsPluginVirtualAuth(auth *Auth) bool {
+	if auth == nil || len(auth.Attributes) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes[AttributePluginVirtual]), pluginVirtualAttrEnabled)
+}
+
+const (
 	recentRequestBucketSeconds int64 = 10 * 60
 	recentRequestBucketCount         = 20
 )
 
 type recentRequestBucket struct {
-	bucketID int64
-	success  int64
-	failed   int64
+	bucketID        int64
+	success         int64
+	failed          int64
+	lastFailureReason string
 }
 
 type recentRequestRing struct {
@@ -123,9 +167,10 @@ type recentRequestRing struct {
 }
 
 type RecentRequestBucket struct {
-	Time    string `json:"time"`
-	Success int64  `json:"success"`
-	Failed  int64  `json:"failed"`
+	Time              string `json:"time"`
+	Success           int64  `json:"success"`
+	Failed            int64  `json:"failed"`
+	LastFailureReason string `json:"last_failure_reason,omitempty"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -193,7 +238,7 @@ func formatRecentRequestBucketLabel(bucketID int64) string {
 	return start.Format("15:04") + "-" + end.Format("15:04")
 }
 
-func (a *Auth) recordRecentRequest(now time.Time, success bool) {
+func (a *Auth) recordRecentRequest(now time.Time, success bool, failureReason string) {
 	if a == nil {
 		return
 	}
@@ -204,12 +249,16 @@ func (a *Auth) recordRecentRequest(now time.Time, success bool) {
 		bucket.bucketID = bucketID
 		bucket.success = 0
 		bucket.failed = 0
+		bucket.lastFailureReason = ""
 	}
 	if success {
 		bucket.success++
 		return
 	}
 	bucket.failed++
+	if failureReason != "" {
+		bucket.lastFailureReason = failureReason
+	}
 }
 
 func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
@@ -229,6 +278,7 @@ func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
 		if bucket.bucketID == bucketID {
 			entry.Success = bucket.success
 			entry.Failed = bucket.failed
+			entry.LastFailureReason = bucket.lastFailureReason
 		}
 		out = append(out, entry)
 	}
@@ -298,6 +348,12 @@ func stableAuthIndex(seed string) string {
 func (a *Auth) indexSeed() string {
 	if a == nil {
 		return ""
+	}
+
+	if a.Attributes != nil {
+		if seed := strings.TrimSpace(a.Attributes[AttributeAuthIndexSeed]); seed != "" {
+			return AttributeAuthIndexSeed + ":" + seed
+		}
 	}
 
 	provider := strings.ToLower(strings.TrimSpace(a.Provider))
@@ -373,8 +429,10 @@ func (a *Auth) EnsureIndex() string {
 	if a == nil {
 		return ""
 	}
-	if a.indexAssigned && a.Index != "" {
-		return a.Index
+	if existingIndex := strings.TrimSpace(a.Index); existingIndex != "" {
+		a.Index = existingIndex
+		a.indexAssigned = true
+		return existingIndex
 	}
 
 	seed := a.indexSeed()
@@ -551,23 +609,6 @@ func (a *Auth) AccountInfo() (string, string) {
 	if a == nil {
 		return "", ""
 	}
-	// For Gemini CLI, include project ID in the OAuth account info if present.
-	if strings.ToLower(a.Provider) == "gemini-cli" {
-		if a.Metadata != nil {
-			email, _ := a.Metadata["email"].(string)
-			email = strings.TrimSpace(email)
-			if email != "" {
-				if p, ok := a.Metadata["project_id"].(string); ok {
-					p = strings.TrimSpace(p)
-					if p != "" {
-						return "oauth", email + " (" + p + ")"
-					}
-				}
-				return "oauth", email
-			}
-		}
-	}
-
 	// Check metadata for email first (OAuth-style auth)
 	if a.Metadata != nil {
 		if method, ok := a.Metadata["auth_method"].(string); ok {

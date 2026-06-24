@@ -34,5 +34,14 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		notifyTokenRefreshed: func(tokenID, accessToken, refreshToken, expiresAt string) {
 			w.NotifyTokenRefreshed(tokenID, accessToken, refreshToken, expiresAt)
 		},
+		dispatchPersistedAuth: func(update watcher.AuthUpdate) bool {
+			return w.DispatchPersistedAuthUpdate(update)
+		},
+		setPluginAuthParser: func(parser PluginAuthParser) {
+			w.SetPluginAuthParser(parser)
+		},
+		reloadConfigIfChanged: func() {
+			w.ReloadConfigIfChanged()
+		},
 	}, nil
 }

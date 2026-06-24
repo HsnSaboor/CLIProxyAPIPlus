@@ -1,21 +1,19 @@
 # Binaries
 cli-proxy-api
-cliproxy
-/server
 *.exe
-
 
 # Configuration
 config.yaml
 .env
-.mcp.json
+
 # Generated content
 bin/*
 logs/*
 conv/*
 temp/*
 refs/*
-tmp/*
+plugins/*
+examples/plugin/bin/*
 
 # Storage backends
 pgstore/*
@@ -27,6 +25,7 @@ static/*
 
 # Authentication data
 auths/*
+/auths
 !auths/.gitkeep
 
 # Documentation
@@ -40,9 +39,11 @@ GEMINI.md
 .worktrees/
 .codex/*
 .claude/*
+.claude
 .gemini/*
 .serena/*
 .agent/*
+.agents
 .agents/*
 .opencode/*
 .idea/*
@@ -50,24 +51,11 @@ GEMINI.md
 .bmad/*
 _bmad/*
 _bmad-output/*
-.mcp/cache/
 
 # macOS
 .DS_Store
 ._*
-
-# Opencode
-.beads/
-.opencode/
-.cli-proxy-api/
-.venv/
-*.bak
-*.json
-.cli-proxy-api/
-.sisyphus/
-.tldr/
-server
 .gocache/
-chat.txt
-*.orig
-*.patch
+
+# deepwork session state (local only)
+.slim/deepwork/
