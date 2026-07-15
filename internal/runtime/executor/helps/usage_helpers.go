@@ -108,7 +108,6 @@ func (r *UsageReporter) SetTranslatedReasoningEffort(payload []byte, format stri
 		return
 	}
 	r.reasoning = thinking.ExtractTranslatedReasoningEffort(payload, format)
-	r.serviceTier = extractServiceTierFromPayload(payload)
 }
 
 func (r *UsageReporter) TrackHTTPClient(client *http.Client) *http.Client {
@@ -280,37 +279,25 @@ func (r *UsageReporter) buildRecordForModel(model string, detail usage.Detail, f
 		return usage.Record{Model: model, Detail: detail, Failed: failed, Fail: fail}
 	}
 	return usage.Record{
-		Provider:        r.provider,
-		ExecutorType:    r.executorType,
-		Model:           model,
-		Alias:           r.alias,
-		Source:          r.source,
-		APIKey:          r.apiKey,
-		AuthID:          r.authID,
-		AuthIndex:       r.authIndex,
-		AuthType:        r.authType,
-		ReasoningEffort: r.reasoning,
-		ServiceTier:     r.serviceTier,
-		RequestedAt:     r.requestedAt,
-		Latency:         r.latency(),
-		TTFT:            r.ttftDuration(),
-		Failed:          failed,
-		Fail:            fail,
-		Detail:          detail,
+		Provider:            r.provider,
+		ExecutorType:        r.executorType,
+		Model:               model,
+		Alias:               r.alias,
+		Source:              r.source,
+		APIKey:              r.apiKey,
+		AuthID:              r.authID,
+		AuthIndex:           r.authIndex,
+		AuthType:            r.authType,
+		ReasoningEffort:     r.reasoning,
+		ServiceTier:         r.serviceTier,
+		ResponseServiceTier: strings.TrimSpace(detail.ResponseServiceTier),
+		RequestedAt:         r.requestedAt,
+		Latency:             r.latency(),
+		TTFT:                r.ttftDuration(),
+		Failed:              failed,
+		Fail:                fail,
+		Detail:              detail,
 	}
-}
-
-func extractServiceTierFromPayload(payload []byte) string {
-	if len(payload) == 0 {
-		return usage.DefaultServiceTier
-	}
-	for _, path := range []string{"service_tier", "request.service_tier", "response.service_tier"} {
-		serviceTier := strings.TrimSpace(gjson.GetBytes(payload, path).String())
-		if serviceTier != "" {
-			return serviceTier
-		}
-	}
-	return usage.DefaultServiceTier
 }
 
 func failFromErrors(errs ...error) usage.Failure {
@@ -464,20 +451,103 @@ func resolveUsageAuthType(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
 	}
-	kind, _ := auth.AccountInfo()
-	kind = strings.TrimSpace(kind)
-	if kind == "api_key" {
-		return "apikey"
+	return auth.AuthKind()
+}
+
+// StreamUsageBuffer keeps the latest usage detail observed in a stream.
+type StreamUsageBuffer struct {
+	detail usage.Detail
+	ok     bool
+}
+
+var (
+	openAIStreamUsageMarker       = []byte(`"usage"`)
+	openAIStreamServiceTierMarker = []byte(`"service_tier"`)
+)
+
+// Observe records detail when ok is true, allowing the final stream usage to win.
+func (b *StreamUsageBuffer) Observe(detail usage.Detail, ok bool) {
+	if b == nil || !ok {
+		return
 	}
-	return kind
+	responseServiceTier := strings.TrimSpace(detail.ResponseServiceTier)
+	if responseServiceTier == "" || hasNonZeroTokenUsage(detail) {
+		preservedTier := b.detail.ResponseServiceTier
+		b.detail = detail
+		if b.detail.ResponseServiceTier == "" {
+			b.detail.ResponseServiceTier = preservedTier
+		}
+	} else {
+		b.detail.ResponseServiceTier = responseServiceTier
+	}
+	b.ok = true
+}
+
+// ObserveOpenAIStream records response-tier state and the latest usage from an
+// OpenAI-style stream while avoiding JSON parsing for irrelevant chunks.
+func (b *StreamUsageBuffer) ObserveOpenAIStream(line []byte) {
+	if b == nil {
+		return
+	}
+	payload := jsonPayload(line)
+	if len(payload) == 0 {
+		return
+	}
+
+	hasUsageCandidate := bytes.Contains(payload, openAIStreamUsageMarker)
+	needTier := b.detail.ResponseServiceTier == "" || hasUsageCandidate
+	hasTierCandidate := needTier && bytes.Contains(payload, openAIStreamServiceTierMarker)
+	if !hasUsageCandidate && !hasTierCandidate {
+		return
+	}
+	if !gjson.ValidBytes(payload) {
+		return
+	}
+
+	detail := usage.Detail{}
+	usageOK := false
+	if hasUsageCandidate {
+		usageNode := gjson.GetBytes(payload, "usage")
+		if hasOpenAIStyleUsageTokenFields(usageNode) {
+			detail = parseOpenAIStyleUsageNode(usageNode)
+			usageOK = true
+		}
+	}
+	if hasTierCandidate {
+		detail.ResponseServiceTier = extractResponseServiceTierFromValidJSON(payload)
+	}
+	b.Observe(detail, usageOK || detail.ResponseServiceTier != "")
+}
+
+// Publish emits the latest observed usage detail, if any.
+func (b *StreamUsageBuffer) Publish(ctx context.Context, reporter *UsageReporter) bool {
+	if b == nil || !b.ok || reporter == nil {
+		return false
+	}
+	reporter.Publish(ctx, b.detail)
+	return true
+}
+
+// Detail returns the latest observed usage detail.
+func (b *StreamUsageBuffer) Detail() (usage.Detail, bool) {
+	if b == nil || !b.ok {
+		return usage.Detail{}, false
+	}
+	return b.detail, true
 }
 
 func ParseCodexUsage(data []byte) (usage.Detail, bool) {
+	responseServiceTier := extractResponseServiceTier(data)
 	usageNode := gjson.ParseBytes(data).Get("response.usage")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		return usage.Detail{}, false
+		if responseServiceTier == "" {
+			return usage.Detail{}, false
+		}
+		return usage.Detail{ResponseServiceTier: responseServiceTier}, true
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	detail := parseOpenAIStyleUsageNode(usageNode)
+	detail.ResponseServiceTier = responseServiceTier
+	return detail, true
 }
 
 func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
@@ -489,11 +559,14 @@ func ParseCodexImageToolUsage(data []byte) (usage.Detail, bool) {
 }
 
 func ParseOpenAIUsage(data []byte) usage.Detail {
+	responseServiceTier := extractResponseServiceTier(data)
 	usageNode := gjson.ParseBytes(data).Get("usage")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		return usage.Detail{}
+		return usage.Detail{ResponseServiceTier: responseServiceTier}
 	}
-	return parseOpenAIStyleUsageNode(usageNode)
+	detail := parseOpenAIStyleUsageNode(usageNode)
+	detail.ResponseServiceTier = responseServiceTier
+	return detail
 }
 
 func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
@@ -507,6 +580,10 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("total_tokens").Exists() ||
 		usageNode.Get("prompt_tokens_details.cached_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cached_tokens").Exists() ||
+		usageNode.Get("prompt_tokens_details.cache_write_tokens").Exists() ||
+		usageNode.Get("prompt_tokens_details.cache_creation_tokens").Exists() ||
+		usageNode.Get("input_tokens_details.cache_write_tokens").Exists() ||
+		usageNode.Get("input_tokens_details.cache_creation_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
 		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
 }
@@ -531,6 +608,17 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
+		detail.CacheReadTokens = cached.Int()
+	}
+	cacheCreation := firstExistingUsageNode(
+		usageNode,
+		"input_tokens_details.cache_creation_tokens",
+		"input_tokens_details.cache_write_tokens",
+		"prompt_tokens_details.cache_creation_tokens",
+		"prompt_tokens_details.cache_write_tokens",
+	)
+	if cacheCreation.Exists() {
+		detail.CacheCreationTokens = cacheCreation.Int()
 	}
 	reasoning := usageNode.Get("completion_tokens_details.reasoning_tokens")
 	if !reasoning.Exists() {
@@ -547,11 +635,17 @@ func ParseOpenAIStreamUsage(line []byte) (usage.Detail, bool) {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return usage.Detail{}, false
 	}
+	responseServiceTier := extractResponseServiceTier(payload)
 	usageNode := gjson.GetBytes(payload, "usage")
 	if !hasOpenAIStyleUsageTokenFields(usageNode) {
-		return usage.Detail{}, false
+		if responseServiceTier == "" {
+			return usage.Detail{}, false
+		}
+		return usage.Detail{ResponseServiceTier: responseServiceTier}, true
 	}
-	return parseOpenAIStyleUsageNode(usageNode), true
+	detail := parseOpenAIStyleUsageNode(usageNode)
+	detail.ResponseServiceTier = responseServiceTier
+	return detail, true
 }
 
 func ParseClaudeUsage(data []byte) usage.Detail {
@@ -592,17 +686,93 @@ func parseClaudeUsageNode(usageNode gjson.Result) usage.Detail {
 }
 
 func parseGeminiFamilyUsageDetail(node gjson.Result) usage.Detail {
+	cachedTokens := node.Get("cachedContentTokenCount").Int()
 	detail := usage.Detail{
 		InputTokens:     node.Get("promptTokenCount").Int(),
 		OutputTokens:    node.Get("candidatesTokenCount").Int(),
 		ReasoningTokens: node.Get("thoughtsTokenCount").Int(),
 		TotalTokens:     node.Get("totalTokenCount").Int(),
-		CachedTokens:    node.Get("cachedContentTokenCount").Int(),
+		CachedTokens:    cachedTokens,
+		CacheReadTokens: cachedTokens,
 	}
 	if detail.TotalTokens == 0 {
 		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
 	return detail
+}
+
+func parseInteractionsUsageDetail(node gjson.Result) usage.Detail {
+	cacheRead := firstExistingUsageNode(node, "cache_read_tokens", "cacheReadTokens")
+	detail := usage.Detail{
+		InputTokens:         firstExistingUsageNode(node, "input_tokens", "prompt_tokens", "total_input_tokens").Int(),
+		OutputTokens:        firstExistingUsageNode(node, "output_tokens", "completion_tokens", "total_output_tokens").Int(),
+		ReasoningTokens:     firstExistingUsageNode(node, "reasoning_tokens", "thoughtsTokenCount", "total_thought_tokens").Int(),
+		TotalTokens:         firstExistingUsageNode(node, "total_tokens", "totalTokenCount").Int(),
+		CachedTokens:        firstExistingUsageNode(node, "cached_tokens", "cachedContentTokenCount", "total_cached_tokens").Int(),
+		CacheReadTokens:     cacheRead.Int(),
+		CacheCreationTokens: firstExistingUsageNode(node, "cache_creation_tokens", "cacheCreationTokens", "cache_write_tokens", "cacheWriteTokens").Int(),
+	}
+	if !cacheRead.Exists() && detail.CachedTokens > 0 {
+		detail.CacheReadTokens = detail.CachedTokens
+	}
+	if detail.TotalTokens == 0 {
+		detail.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CacheCreationTokens
+		if cacheRead.Exists() {
+			detail.TotalTokens += detail.CacheReadTokens
+		}
+	}
+	return detail
+}
+
+func hasUsageDetail(detail usage.Detail) bool {
+	return hasNonZeroTokenUsage(detail)
+}
+
+func ParseInteractionsUsage(data []byte) usage.Detail {
+	root := gjson.ParseBytes(data)
+	node := firstExistingUsageNode(root, "usage", "total_usage", "metadata.total_usage", "metadata.usage", "usageMetadata", "usage_metadata", "interaction.usage", "interaction.total_usage", "interaction.metadata.total_usage")
+	if !node.Exists() {
+		return usage.Detail{}
+	}
+	if node.Get("promptTokenCount").Exists() || node.Get("candidatesTokenCount").Exists() {
+		detail := parseGeminiFamilyUsageDetail(node)
+		detail.ResponseServiceTier = extractResponseServiceTier(data)
+		return detail
+	}
+	detail := parseInteractionsUsageDetail(node)
+	detail.ResponseServiceTier = extractResponseServiceTier(data)
+	return detail
+}
+
+func extractResponseServiceTier(payload []byte) string {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return ""
+	}
+	return extractResponseServiceTierFromValidJSON(payload)
+}
+
+func extractResponseServiceTierFromValidJSON(payload []byte) string {
+	for _, path := range []string{"response.service_tier", "service_tier", "interaction.service_tier"} {
+		if tier := strings.TrimSpace(gjson.GetBytes(payload, path).String()); tier != "" {
+			return tier
+		}
+	}
+	return ""
+}
+
+func ParseInteractionsStreamUsage(line []byte) (usage.Detail, bool) {
+	payload := jsonPayload(line)
+	if len(payload) == 0 {
+		payload = line
+	}
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return usage.Detail{}, false
+	}
+	detail := ParseInteractionsUsage(payload)
+	if !hasUsageDetail(detail) {
+		return usage.Detail{}, false
+	}
+	return detail, true
 }
 
 func ParseGeminiUsage(data []byte) usage.Detail {

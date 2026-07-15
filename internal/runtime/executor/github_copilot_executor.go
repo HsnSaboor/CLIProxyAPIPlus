@@ -1679,6 +1679,6 @@ func FetchGitHubCopilotModels(ctx context.Context, auth *cliproxyauth.Auth, cfg 
 		models = append(models, m)
 	}
 
-	log.Infof("github-copilot: fetched %d models from API", len(models))
+	log.Debugf("github-copilot: fetched %d models from API", len(models))
 	return models
 }

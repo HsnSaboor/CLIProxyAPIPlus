@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -23,6 +24,8 @@ type fakePluginRuntime struct {
 	unloaded []string
 }
 
+type fakePluginLoadInspector map[string]bool
+
 func (r *fakePluginRuntime) PluginBusy(id string) bool {
 	return r.busy
 }
@@ -31,6 +34,10 @@ func (r *fakePluginRuntime) UnloadPlugin(id string) bool {
 	r.unloaded = append(r.unloaded, id)
 	r.busy = false
 	return true
+}
+
+func (i fakePluginLoadInspector) PluginRegistered(id string) bool {
+	return i[id]
 }
 
 func TestSyncPlatformInstallsManifestArtifact(t *testing.T) {
@@ -55,7 +62,7 @@ func TestSyncPlatformInstallsManifestArtifact(t *testing.T) {
 	if errSync := SyncPlatform(context.Background(), syncTestConfig(t, root), nil, Platform{GOOS: "windows", GOARCH: "amd64"}); errSync != nil {
 		t.Fatalf("SyncPlatform() error = %v", errSync)
 	}
-	target := filepath.Join(root, "windows", "amd64", "sample.dll")
+	target := pluginTestPath(root, "windows", "amd64", "sample", "0.2.0")
 	got, errRead := os.ReadFile(target)
 	if errRead != nil {
 		t.Fatalf("read target: %v", errRead)
@@ -65,13 +72,94 @@ func TestSyncPlatformInstallsManifestArtifact(t *testing.T) {
 	}
 }
 
+func TestSyncPlatformWithReportRecordsSuccessfulInstall(t *testing.T) {
+	root := t.TempDir()
+	archiveData := makeZip(t, map[string]string{"sample.dll": "library-data"})
+	archiveName := "sample_0.2.0_windows_amd64.zip"
+	checksum := sha256.Sum256(archiveData)
+	httpClient := mapHTTPDoer{
+		"https://api.github.com/repos/owner/sample-plugin/releases/tags/v0.2.0": []byte(`{
+			"tag_name": "v0.2.0",
+			"assets": [
+				{"name": "` + archiveName + `", "browser_download_url": "https://downloads.example/` + archiveName + `"},
+				{"name": "checksums.txt", "browser_download_url": "https://downloads.example/checksums.txt"}
+			]
+		}`),
+		"https://downloads.example/" + archiveName: archiveData,
+		"https://downloads.example/checksums.txt":  []byte(hex.EncodeToString(checksum[:]) + "  " + archiveName + "\n"),
+	}
+	restore := replacePluginStoreClientForTest(httpClient)
+	defer restore()
+
+	report, errSync := SyncPlatformWithReport(context.Background(), syncTestConfig(t, root), nil, Platform{GOOS: "windows", GOARCH: "amd64"})
+	if errSync != nil {
+		t.Fatalf("SyncPlatformWithReport() error = %v", errSync)
+	}
+	if !report.OK || report.Status != pluginTaskStatusOK || report.Phase != pluginTaskPhaseInstall {
+		t.Fatalf("report status = %+v, want successful install phase", report)
+	}
+	if len(report.Plugins) != 1 {
+		t.Fatalf("report plugins len = %d, want 1", len(report.Plugins))
+	}
+	plugin := report.Plugins[0]
+	if plugin.ID != "sample" || plugin.InstallStatus != pluginInstallStatusInstalled || plugin.Version != "0.2.0" {
+		t.Fatalf("plugin report = %+v, want installed sample 0.2.0", plugin)
+	}
+	if wantPath := pluginTestPath(root, "windows", "amd64", "sample", "0.2.0"); plugin.Path != wantPath {
+		t.Fatalf("plugin path = %q, want %q", plugin.Path, wantPath)
+	}
+}
+
+func TestSyncPlatformWithReportRecordsSkippedIdenticalArtifact(t *testing.T) {
+	root := t.TempDir()
+	targetDir := filepath.Join(root, "windows", "amd64")
+	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
+		t.Fatalf("MkdirAll() error = %v", errMkdir)
+	}
+	target := filepath.Join(targetDir, "sample-v0.2.0.dll")
+	if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
+		t.Fatalf("WriteFile() error = %v", errWrite)
+	}
+	archiveData := makeZip(t, map[string]string{"sample.dll": "library-data"})
+	archiveName := "sample_0.2.0_windows_amd64.zip"
+	checksum := sha256.Sum256(archiveData)
+	httpClient := mapHTTPDoer{
+		"https://api.github.com/repos/owner/sample-plugin/releases/tags/v0.2.0": []byte(`{
+			"tag_name": "v0.2.0",
+			"assets": [
+				{"name": "` + archiveName + `", "browser_download_url": "https://downloads.example/` + archiveName + `"},
+				{"name": "checksums.txt", "browser_download_url": "https://downloads.example/checksums.txt"}
+			]
+		}`),
+		"https://downloads.example/" + archiveName: archiveData,
+		"https://downloads.example/checksums.txt":  []byte(hex.EncodeToString(checksum[:]) + "  " + archiveName + "\n"),
+	}
+	restore := replacePluginStoreClientForTest(httpClient)
+	defer restore()
+
+	report, errSync := SyncPlatformWithReport(context.Background(), syncTestConfig(t, root), nil, Platform{GOOS: "windows", GOARCH: "amd64"})
+	if errSync != nil {
+		t.Fatalf("SyncPlatformWithReport() error = %v", errSync)
+	}
+	if !report.OK || len(report.Plugins) != 1 {
+		t.Fatalf("report = %+v, want one successful skipped plugin", report)
+	}
+	plugin := report.Plugins[0]
+	if plugin.ID != "sample" || plugin.InstallStatus != pluginInstallStatusSkipped || !plugin.Skipped {
+		t.Fatalf("plugin report = %+v, want skipped identical sample", plugin)
+	}
+	if plugin.Path != target {
+		t.Fatalf("plugin path = %q, want %q", plugin.Path, target)
+	}
+}
+
 func TestSyncPlatformSkipsIdenticalBusyPlugin(t *testing.T) {
 	root := t.TempDir()
 	targetDir := filepath.Join(root, "windows", "amd64")
 	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
 		t.Fatalf("MkdirAll() error = %v", errMkdir)
 	}
-	target := filepath.Join(targetDir, "sample.dll")
+	target := filepath.Join(targetDir, "sample-v0.2.0.dll")
 	if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
 		t.Fatalf("WriteFile() error = %v", errWrite)
 	}
@@ -147,6 +235,147 @@ store:
 	}
 }
 
+func TestSyncPlatformWithReportRecordsInvalidManifest(t *testing.T) {
+	cfg := &config.Config{
+		Home: config.HomeConfig{Enabled: true},
+		Plugins: config.PluginsConfig{
+			Enabled: true,
+			Dir:     t.TempDir(),
+			Configs: map[string]config.PluginInstanceConfig{
+				"sample": pluginConfigFromYAML(t, `
+enabled: true
+store:
+  id: sample
+`),
+			},
+		},
+	}
+	report, errSync := SyncPlatformWithReport(context.Background(), cfg, nil, Platform{GOOS: "linux", GOARCH: "amd64"})
+	if errSync == nil {
+		t.Fatal("SyncPlatformWithReport() error = nil, want invalid manifest")
+	}
+	if report.OK || report.Status != pluginTaskStatusError || len(report.Plugins) != 1 {
+		t.Fatalf("report = %+v, want one failed plugin", report)
+	}
+	if report.Plugins[0].ID != "sample" || report.Plugins[0].InstallStatus != pluginInstallStatusFailed || !strings.Contains(report.Plugins[0].Error, "invalid store manifest") {
+		t.Fatalf("plugin report = %+v, want invalid manifest failure", report.Plugins[0])
+	}
+}
+
+func TestMarkLoadResultsFailsWhenInstalledPluginDidNotLoad(t *testing.T) {
+	report := SyncReport{
+		Status:  pluginTaskStatusOK,
+		OK:      true,
+		Phase:   pluginTaskPhaseInstall,
+		Plugins: []PluginInstallStatus{{ID: "sample", InstallStatus: pluginInstallStatusInstalled}},
+	}
+
+	errLoad := MarkLoadResults(&report, fakePluginLoadInspector{})
+	if errLoad == nil {
+		t.Fatal("MarkLoadResults() error = nil, want load failure")
+	}
+	if report.OK || report.Status != pluginTaskStatusError || report.Phase != pluginTaskPhaseLoad {
+		t.Fatalf("report = %+v, want failed load phase", report)
+	}
+	if report.Plugins[0].LoadStatus != pluginLoadStatusFailed || !strings.Contains(report.Plugins[0].Error, "installed but not loaded") {
+		t.Fatalf("plugin report = %+v, want load failure", report.Plugins[0])
+	}
+}
+
+func TestMarkLoadResultsPreservesInstallFailure(t *testing.T) {
+	report := SyncReport{
+		Status:  pluginTaskStatusError,
+		OK:      false,
+		Phase:   pluginTaskPhaseInstall,
+		Plugins: []PluginInstallStatus{{ID: "sample", InstallStatus: pluginInstallStatusFailed, Error: "install boom"}},
+	}
+
+	errLoad := MarkLoadResults(&report, fakePluginLoadInspector{"sample": true})
+	if errLoad == nil {
+		t.Fatal("MarkLoadResults() error = nil, want install failure to remain fatal")
+	}
+	if report.OK || report.Status != pluginTaskStatusError {
+		t.Fatalf("report = %+v, want failed status", report)
+	}
+	if report.Plugins[0].LoadStatus != pluginInstallStatusSkipped {
+		t.Fatalf("load status = %q, want skipped", report.Plugins[0].LoadStatus)
+	}
+}
+
+func TestDeleteWithReportRemovesCurrentPlatformPlugin(t *testing.T) {
+	root := t.TempDir()
+	targetDir := filepath.Join(root, runtime.GOOS, runtime.GOARCH)
+	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
+		t.Fatalf("MkdirAll() error = %v", errMkdir)
+	}
+	target := filepath.Join(targetDir, "sample"+pluginExtension(runtime.GOOS))
+	if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
+		t.Fatalf("WriteFile() error = %v", errWrite)
+	}
+	runtimeHost := &fakePluginRuntime{busy: true}
+
+	report := DeleteWithReport(context.Background(), syncTestConfig(t, root), runtimeHost, 42, "sample")
+	if !report.OK || report.TaskID != 42 || report.Task != pluginDeleteTaskName || report.Phase != pluginTaskPhaseDelete {
+		t.Fatalf("report = %+v, want successful delete task", report)
+	}
+	if len(runtimeHost.unloaded) != 1 || runtimeHost.unloaded[0] != "sample" {
+		t.Fatalf("UnloadPlugin calls = %v, want sample", runtimeHost.unloaded)
+	}
+	if len(report.Plugins) != 1 || report.Plugins[0].InstallStatus != pluginInstallStatusDeleted || report.Plugins[0].Path != target {
+		t.Fatalf("plugin report = %+v, want deleted target", report.Plugins)
+	}
+	if _, errStat := os.Stat(target); !os.IsNotExist(errStat) {
+		t.Fatalf("target stat error = %v, want not exist", errStat)
+	}
+}
+
+func TestDeleteWithReportRemovesAllCurrentPlatformPluginVersions(t *testing.T) {
+	root := t.TempDir()
+	targetDir := filepath.Join(root, runtime.GOOS, runtime.GOARCH)
+	if errMkdir := os.MkdirAll(targetDir, 0o755); errMkdir != nil {
+		t.Fatalf("MkdirAll() error = %v", errMkdir)
+	}
+	extension := pluginExtension(runtime.GOOS)
+	olderTarget := filepath.Join(targetDir, "sample-v0.2.0"+extension)
+	newerTarget := filepath.Join(targetDir, "sample-v0.3.0"+extension)
+	otherTarget := filepath.Join(targetDir, "other-v0.3.0"+extension)
+	for _, target := range []string{olderTarget, newerTarget, otherTarget} {
+		if errWrite := os.WriteFile(target, []byte("library-data"), 0o644); errWrite != nil {
+			t.Fatalf("WriteFile(%s) error = %v", target, errWrite)
+		}
+	}
+	runtimeHost := &fakePluginRuntime{busy: true}
+
+	report := DeleteWithReport(context.Background(), syncTestConfig(t, root), runtimeHost, 43, "sample")
+	if !report.OK {
+		t.Fatalf("report = %+v, want successful delete task", report)
+	}
+	if len(runtimeHost.unloaded) != 1 || runtimeHost.unloaded[0] != "sample" {
+		t.Fatalf("UnloadPlugin calls = %v, want sample", runtimeHost.unloaded)
+	}
+	if len(report.Plugins) != 1 || report.Plugins[0].InstallStatus != pluginInstallStatusDeleted || report.Plugins[0].Path != newerTarget {
+		t.Fatalf("plugin report = %+v, want deleted representative target %s", report.Plugins, newerTarget)
+	}
+	for _, target := range []string{olderTarget, newerTarget} {
+		if _, errStat := os.Stat(target); !os.IsNotExist(errStat) {
+			t.Fatalf("target %s stat error = %v, want not exist", target, errStat)
+		}
+	}
+	if _, errStat := os.Stat(otherTarget); errStat != nil {
+		t.Fatalf("other plugin stat error = %v, want retained", errStat)
+	}
+}
+
+func TestDeleteWithReportMissingPluginIsSuccess(t *testing.T) {
+	report := DeleteWithReport(context.Background(), syncTestConfig(t, t.TempDir()), nil, 7, "missing")
+	if !report.OK || report.Status != pluginTaskStatusOK {
+		t.Fatalf("report = %+v, want missing plugin delete success", report)
+	}
+	if len(report.Plugins) != 1 || report.Plugins[0].InstallStatus != pluginInstallStatusMissing {
+		t.Fatalf("plugin report = %+v, want missing status", report.Plugins)
+	}
+}
+
 func syncTestConfig(t *testing.T, root string) *config.Config {
 	t.Helper()
 	return &config.Config{
@@ -169,6 +398,15 @@ store:
 			},
 		},
 	}
+}
+
+func pluginTestPath(root string, goos string, goarch string, id string, version string) string {
+	name := strings.TrimSpace(id)
+	version = strings.TrimSpace(version)
+	if version != "" {
+		name += "-v" + version
+	}
+	return filepath.Join(root, goos, goarch, name+pluginExtension(goos))
 }
 
 func pluginConfigFromYAML(t *testing.T, text string) config.PluginInstanceConfig {

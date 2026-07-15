@@ -656,12 +656,20 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 		if entry := resolveAPIKeyConfig(cfg.GeminiKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
+	case "gemini-interactions":
+		if entry := resolveAPIKeyConfig(cfg.InteractionsKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
 	case "claude":
 		if entry := resolveAPIKeyConfig(cfg.ClaudeKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	case "codex":
 		if entry := resolveAPIKeyConfig(cfg.CodexKey, auth); entry != nil {
+			return strings.TrimSpace(entry.ProxyURL)
+		}
+	case "xai":
+		if entry := resolveAPIKeyConfig(cfg.XAIKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	}

@@ -123,10 +123,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	compatCfg := e.resolveCompatConfig(auth)
 	// Provider-specific request transformations
 	// Resolve conflicts between "reasoning" object and "reasoning_effort" string
 	translated = resolveReasoningEffortConflict(translated)
-	translated = normalizeMiniMaxM3ThinkingType(baseModel, translated)
+	translated = omitMiniMaxM3ThinkingType(baseModel, translated)
 	if isMiMoModel(baseModel) {
 		translated = applyMiMoReasoningBackfill(translated)
 	}
@@ -145,14 +146,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if isDeepSeekModel(baseModel) {
 		translated = stripDeepSeekUnsupportedFields(translated)
 	}
-	if compatCfg := e.resolveCompatConfig(auth); needsToolCallIDNormalization(baseModel, compatCfg) {
+	if needsToolCallIDNormalization(baseModel, compatCfg) {
 		if normalized, patched, errNorm := normalizeNVIDIAToolCallIDs(translated); patched > 0 && errNorm == nil {
 			translated = normalized
 		}
 	}
-	if compatCfg := e.resolveCompatConfig(auth); isNVIDIACompatProvider(compatCfg) {
+	if isNVIDIACompatProvider(compatCfg) {
 		translated = applyNVIDIAMaxTokensReduction(translated)
 	}
+	translated = stripOpenAICompatProviderUnsupportedFields(e.provider, compatCfg, translated)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -364,10 +366,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	compatCfg := e.resolveCompatConfig(auth)
 	// Provider-specific request transformations
 	// Resolve conflicts between "reasoning" object and "reasoning_effort" string
 	translated = resolveReasoningEffortConflict(translated)
-	translated = normalizeMiniMaxM3ThinkingType(baseModel, translated)
+	translated = omitMiniMaxM3ThinkingType(baseModel, translated)
 	if isMiMoModel(baseModel) {
 		translated = applyMiMoReasoningBackfill(translated)
 	}
@@ -386,14 +389,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if isDeepSeekModel(baseModel) {
 		translated = stripDeepSeekUnsupportedFields(translated)
 	}
-	if compatCfg := e.resolveCompatConfig(auth); needsToolCallIDNormalization(baseModel, compatCfg) {
+	if needsToolCallIDNormalization(baseModel, compatCfg) {
 		if normalized, patched, errNorm := normalizeNVIDIAToolCallIDs(translated); patched > 0 && errNorm == nil {
 			translated = normalized
 		}
 	}
-	if compatCfg := e.resolveCompatConfig(auth); isNVIDIACompatProvider(compatCfg) {
+	if isNVIDIACompatProvider(compatCfg) {
 		translated = applyNVIDIAMaxTokensReduction(translated)
 	}
+	translated = stripOpenAICompatProviderUnsupportedFields(e.provider, compatCfg, translated)
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
@@ -474,12 +478,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 52_428_800) // 50MB
 		var param any
+		var streamUsage helps.StreamUsageBuffer
+		defer streamUsage.Publish(ctx, reporter)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
-				reporter.Publish(ctx, detail)
-			}
+			streamUsage.ObserveOpenAIStream(line)
 			trimmedLine := bytes.TrimSpace(line)
 			if len(trimmedLine) == 0 {
 				continue
@@ -533,7 +537,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				}
 			}
 		}
-		// Ensure we record the request if no usage chunk was ever seen
+		// Ensure we record the request if no usage chunk was ever seen.
+		streamUsage.Publish(ctx, reporter)
 		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -854,6 +859,29 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 	return nil
 }
 
+func stripOpenAICompatProviderUnsupportedFields(provider string, compat *config.OpenAICompatibility, payload []byte) []byte {
+	if isKimiOpenAICompatProvider(provider, compat) {
+		return stripKimiUnsupportedFields(payload)
+	}
+	return payload
+}
+
+func isKimiOpenAICompatProvider(provider string, compat *config.OpenAICompatibility) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if strings.Contains(provider, "kimi") || strings.Contains(provider, "moonshot") {
+		return true
+	}
+	if compat == nil {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSpace(compat.Name))
+	if strings.Contains(name, "kimi") || strings.Contains(name, "moonshot") {
+		return true
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(compat.BaseURL))
+	return strings.Contains(baseURL, "moonshot") || strings.Contains(baseURL, "kimi")
+}
+
 func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byte {
 	if len(payload) == 0 || model == "" {
 		return payload
@@ -929,9 +957,6 @@ func isOpenCodeZenProvider(baseURL string) bool {
 	return strings.Contains(lower, "opencode.ai/zen/")
 }
 
-// isMiniMaxM3Model reports whether the model name targets a MiniMax-M3
-// model, regardless of the upstream gateway. MiniMax-M3 only allows
-// thinking.type "adaptive" or "disabled" and rejects "enabled".
 func isMiniMaxM3Model(model string) bool {
 	lower := strings.ToLower(strings.TrimSpace(model))
 	if lower == "" {
@@ -940,23 +965,20 @@ func isMiniMaxM3Model(model string) bool {
 	return strings.Contains(lower, "minimax-m3")
 }
 
-// normalizeMiniMaxM3ThinkingType rewrites thinking.type from "enabled"
-// to "adaptive" for MiniMax-M3 models, since MiniMax only allows
-// "adaptive" or "disabled" and rejects "enabled".
-// If thinking.type is "disabled" or "adaptive", it is left untouched.
-// Non-MiniMax models are not affected, since other providers (e.g. Claude,
-// GPT) accept "enabled".
-func normalizeMiniMaxM3ThinkingType(model string, body []byte) []byte {
+func omitMiniMaxM3ThinkingType(model string, body []byte) []byte {
 	if !isMiniMaxM3Model(model) || len(body) == 0 || !gjson.ValidBytes(body) {
 		return body
 	}
-	thinkingType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "thinking.type").String()))
-	if thinkingType == "" || thinkingType == "disabled" || thinkingType == "adaptive" {
-		return body
-	}
-	updated, err := sjson.SetBytes(body, "thinking.type", "adaptive")
+	updated, err := sjson.DeleteBytes(body, "thinking.type")
 	if err != nil {
 		return body
+	}
+	thinking := gjson.GetBytes(updated, "thinking")
+	if thinking.IsObject() && len(thinking.Map()) == 0 {
+		withoutThinking, errDelete := sjson.DeleteBytes(updated, "thinking")
+		if errDelete == nil {
+			return withoutThinking
+		}
 	}
 	return updated
 }

@@ -2,6 +2,7 @@ package responses
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
@@ -156,6 +157,53 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsIncompatibleReasoningSignatu
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_FunctionCallOutputPreservesInputImage(t *testing.T) {
+	const imageB64 = "iVBORw0KGgo="
+	dataURL := "data:image/png;base64," + imageB64
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{
+				"type":"function_call",
+				"call_id":"call_view_image_1",
+				"name":"view_image",
+				"arguments":"{}"
+			},
+			{
+				"type":"function_call_output",
+				"call_id":"call_view_image_1",
+				"output":[
+					{
+						"type":"input_image",
+						"image_url":"` + dataURL + `",
+						"detail":"high"
+					}
+				]
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	toolResult := root.Get("messages.1.content.0")
+	if got := toolResult.Get("type").String(); got != "tool_result" {
+		t.Fatalf("tool_result type = %q, want tool_result. Output: %s", got, string(out))
+	}
+	if got := toolResult.Get("content.0.type").String(); got != "image" {
+		t.Fatalf("tool_result content block type = %q, want image. Output: %s", got, string(out))
+	}
+	if got := toolResult.Get("content.0.source.media_type").String(); got != "image/png" {
+		t.Fatalf("image media_type = %q, want image/png. Output: %s", got, string(out))
+	}
+	if got := toolResult.Get("content.0.source.data").String(); got != imageB64 {
+		t.Fatalf("image data = %q, want raw base64 without data URL prefix", got)
+	}
+	if strings.Contains(toolResult.Get("content").Raw, "data:image") {
+		t.Fatalf("tool_result content must not embed data URL as text. Output: %s", string(out))
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_KeepsToolUseAdjacentToToolResult(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-test",
@@ -199,6 +247,63 @@ func TestConvertOpenAIResponsesRequestToClaude_KeepsToolUseAdjacentToToolResult(
 	}
 	if got := root.Get("messages.2.content.0.tool_use_id").String(); got != "call_00_awGuheXs4aRbtedNK8LE3743" {
 		t.Fatalf("tool_result id = %q, want call_00_awGuheXs4aRbtedNK8LE3743. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_OrphanToolResultBecomesText(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{
+				"type":"function_call_output",
+				"call_id":"missing_call",
+				"output":"stale tool output"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.0.role").String(); got != "user" {
+		t.Fatalf("message role = %q, want user. Output: %s", got, string(out))
+	}
+	if root.Get("messages.0.content.0.type").String() == "tool_result" {
+		t.Fatalf("orphan function_call_output should not become Anthropic tool_result. Output: %s", string(out))
+	}
+	content := root.Get("messages.0.content").String()
+	if content != "[tool_result without adjacent tool_use: missing_call]\nstale tool output" {
+		t.Fatalf("message content = %q, want orphan marker text. Output: %s", content, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_SynthesizesMissingToolResult(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[
+			{
+				"type":"function_call",
+				"call_id":"call_dangling",
+				"name":"read_file",
+				"arguments":"{\"path\":\"README.md\"}"
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.0.content.0.type").String(); got != "tool_use" {
+		t.Fatalf("first message first content type = %q, want tool_use. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.1.content.0.type").String(); got != "tool_result" {
+		t.Fatalf("second message first content type = %q, want synthesized tool_result. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.1.content.0.tool_use_id").String(); got != "call_dangling" {
+		t.Fatalf("synthesized tool_result id = %q, want call_dangling. Output: %s", got, string(out))
+	}
+	if !root.Get("messages.1.content.0.is_error").Bool() {
+		t.Fatalf("synthesized tool_result should be marked is_error. Output: %s", string(out))
 	}
 }
 
@@ -272,4 +377,34 @@ func testGPTResponsesReasoningSignature() string {
 		payload[i] = byte(i)
 	}
 	return base64.URLEncoding.EncodeToString(payload)
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_PreservesContentPartCacheControl(t *testing.T) {
+	inputJSON := `{
+		"model": "gpt-4.1",
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [
+					{"type": "input_text", "text": "cached prefix", "cache_control": {"type": "ephemeral"}},
+					{"type": "input_text", "text": "fresh question"}
+				]
+			}
+		]
+	}`
+
+	result := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-5", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+
+	content := resultJSON.Get("messages.0.content")
+	if !content.IsArray() {
+		t.Fatalf("expected content array when cache_control is present, got %s", result)
+	}
+	if got := content.Get("0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("content.0.cache_control.type = %q, want ephemeral. Output: %s", got, result)
+	}
+	if content.Get("1.cache_control").Exists() {
+		t.Fatalf("content.1 should not have cache_control. Output: %s", result)
+	}
 }

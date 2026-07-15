@@ -14,6 +14,7 @@ import (
 
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -88,7 +89,12 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			messageResult := messageResults[i]
 			messageRole := messageResult.Get("role").String()
 			if messageRole == "system" {
-				messageRole = "developer"
+				if reminderText, ok := translatorcommon.ClaudeMessageSystemReminderText(messageResult.Get("content")); ok {
+					message := []byte(`{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}`)
+					message, _ = sjson.SetBytes(message, "content.0.text", reminderText)
+					template, _ = sjson.SetRawBytes(template, "input.-1", message)
+				}
+				continue
 			}
 
 			newMessage := func() []byte {
@@ -133,9 +139,16 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 					return
 				}
 
-				signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, part.Get("signature").String())
+				rawSignature := part.Get("signature").String()
+				signature, ok := sigcompat.CompatibleSignatureForProvider(sigcompat.SignatureProviderGPT, rawSignature)
 				if !ok {
-					return
+					if !codexClaudeTargetAcceptsGrokSignature(modelName) {
+						return
+					}
+					if _, err := sigcompat.InspectGrokEncryptedContent(rawSignature); err != nil {
+						return
+					}
+					signature = rawSignature
 				}
 
 				flushMessage()
@@ -335,6 +348,11 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 	template, _ = sjson.SetBytes(template, "include", []string{"reasoning.encrypted_content"})
 
 	return template
+}
+
+func codexClaudeTargetAcceptsGrokSignature(modelName string) bool {
+	baseModel := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName))
+	return strings.Contains(baseModel, "grok")
 }
 
 func normalizeCodexServiceTier(result gjson.Result) string {

@@ -42,6 +42,7 @@ func antigravityOpenAIResponseFunctionName(name, fallback string) string {
 //   - []byte: The transformed request data in Antigravity API format
 func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ bool) []byte {
 	rawJSON := inputRawJSON
+	functionNameMap := util.SanitizedFunctionNameMap(rawJSON)
 	// Base envelope (no default thinkingConfig)
 	out := []byte(`{"project":"","request":{"contents":[]},"model":"gemini-2.5-pro"}`)
 
@@ -50,6 +51,8 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 	// Let user-provided generationConfig pass through
 	if genConfig := gjson.GetBytes(rawJSON, "generationConfig"); genConfig.Exists() {
+		out, _ = sjson.SetRawBytes(out, "request.generationConfig", []byte(genConfig.Raw))
+	} else if genConfig := gjson.GetBytes(rawJSON, "generation_config"); genConfig.Exists() {
 		out, _ = sjson.SetRawBytes(out, "request.generationConfig", []byte(genConfig.Raw))
 	}
 
@@ -69,6 +72,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			}
 		}
 	}
+	out = applyOpenAIThinkingCompatibilityToAntigravity(out, rawJSON, modelName)
 
 	// Temperature/top_p/top_k/max_tokens
 	if tr := gjson.GetBytes(rawJSON, "temperature"); tr.Exists() && tr.Type == gjson.Number {
@@ -197,8 +201,8 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							text := item.Get("text").String()
 							if text != "" {
 								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
+								p++
 							}
-							p++
 						case "image_url":
 							imageURL := item.Get("image_url.url").String()
 							if len(imageURL) > 5 {
@@ -260,6 +264,12 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 			} else if role == "assistant" {
 				node := []byte(`{"role":"model","parts":[]}`)
 				p := 0
+				if reasoningContent := m.Get("reasoning_content"); reasoningContent.Type == gjson.String && reasoningContent.String() != "" {
+					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", reasoningContent.String())
+					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thought", true)
+					node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", antigravityFunctionThoughtSignature)
+					p++
+				}
 				if content.Type == gjson.String && content.String() != "" {
 					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
 					p++
@@ -271,8 +281,8 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							text := item.Get("text").String()
 							if text != "" {
 								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
+								p++
 							}
-							p++
 						case "image_url":
 							// If the assistant returned an inline data URL, preserve it for history fidelity.
 							imageURL := item.Get("image_url.url").String()
@@ -299,9 +309,12 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						if tc.Get("type").String() != "function" {
 							continue
 						}
-						fid := tc.Get("id").String()
-						fname := antigravityOpenAIResponseFunctionName(tc.Get("function.name").String(), fid)
-						fargs := tc.Get("function.arguments").String()
+fid := tc.Get("id").String()
+					fname := util.MapSanitizedFunctionName(functionNameMap, tc.Get("function.name").String())
+					if fname == "" {
+						continue
+					}
+					fargs := tc.Get("function.arguments").String()
 						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
 						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
 						if gjson.Valid(fargs) {
@@ -315,34 +328,37 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							fIDs = append(fIDs, fid)
 						}
 					}
-					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+					if p > 0 {
+						out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+					}
 
 					// Append a single tool content combining name + response per function
 					toolNode := []byte(`{"role":"user","parts":[]}`)
 					pp := 0
 					for _, fid := range fIDs {
-						name := antigravityOpenAIResponseFunctionName(tcID2Name[fid], fid)
-						toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
-						toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", name)
-						resp := toolResponses[fid]
-						if resp == "" {
-							resp = "{}"
-						}
-						// Handle non-JSON output gracefully (matches dev branch approach)
-						if resp != "null" {
-							parsed := gjson.Parse(resp)
-							if parsed.Type == gjson.JSON {
-								toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
-							} else {
-								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
+						if name, ok := tcID2Name[fid]; ok {
+							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
+							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", util.MapSanitizedFunctionName(functionNameMap, name))
+							resp := toolResponses[fid]
+							if resp == "" {
+								resp = "{}"
 							}
+							// Handle non-JSON output gracefully (matches dev branch approach)
+							if resp != "null" {
+								parsed := gjson.Parse(resp)
+								if parsed.Type == gjson.JSON {
+									toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
+								} else {
+									toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
+								}
+							}
+							pp++
 						}
-						pp++
 					}
 					if pp > 0 {
 						out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
 					}
-				} else {
+				} else if p > 0 {
 					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 				}
 			}
@@ -398,7 +414,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 						fnRaw = string(fnRawBytes)
 					}
 					fnRawBytes := []byte(fnRaw)
-					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.SanitizeFunctionName(fn.Get("name").String()))
+					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.MapSanitizedFunctionName(functionNameMap, fn.Get("name").String()))
 					fnRaw, _ = sjson.Delete(string(fnRawBytes), "strict")
 					if !hasFunction {
 						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))
@@ -443,6 +459,12 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				urlContextNodes = append(urlContextNodes, urlToolNode)
 			}
 		}
+		if hasFunction {
+			declarations := gjson.GetBytes(functionToolNode, "functionDeclarations")
+			deduplicated := util.DeduplicateFunctionDeclarations([]byte(declarations.Raw))
+			functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", deduplicated)
+			hasFunction = len(gjson.ParseBytes(deduplicated).Array()) > 0
+		}
 		if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
 			toolsNode := []byte("[]")
 			if hasFunction {
@@ -461,7 +483,119 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		}
 	}
 
+	out = applyOpenAIToolChoiceToAntigravity(out, rawJSON, functionNameMap)
 	return common.AttachDefaultSafetySettings(out, "request.safetySettings")
+}
+
+func applyOpenAIToolChoiceToAntigravity(out, rawJSON []byte, functionNameMap map[string]string) []byte {
+	toolChoice := gjson.GetBytes(rawJSON, "tool_choice")
+	if !toolChoice.Exists() {
+		return out
+	}
+
+	mode := ""
+	allowedName := ""
+	if toolChoice.Type == gjson.String {
+		switch strings.ToLower(strings.TrimSpace(toolChoice.String())) {
+		case "none":
+			mode = "NONE"
+		case "auto":
+			mode = "AUTO"
+		case "required", "any":
+			mode = "ANY"
+		}
+	} else if toolChoice.IsObject() && strings.EqualFold(toolChoice.Get("type").String(), "function") {
+		mode = "ANY"
+		allowedName = toolChoice.Get("function.name").String()
+	}
+	if mode == "" {
+		return out
+	}
+
+	out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.mode", mode)
+	if strings.TrimSpace(allowedName) != "" {
+		mappedName := util.MapSanitizedFunctionName(functionNameMap, allowedName)
+		out, _ = sjson.SetBytes(out, "request.toolConfig.functionCallingConfig.allowedFunctionNames", []string{mappedName})
+	}
+	return out
+}
+
+func applyOpenAIThinkingCompatibilityToAntigravity(out []byte, rawJSON []byte, modelName string) []byte {
+	out = normalizeAntigravityOpenAIThinkingConfig(out)
+
+	for _, path := range []string{
+		"thinking.includeThoughts",
+		"thinking.include_thoughts",
+		"reasoning.includeThoughts",
+		"reasoning.include_thoughts",
+	} {
+		if value := gjson.GetBytes(rawJSON, path); value.Exists() {
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", value.Bool())
+		}
+	}
+
+	if exclude := gjson.GetBytes(rawJSON, "reasoning.exclude"); exclude.Exists() {
+		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", !exclude.Bool())
+	}
+
+	if !gjson.GetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts").Exists() && antigravityOpenAIDefaultIncludeThoughts(modelName) {
+		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
+	}
+
+	return normalizeAntigravityOpenAIThinkingConfig(out)
+}
+
+func normalizeAntigravityOpenAIThinkingConfig(out []byte) []byte {
+	for _, prefix := range []string{
+		"request.generationConfig.thinking_config",
+		"request.generationConfig.thinkingConfig",
+	} {
+		if includeThoughts := gjson.GetBytes(out, prefix+".includeThoughts"); includeThoughts.Exists() {
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts.Bool())
+		}
+		if includeThoughts := gjson.GetBytes(out, prefix+".include_thoughts"); includeThoughts.Exists() {
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts.Bool())
+		}
+		if thinkingLevel := gjson.GetBytes(out, prefix+".thinkingLevel"); thinkingLevel.Exists() {
+			out, _ = sjson.SetRawBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel", []byte(thinkingLevel.Raw))
+		}
+		if thinkingLevel := gjson.GetBytes(out, prefix+".thinking_level"); thinkingLevel.Exists() {
+			out, _ = sjson.SetRawBytes(out, "request.generationConfig.thinkingConfig.thinkingLevel", []byte(thinkingLevel.Raw))
+		}
+		if thinkingBudget := gjson.GetBytes(out, prefix+".thinkingBudget"); thinkingBudget.Exists() {
+			out, _ = sjson.SetRawBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", []byte(thinkingBudget.Raw))
+		}
+		if thinkingBudget := gjson.GetBytes(out, prefix+".thinking_budget"); thinkingBudget.Exists() {
+			out, _ = sjson.SetRawBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", []byte(thinkingBudget.Raw))
+		}
+	}
+
+	for _, path := range []string{
+		"request.generationConfig.includeThoughts",
+		"request.generationConfig.include_thoughts",
+	} {
+		if includeThoughts := gjson.GetBytes(out, path); includeThoughts.Exists() {
+			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", includeThoughts.Bool())
+		}
+	}
+
+	for _, path := range []string{
+		"request.generationConfig.thinking_config",
+		"request.generationConfig.thinkingConfig.include_thoughts",
+		"request.generationConfig.thinkingConfig.thinking_level",
+		"request.generationConfig.thinkingConfig.thinking_budget",
+		"request.generationConfig.includeThoughts",
+		"request.generationConfig.include_thoughts",
+	} {
+		out, _ = sjson.DeleteBytes(out, path)
+	}
+
+	return out
+}
+
+func antigravityOpenAIDefaultIncludeThoughts(modelName string) bool {
+	modelName = strings.ToLower(modelName)
+	return strings.Contains(modelName, "gemini-3")
 }
 
 // itoa converts int to string without strconv import for few usages.

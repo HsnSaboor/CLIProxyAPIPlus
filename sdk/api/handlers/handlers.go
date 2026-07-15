@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
@@ -31,6 +32,8 @@ import (
 	"github.com/tiktoken-go/tokenizer"
 	"golang.org/x/net/context"
 )
+
+const statusClientClosedRequest = 499
 
 // ErrorResponse represents a standard error response format for the API.
 // It contains a single ErrorDetail field.
@@ -180,6 +183,9 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	errType := "invalid_request_error"
 	var code string
 	switch status {
+	case statusClientClosedRequest:
+		errType = "invalid_request_error"
+		code = "client_closed_request"
 	case http.StatusUnauthorized:
 		errType = "authentication_error"
 		code = "invalid_api_key"
@@ -192,6 +198,12 @@ func BuildErrorResponseBody(status int, errText string) []byte {
 	case http.StatusNotFound:
 		errType = "invalid_request_error"
 		code = "model_not_found"
+	case http.StatusRequestTimeout:
+		errType = "invalid_request_error"
+		code = "request_timeout"
+	case http.StatusGatewayTimeout:
+		errType = "server_error"
+		code = "gateway_timeout"
 	default:
 		if status >= http.StatusInternalServerError {
 			errType = "server_error"
@@ -293,6 +305,17 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+func addAuthSelectionModelMetadata(meta map[string]any, model string) {
+	if meta == nil {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	meta[coreexecutor.AuthSelectionModelMetadataKey] = model
+}
+
 func setReasoningEffortMetadata(meta map[string]any, handlerType, model string, rawJSON []byte) {
 	if meta == nil {
 		return
@@ -308,7 +331,7 @@ func setServiceTierMetadata(meta map[string]any, rawJSON []byte) {
 	if meta == nil {
 		return
 	}
-	serviceTier := coreusage.DefaultServiceTier
+	serviceTier := coreusage.AutoServiceTier
 	node := gjson.GetBytes(rawJSON, "service_tier")
 	if node.Exists() {
 		value := strings.TrimSpace(node.String())
@@ -694,9 +717,53 @@ func appendAPIResponse(c *gin.Context, data []byte) {
 	c.Set("API_RESPONSE", bytes.Clone(data))
 }
 
+func (h *BaseAPIHandler) recordSuccessfulAPIResponse(ctx context.Context, data []byte) {
+	if h == nil || h.Cfg == nil || !h.Cfg.RequestLog || len(bytes.TrimSpace(data)) == 0 {
+		return
+	}
+	if ctx == nil {
+		return
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return
+	}
+	if existing, exists := ginCtx.Get("API_RESPONSE"); exists {
+		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
+			trimmedData := bytes.TrimSpace(data)
+			if len(trimmedData) > 0 && bytes.Contains(existingBytes, trimmedData) {
+				return
+			}
+		}
+	}
+	appendAPIResponse(ginCtx, data)
+}
+
 func isNotFoundError(err error) bool {
-	se, ok := err.(interface{ StatusCode() int })
-	return ok && se != nil && se.StatusCode() == http.StatusNotFound
+	return statusFromError(err) == http.StatusNotFound
+}
+
+func errorMessageStatus(err error) int {
+	status := statusFromError(err)
+	if status > 0 {
+		return status
+	}
+	if errors.Is(err, context.Canceled) {
+		return statusClientClosedRequest
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusInternalServerError
+}
+
+func headersFromError(err error) http.Header {
+	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+		if hdr := he.Headers(); hdr != nil {
+			return hdr.Clone()
+		}
+	}
+	return nil
 }
 
 // resolveFallbackProvidersForRuntime404 resolves fallback providers when the original model
@@ -728,17 +795,22 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, false, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+		return nil, nil, errMsg
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.executeWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
+	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(entryProtocol), normalizedModel, rawJSON)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
@@ -752,7 +824,7 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 		Payload: cloneBytes(rawJSON),
 	}
 	afterAuthCapture := &requestAfterAuthCapture{}
-		opts := coreexecutor.Options{
+	opts := coreexecutor.Options{
 		Stream:                      false,
 		Alt:                         alt,
 		OriginalRequest:             rawJSON,
@@ -780,24 +852,13 @@ func (h *BaseAPIHandler) executeWithAuthManagerFormats(ctx context.Context, entr
 	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: errorMessageStatus(err), Error: err, Addon: headersFromError(err)}
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, responseProtocol, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	h.recordSuccessfulAPIResponse(ctx, body)
 	return body, responseHeaders, nil
 }
 
@@ -813,14 +874,16 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	if routeDecision.ExecutorPluginID != "" {
 		return h.countWithPluginExecutor(ctx, handlerType, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision)
+	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, false, routeDecision, execOptions)
 	if errMsg != nil {
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
 		return nil, nil, errMsg
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(handlerType, providers)
 	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(handlerType), normalizedModel, rawJSON)
 	setReasoningEffortMetadata(reqMeta, handlerType, normalizedModel, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -833,7 +896,7 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 		Payload: cloneBytes(rawJSON),
 	}
 	afterAuthCapture := &requestAfterAuthCapture{}
-		opts := coreexecutor.Options{
+	opts := coreexecutor.Options{
 		Stream:                      false,
 		Alt:                         alt,
 		OriginalRequest:             rawJSON,
@@ -860,24 +923,13 @@ func (h *BaseAPIHandler) executeCountWithAuthManager(ctx context.Context, handle
 	}
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		return nil, nil, &interfaces.ErrorMessage{StatusCode: errorMessageStatus(err), Error: err, Addon: headersFromError(err)}
 	}
 	executedReq, executedOpts := afterAuthCapture.apply(req, opts)
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, handlerType, normalizedModel, originalRequestedModel, executedOpts, rawResponseHeaders, responseHeaders, executedOpts.OriginalRequest, executedReq.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	h.recordSuccessfulAPIResponse(ctx, body)
 	return body, responseHeaders, nil
 }
 
@@ -896,6 +948,7 @@ func (h *BaseAPIHandler) executeWithPluginExecutor(ctx context.Context, entryPro
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, responseProtocol, modelName, originalRequestedModel, opts, rawResponseHeaders, responseHeaders, opts.OriginalRequest, req.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	h.recordSuccessfulAPIResponse(ctx, body)
 	return body, responseHeaders, nil
 }
 
@@ -914,12 +967,14 @@ func (h *BaseAPIHandler) countWithPluginExecutor(ctx context.Context, handlerTyp
 	rawResponseHeaders := cloneHeader(resp.Headers)
 	responseHeaders := downstreamHeadersFromExecutor(rawResponseHeaders, PassthroughHeadersEnabled(h.Cfg))
 	body, responseHeaders := h.applyResponseInterceptors(ctx, handlerType, modelName, originalRequestedModel, opts, rawResponseHeaders, responseHeaders, opts.OriginalRequest, req.Payload, resp.Payload, http.StatusOK, execOptions.SkipInterceptorPluginID)
+	h.recordSuccessfulAPIResponse(ctx, body)
 	return body, responseHeaders, nil
 }
 
 func (h *BaseAPIHandler) pluginExecutorRequest(ctx context.Context, entryProtocol, responseProtocol, modelName, originalRequestedModel string, rawJSON []byte, alt string, stream bool, execOptions modelExecutionOptions) (coreexecutor.Request, coreexecutor.Options) {
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, modelName, rawJSON)
 	setServiceTierMetadata(reqMeta, rawJSON)
@@ -970,19 +1025,7 @@ func (h *BaseAPIHandler) applyRequestInterceptorsAfterPluginExecutorRoute(ctx co
 }
 
 func executionErrorMessage(err error) *interfaces.ErrorMessage {
-	status := http.StatusInternalServerError
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-		if code := se.StatusCode(); code > 0 {
-			status = code
-		}
-	}
-	var addon http.Header
-	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-		if hdr := he.Headers(); hdr != nil {
-			addon = hdr.Clone()
-		}
-	}
-	return &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+	return &interfaces.ErrorMessage{StatusCode: errorMessageStatus(err), Error: err, Addon: headersFromError(err)}
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -1147,10 +1190,16 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	originalRequestedModel := modelName
 	routeDecision := h.applyModelRouter(ctx, entryProtocol, modelName, rawJSON, true, execOptions)
 	responseProtocol := modelExecutionResponseProtocol(entryProtocol, exitProtocol)
+	if errMsg := validateNativeInteractionsExecution(entryProtocol, execOptions, routeDecision); errMsg != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
+	}
 	if routeDecision.ExecutorPluginID != "" {
 		return h.streamWithPluginExecutor(ctx, entryProtocol, responseProtocol, modelName, originalRequestedModel, rawJSON, alt, routeDecision.ExecutorPluginID, execOptions)
 	}
-	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision)
+	providers, normalizedModel, errMsg := h.providersForExecution(modelName, originalRequestedModel, allowImageModel, routeDecision, execOptions)
 	if errMsg != nil {
 		attachUnknownProviderUpstreamHint(ctx, modelName, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -1158,9 +1207,11 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		close(errChan)
 		return nil, nil, errChan
 	}
+	providers = adjustExecutionProvidersForEntryProtocol(entryProtocol, providers)
 	attachRouteFallbackToGinContext(ctx, modelName, normalizedModel)
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = originalRequestedModel
+	addAuthSelectionModelMetadata(reqMeta, execOptions.AuthSelectionModel)
 	maybeAttachEstimatedInputTokens(reqMeta, sdktranslator.FromString(entryProtocol), normalizedModel, rawJSON)
 	addModelExecutionSourceMetadata(reqMeta, execOptions.InternalSource)
 	setReasoningEffortMetadata(reqMeta, entryProtocol, normalizedModel, rawJSON)
@@ -1174,7 +1225,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 		Payload: cloneBytes(rawJSON),
 	}
 	afterAuthCapture := &requestAfterAuthCapture{}
-		opts := coreexecutor.Options{
+	opts := coreexecutor.Options{
 		Stream:                      true,
 		Alt:                         alt,
 		OriginalRequest:             rawJSON,
@@ -1203,19 +1254,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	if err != nil {
 		err = enrichAuthSelectionError(err, providers, normalizedModel)
 		errChan := make(chan *interfaces.ErrorMessage, 1)
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
-		}
-		var addon http.Header
-		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-			if hdr := he.Headers(); hdr != nil {
-				addon = hdr.Clone()
-			}
-		}
-		errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
+		errChan <- &interfaces.ErrorMessage{StatusCode: errorMessageStatus(err), Error: err, Addon: headersFromError(err)}
 		close(errChan)
 		return nil, nil, errChan
 	}
@@ -1388,19 +1427,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 						}
 					}
 
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
-					}
-					var addon http.Header
-					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
-						if hdr := he.Headers(); hdr != nil {
-							addon = hdr.Clone()
-						}
-					}
-					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
+					_ = sendErr(&interfaces.ErrorMessage{StatusCode: errorMessageStatus(streamErr), Error: streamErr, Addon: headersFromError(streamErr)})
 					return
 				}
 				if len(chunk.Payload) > 0 {
@@ -1484,6 +1511,68 @@ func validateSSEDataJSON(chunk []byte) error {
 	return nil
 }
 
+func preferExecutionProvider(providers []string, preferred string) []string {
+	preferred = strings.ToLower(strings.TrimSpace(preferred))
+	if preferred == "" || len(providers) < 2 {
+		return providers
+	}
+	preferredIndex := -1
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) == preferred {
+			preferredIndex = i
+			break
+		}
+	}
+	if preferredIndex <= 0 {
+		return providers
+	}
+	out := make([]string, 0, len(providers))
+	out = append(out, providers[preferredIndex])
+	out = append(out, providers[:preferredIndex]...)
+	out = append(out, providers[preferredIndex+1:]...)
+	return out
+}
+
+func adjustExecutionProvidersForEntryProtocol(entryProtocol string, providers []string) []string {
+	if entryProtocol == Interactions {
+		return preferExecutionProvider(providers, GeminiInteractions)
+	}
+	if supportsNativeInteractionsEntryProtocol(entryProtocol) {
+		return providers
+	}
+	return excludeExecutionProvider(providers, GeminiInteractions)
+}
+
+func supportsNativeInteractionsEntryProtocol(entryProtocol string) bool {
+	switch entryProtocol {
+	case Interactions, OpenAI, OpenaiResponse, Claude, Gemini:
+		return true
+	default:
+		return false
+	}
+}
+
+func excludeExecutionProvider(providers []string, excluded string) []string {
+	excluded = strings.ToLower(strings.TrimSpace(excluded))
+	if excluded == "" || len(providers) == 0 {
+		return providers
+	}
+	excludedIndex := -1
+	for i := range providers {
+		if strings.ToLower(strings.TrimSpace(providers[i])) == excluded {
+			excludedIndex = i
+			break
+		}
+	}
+	if excludedIndex == -1 {
+		return providers
+	}
+	out := make([]string, 0, len(providers)-1)
+	out = append(out, providers[:excludedIndex]...)
+	out = append(out, providers[excludedIndex+1:]...)
+	return out
+}
+
 func statusFromError(err error) int {
 	if err == nil {
 		return 0
@@ -1500,10 +1589,48 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	return h.getRequestDetailsWithOptions(modelName, false)
 }
 
+func validateNativeInteractionsExecution(entryProtocol string, execOptions modelExecutionOptions, routeDecision modelRouteDecision) *interfaces.ErrorMessage {
+	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
+	if forcedProvider == "" || entryProtocol != Interactions {
+		return nil
+	}
+	if routeDecision.ExecutorPluginID != "" {
+		return nativeInteractionsExecutionError()
+	}
+	if routeProvider := strings.ToLower(strings.TrimSpace(routeDecision.Provider)); routeProvider != "" && routeProvider != forcedProvider {
+		return nativeInteractionsExecutionError()
+	}
+	return nil
+}
+
+func nativeInteractionsExecutionError() *interfaces.ErrorMessage {
+	return &interfaces.ErrorMessage{
+		StatusCode: http.StatusBadRequest,
+		Error:      fmt.Errorf("agent is only supported for native interactions execution"),
+	}
+}
+
 // providersForExecution resolves the providers and normalized model for a request. When a model
 // router selected a built-in provider, it skips model->provider resolution and uses the router's
 // provider (with an optional target model); otherwise it falls back to the registry-based path.
-func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision) ([]string, string, *interfaces.ErrorMessage) {
+func (h *BaseAPIHandler) providersForExecution(modelName, originalRequestedModel string, allowImageModel bool, routeDecision modelRouteDecision, execOptions modelExecutionOptions) ([]string, string, *interfaces.ErrorMessage) {
+	forcedProvider := strings.ToLower(strings.TrimSpace(execOptions.ForcedProvider))
+	if forcedProvider != "" {
+		if routeDecision.ExecutorPluginID != "" {
+			return nil, "", nativeInteractionsExecutionError()
+		}
+		if routeProvider := strings.ToLower(strings.TrimSpace(routeDecision.Provider)); routeProvider != "" && routeProvider != forcedProvider {
+			return nil, "", nativeInteractionsExecutionError()
+		}
+		normalizedModel := strings.TrimSpace(modelName)
+		if normalizedModel == "" {
+			normalizedModel = strings.TrimSpace(originalRequestedModel)
+		}
+		if errMsg := h.validateImageOnlyModel(normalizedModel, allowImageModel); errMsg != nil {
+			return nil, "", errMsg
+		}
+		return []string{forcedProvider}, normalizedModel, nil
+	}
 	if routeDecision.Provider != "" {
 		normalizedModel := originalRequestedModel
 		if routeDecision.Model != "" {
@@ -1657,11 +1784,11 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 			return fbProviders, fbModel, nil
 		}
 		log.WithFields(log.Fields{
-			"requested_model":    modelName,
-			"base_model":         baseModel,
-			"resolved_model":     resolvedModelName,
-			"fallback_chain":     h.AuthManager.FallbackChain(),
-			"fallback_models":    h.AuthManager.FallbackModels(),
+			"requested_model": modelName,
+			"base_model":      baseModel,
+			"resolved_model":  resolvedModelName,
+			"fallback_chain":  h.AuthManager.FallbackChain(),
+			"fallback_models": h.AuthManager.FallbackModels(),
 		}).Warn("route fallback attempted but no providers found for any fallback model")
 	}
 
@@ -1811,7 +1938,7 @@ func (h *BaseAPIHandler) validateImageOnlyModel(modelName string, allowImageMode
 
 func isOpenAIImageOnlyModel(model string) bool {
 	switch strings.ToLower(strings.TrimSpace(routeModelBaseName(model))) {
-	case "gpt-image-1.5", "gpt-image-2":
+	case "gpt-image-1.5", "gpt-image-2", "grok-imagine-image", "grok-imagine-image-quality":
 		return true
 	default:
 		return false

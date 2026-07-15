@@ -3,6 +3,9 @@ package executor
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/tidwall/gjson"
 )
 
 func TestNormalizeDeltaContentArray(t *testing.T) {
@@ -120,6 +123,59 @@ func TestNormalizeDeltaContentArray(t *testing.T) {
 			t.Errorf("content = %q, want %q", s, "hello world")
 		}
 	})
+}
+
+func TestStripOpenAICompatProviderUnsupportedFields_Kimi(t *testing.T) {
+	payload := []byte(`{"model":"kimi-k2.5","messages":[],"reasoning_effort":"high","reasoning":{"enabled":true},"reasoningSummary":"auto","include":["reasoning"],"verbosity":"detailed"}`)
+	compat := &config.OpenAICompatibility{Name: "kimi", BaseURL: "https://api.moonshot.cn/v1"}
+
+	got := stripOpenAICompatProviderUnsupportedFields("openai-compatible-kimi", compat, payload)
+	for _, field := range []string{"reasoning_effort", "reasoning", "reasoningSummary", "include", "verbosity"} {
+		if gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("%s should be removed for OpenAI-compatible Kimi provider, got %s", field, got)
+		}
+	}
+	if model := gjson.GetBytes(got, "model").String(); model != "kimi-k2.5" {
+		t.Fatalf("model = %q, want kimi-k2.5; payload=%s", model, got)
+	}
+}
+
+func TestStripOpenAICompatProviderUnsupportedFields_NonKimiUnchanged(t *testing.T) {
+	payload := []byte(`{"model":"glm-5","messages":[],"reasoning_effort":"max"}`)
+	compat := &config.OpenAICompatibility{Name: "glm", BaseURL: "https://glm.example/v1"}
+
+	got := stripOpenAICompatProviderUnsupportedFields("openai-compatible-glm", compat, payload)
+	if string(got) != string(payload) {
+		t.Fatalf("non-Kimi compat payload changed: got %s want %s", got, payload)
+	}
+}
+
+func TestOmitMiniMaxM3ThinkingType_ForResolvedModel(t *testing.T) {
+	tests := []struct {
+		name         string
+		model        string
+		payload      string
+		wantType     string
+		wantThinking bool
+	}{
+		{name: "adaptive", model: "minimaxai/minimax-m3", payload: `{"thinking":{"type":"adaptive"}}`},
+		{name: "disabled", model: "minimax-m3", payload: `{"thinking":{"type":"disabled"}}`},
+		{name: "preserve other thinking fields", model: "vendor/minimax-m3-preview", payload: `{"thinking":{"type":"adaptive","budget_tokens":8192}}`, wantThinking: true},
+		{name: "missing", model: "vendor/minimax-m3-preview", payload: `{}`},
+		{name: "other model", model: "minimax-m2", payload: `{"thinking":{"type":"adaptive"}}`, wantType: "adaptive", wantThinking: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := omitMiniMaxM3ThinkingType(tt.model, []byte(tt.payload))
+			if thinkingType := gjson.GetBytes(got, "thinking.type").String(); thinkingType != tt.wantType {
+				t.Fatalf("thinking.type = %q, want %q; payload=%s", thinkingType, tt.wantType, got)
+			}
+			if thinkingExists := gjson.GetBytes(got, "thinking").Exists(); thinkingExists != tt.wantThinking {
+				t.Fatalf("thinking exists = %t, want %t; payload=%s", thinkingExists, tt.wantThinking, got)
+			}
+		})
+	}
 }
 
 func TestFixMistralMessageOrder(t *testing.T) {

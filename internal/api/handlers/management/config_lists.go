@@ -279,6 +279,167 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 	c.JSON(400, gin.H{"error": "missing api-key or index"})
 }
 
+// interactions-api-key: []GeminiKey
+func (h *Handler) GetInteractionsKeys(c *gin.Context) {
+	c.JSON(200, gin.H{"interactions-api-key": h.interactionsKeysWithAuthIndex()})
+}
+func (h *Handler) PutInteractionsKeys(c *gin.Context) {
+	data, errRead := c.GetRawData()
+	if errRead != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.GeminiKey
+	errUnmarshal := json.Unmarshal(data, &arr)
+	if errUnmarshal != nil {
+		var obj struct {
+			Items []config.GeminiKey `json:"items"`
+		}
+		errObjUnmarshal := json.Unmarshal(data, &obj)
+		if errObjUnmarshal != nil || len(obj.Items) == 0 {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		arr = obj.Items
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.InteractionsKey = append([]config.GeminiKey(nil), arr...)
+	h.cfg.SanitizeInteractionsKeys()
+	h.persistLocked(c)
+}
+func (h *Handler) PatchInteractionsKey(c *gin.Context) {
+	type geminiKeyPatch struct {
+		APIKey         *string            `json:"api-key"`
+		Prefix         *string            `json:"prefix"`
+		BaseURL        *string            `json:"base-url"`
+		ProxyURL       *string            `json:"proxy-url"`
+		Headers        *map[string]string `json:"headers"`
+		ExcludedModels *[]string          `json:"excluded-models"`
+	}
+	var body struct {
+		Index *int            `json:"index"`
+		Match *string         `json:"match"`
+		Value *geminiKeyPatch `json:"value"`
+	}
+	errBind := c.ShouldBindJSON(&body)
+	if errBind != nil || body.Value == nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	targetIndex := -1
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.InteractionsKey) {
+		targetIndex = *body.Index
+	}
+	if targetIndex == -1 && body.Match != nil {
+		match := strings.TrimSpace(*body.Match)
+		if match != "" {
+			for i := range h.cfg.InteractionsKey {
+				if h.cfg.InteractionsKey[i].APIKey == match {
+					targetIndex = i
+					break
+				}
+			}
+		}
+	}
+	if targetIndex == -1 {
+		c.JSON(404, gin.H{"error": "item not found"})
+		return
+	}
+
+	entry := h.cfg.InteractionsKey[targetIndex]
+	if body.Value.APIKey != nil {
+		trimmed := strings.TrimSpace(*body.Value.APIKey)
+		if trimmed == "" {
+			h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:targetIndex], h.cfg.InteractionsKey[targetIndex+1:]...)
+			h.cfg.SanitizeInteractionsKeys()
+			h.persistLocked(c)
+			return
+		}
+		entry.APIKey = trimmed
+	}
+	if body.Value.Prefix != nil {
+		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+	}
+	if body.Value.BaseURL != nil {
+		entry.BaseURL = strings.TrimSpace(*body.Value.BaseURL)
+	}
+	if body.Value.ProxyURL != nil {
+		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.Headers != nil {
+		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.ExcludedModels != nil {
+		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	h.cfg.InteractionsKey[targetIndex] = entry
+	h.cfg.SanitizeInteractionsKeys()
+	h.persistLocked(c)
+}
+
+func (h *Handler) DeleteInteractionsKey(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.GeminiKey, 0, len(h.cfg.InteractionsKey))
+			for _, v := range h.cfg.InteractionsKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
+				out = append(out, v)
+			}
+			if len(out) != len(h.cfg.InteractionsKey) {
+				h.cfg.InteractionsKey = out
+				h.cfg.SanitizeInteractionsKeys()
+				h.persistLocked(c)
+			} else {
+				c.JSON(404, gin.H{"error": "item not found"})
+			}
+			return
+		}
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.InteractionsKey {
+			if strings.TrimSpace(h.cfg.InteractionsKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount == 0 {
+			c.JSON(404, gin.H{"error": "item not found"})
+			return
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:matchIndex], h.cfg.InteractionsKey[matchIndex+1:]...)
+		h.cfg.SanitizeInteractionsKeys()
+		h.persistLocked(c)
+		return
+	}
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
+		if errScan == nil && idx >= 0 && idx < len(h.cfg.InteractionsKey) {
+			h.cfg.InteractionsKey = append(h.cfg.InteractionsKey[:idx], h.cfg.InteractionsKey[idx+1:]...)
+			h.cfg.SanitizeInteractionsKeys()
+			h.persistLocked(c)
+			return
+		}
+	}
+	c.JSON(400, gin.H{"error": "missing api-key or index"})
+}
+
 // claude-api-key: []ClaudeKey
 func (h *Handler) GetClaudeKeys(c *gin.Context) {
 	c.JSON(200, gin.H{"claude-api-key": h.claudeKeysWithAuthIndex()})
@@ -474,14 +635,15 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Prefix        *string                             `json:"prefix"`
-		Disabled      *bool                               `json:"disabled"`
-		BaseURL       *string                             `json:"base-url"`
-		BillingClass  *string                             `json:"billing-class"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		Name           *string                             `json:"name"`
+		Prefix         *string                             `json:"prefix"`
+		Disabled       *bool                               `json:"disabled"`
+		DisableCooling *bool                               `json:"disable-cooling"`
+		BaseURL        *string                             `json:"base-url"`
+		BillingClass   *string                             `json:"billing-class"`
+		APIKeyEntries  *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models         *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers        *map[string]string                  `json:"headers"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -522,6 +684,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.Disabled != nil {
 		entry.Disabled = *body.Value.Disabled
+	}
+	if body.Value.DisableCooling != nil {
+		entry.DisableCooling = *body.Value.DisableCooling
 	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
@@ -1143,12 +1308,11 @@ func (h *Handler) PutCommandCodeKeys(c *gin.Context) {
 		}
 		arr = obj.Items
 	}
-	// Filter out commandcode entries with empty base-url (treat as removed)
 	filtered := make([]config.CommandCodeKey, 0, len(arr))
 	for i := range arr {
 		entry := arr[i]
 		normalizeCommandCodeKey(&entry)
-		if entry.BaseURL == "" {
+		if entry.APIKey == "" {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -1390,9 +1554,9 @@ func (h *Handler) PatchMistralKey(c *gin.Context) {
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
 		if trimmed == "" {
-h.cfg.MistralKey = append(h.cfg.MistralKey[:targetIndex], h.cfg.MistralKey[targetIndex+1:]...)
-		h.cfg.SanitizeMistralKeys()
-		h.persistLocked(c)
+			h.cfg.MistralKey = append(h.cfg.MistralKey[:targetIndex], h.cfg.MistralKey[targetIndex+1:]...)
+			h.cfg.SanitizeMistralKeys()
+			h.persistLocked(c)
 			return
 		}
 		entry.BaseURL = trimmed
@@ -1465,6 +1629,184 @@ func (h *Handler) DeleteMistralKey(c *gin.Context) {
 		if err == nil && idx >= 0 && idx < len(h.cfg.MistralKey) {
 			h.cfg.MistralKey = append(h.cfg.MistralKey[:idx], h.cfg.MistralKey[idx+1:]...)
 			h.cfg.SanitizeMistralKeys()
+			h.persistLocked(c)
+			return
+		}
+	}
+	c.JSON(400, gin.H{"error": "missing api-key or index"})
+}
+
+// xai-api-key: []XAIKey
+func (h *Handler) GetXAIKeys(c *gin.Context) {
+	c.JSON(200, gin.H{"xai-api-key": h.xaiKeysWithAuthIndex()})
+}
+
+func (h *Handler) PutXAIKeys(c *gin.Context) {
+	data, errRead := c.GetRawData()
+	if errRead != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	var arr []config.XAIKey
+	if errUnmarshal := json.Unmarshal(data, &arr); errUnmarshal != nil {
+		var obj struct {
+			Items []config.XAIKey `json:"items"`
+		}
+		if errObject := json.Unmarshal(data, &obj); errObject != nil || len(obj.Items) == 0 {
+			c.JSON(400, gin.H{"error": "invalid body"})
+			return
+		}
+		arr = obj.Items
+	}
+	filtered := make([]config.XAIKey, 0, len(arr))
+	for i := range arr {
+		entry := arr[i]
+		normalizeCodexKey(&entry)
+		if entry.BaseURL == "" {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.XAIKey = filtered
+	h.cfg.SanitizeXAIKeys()
+	h.persistLocked(c)
+}
+
+func (h *Handler) PatchXAIKey(c *gin.Context) {
+	type xaiKeyPatch struct {
+		APIKey         *string            `json:"api-key"`
+		Priority       *int               `json:"priority"`
+		Prefix         *string            `json:"prefix"`
+		BaseURL        *string            `json:"base-url"`
+		Websockets     *bool              `json:"websockets"`
+		ProxyURL       *string            `json:"proxy-url"`
+		Models         *[]config.XAIModel `json:"models"`
+		Headers        *map[string]string `json:"headers"`
+		ExcludedModels *[]string          `json:"excluded-models"`
+		DisableCooling *bool              `json:"disable-cooling"`
+	}
+	var body struct {
+		Index *int         `json:"index"`
+		Match *string      `json:"match"`
+		Value *xaiKeyPatch `json:"value"`
+	}
+	if errBind := c.ShouldBindJSON(&body); errBind != nil || body.Value == nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	targetIndex := -1
+	if body.Index != nil && *body.Index >= 0 && *body.Index < len(h.cfg.XAIKey) {
+		targetIndex = *body.Index
+	}
+	if targetIndex == -1 && body.Match != nil {
+		match := strings.TrimSpace(*body.Match)
+		for i := range h.cfg.XAIKey {
+			if h.cfg.XAIKey[i].APIKey == match {
+				targetIndex = i
+				break
+			}
+		}
+	}
+	if targetIndex == -1 {
+		c.JSON(404, gin.H{"error": "item not found"})
+		return
+	}
+
+	entry := h.cfg.XAIKey[targetIndex]
+	if body.Value.APIKey != nil {
+		entry.APIKey = strings.TrimSpace(*body.Value.APIKey)
+	}
+	if body.Value.Priority != nil {
+		entry.Priority = *body.Value.Priority
+	}
+	if body.Value.Prefix != nil {
+		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+	}
+	if body.Value.BaseURL != nil {
+		trimmed := strings.TrimSpace(*body.Value.BaseURL)
+		if trimmed == "" {
+			h.cfg.XAIKey = append(h.cfg.XAIKey[:targetIndex], h.cfg.XAIKey[targetIndex+1:]...)
+			h.cfg.SanitizeXAIKeys()
+			h.persistLocked(c)
+			return
+		}
+		entry.BaseURL = trimmed
+	}
+	if body.Value.Websockets != nil {
+		entry.Websockets = *body.Value.Websockets
+	}
+	if body.Value.ProxyURL != nil {
+		entry.ProxyURL = strings.TrimSpace(*body.Value.ProxyURL)
+	}
+	if body.Value.Models != nil {
+		entry.Models = append([]config.XAIModel(nil), (*body.Value.Models)...)
+	}
+	if body.Value.Headers != nil {
+		entry.Headers = config.NormalizeHeaders(*body.Value.Headers)
+	}
+	if body.Value.ExcludedModels != nil {
+		entry.ExcludedModels = config.NormalizeExcludedModels(*body.Value.ExcludedModels)
+	}
+	if body.Value.DisableCooling != nil {
+		entry.DisableCooling = *body.Value.DisableCooling
+	}
+	normalizeCodexKey(&entry)
+	h.cfg.XAIKey[targetIndex] = entry
+	h.cfg.SanitizeXAIKeys()
+	h.persistLocked(c)
+}
+
+func (h *Handler) DeleteXAIKey(c *gin.Context) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.XAIKey, 0, len(h.cfg.XAIKey))
+			for _, entry := range h.cfg.XAIKey {
+				if strings.TrimSpace(entry.APIKey) == val && strings.TrimSpace(entry.BaseURL) == base {
+					continue
+				}
+				out = append(out, entry)
+			}
+			h.cfg.XAIKey = out
+			h.cfg.SanitizeXAIKeys()
+			h.persistLocked(c)
+			return
+		}
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.XAIKey {
+			if strings.TrimSpace(h.cfg.XAIKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.XAIKey = append(h.cfg.XAIKey[:matchIndex], h.cfg.XAIKey[matchIndex+1:]...)
+		}
+		h.cfg.SanitizeXAIKeys()
+		h.persistLocked(c)
+		return
+	}
+	if idxStr := c.Query("index"); idxStr != "" {
+		var idx int
+		_, errScan := fmt.Sscanf(idxStr, "%d", &idx)
+		if errScan == nil && idx >= 0 && idx < len(h.cfg.XAIKey) {
+			h.cfg.XAIKey = append(h.cfg.XAIKey[:idx], h.cfg.XAIKey[idx+1:]...)
+			h.cfg.SanitizeXAIKeys()
 			h.persistLocked(c)
 			return
 		}

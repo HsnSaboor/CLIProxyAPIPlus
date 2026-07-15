@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
@@ -103,9 +105,11 @@ type Service struct {
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
 
-	homeClient       *home.Client
-	homeCancel       context.CancelFunc
-	homeLogForwarder *logging.HomeAppLogForwarder
+	homeClient        *home.Client
+	homeCancel        context.CancelFunc
+	homeLogForwarder  *logging.HomeAppLogForwarder
+	homePluginSyncMu  sync.Mutex
+	homePluginSyncKey string
 }
 
 const (
@@ -370,12 +374,7 @@ func modelRegistrationCategory(auth *coreauth.Auth) string {
 		provider = "unknown"
 	}
 
-	authKind := strings.ToLower(strings.TrimSpace(auth.Attributes["auth_kind"]))
-	if authKind == "" {
-		if kind, _ := auth.AccountInfo(); strings.EqualFold(kind, "api_key") {
-			authKind = "apikey"
-		}
-	}
+	authKind := auth.AuthKind()
 	if authKind == "" {
 		return provider
 	}
@@ -973,7 +972,8 @@ func baselineExecutorAuths() []*coreauth.Auth {
 	providers := []string{
 		"codex",
 		"claude",
-		"gemini",
+		constant.Gemini,
+		constant.GeminiInteractions,
 		"vertex",
 		"aistudio",
 		"antigravity",
@@ -1049,8 +1049,10 @@ func (s *Service) registerExecutorForAuth(a *coreauth.Auth, forceReplace bool) {
 		return
 	}
 	switch strings.ToLower(a.Provider) {
-	case "gemini":
+	case constant.Gemini:
 		s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
+	case constant.GeminiInteractions:
+		s.coreManager.RegisterExecutor(executor.NewGeminiInteractionsExecutor(s.cfg))
 	case "vertex":
 		s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
 	case "aistudio":
@@ -1223,12 +1225,7 @@ func (s *Service) tryRegisterPluginModelsForAuth(ctx context.Context, a *coreaut
 	if providerKey == "" {
 		providerKey = strings.ToLower(strings.TrimSpace(provider))
 	}
-	activeAuthKind := strings.ToLower(strings.TrimSpace(activeAuth.Attributes["auth_kind"]))
-	if activeAuthKind == "" {
-		if kind, _ := activeAuth.AccountInfo(); strings.EqualFold(kind, "api_key") {
-			activeAuthKind = "apikey"
-		}
-	}
+	activeAuthKind := activeAuth.AuthKind()
 	activeExcluded := s.oauthExcludedModels(providerKey, activeAuthKind)
 	if a == activeAuth && len(activeExcluded) == 0 {
 		activeExcluded = excluded
@@ -1493,10 +1490,24 @@ func (s *Service) applyHomeOverlayContext(ctx context.Context, remoteCfg *config
 	forceHomeRuntimeConfig(&merged)
 
 	logHomeConfigChanges(baseCfg, &merged)
-	if errSync := s.syncHomePlugins(ctx, &merged); errSync != nil {
-		return errSync
+	report, syncKey, didSync, errSync := s.syncHomePlugins(ctx, &merged)
+	if didSync {
+		if errSync != nil {
+			log.Warnf("failed to sync home plugins: %v", errSync)
+		}
 	}
 	s.applyConfigUpdate(&merged)
+	if didSync {
+		errLoad := homeplugins.MarkLoadResults(&report, s.pluginHost)
+		if errLoad != nil {
+			log.Warnf("failed to load home plugins after config update: %v", errLoad)
+		}
+		s.reportHomePluginStatus(ctx, &merged, report)
+		if errSync == nil && errLoad == nil {
+			s.markHomePluginsSynced(syncKey)
+		}
+	}
+	s.processHomePluginTasks(ctx, &merged)
 	return nil
 }
 
@@ -1999,12 +2010,7 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		GlobalModelRegistry().UnregisterClient(a.ID)
 		return
 	}
-	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
-	if authKind == "" {
-		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
-			authKind = "apikey"
-		}
-	}
+	authKind := a.AuthKind()
 	// Unregister legacy client ID (if present) to avoid double counting
 	if a.Runtime != nil {
 		if idGetter, ok := a.Runtime.(interface{ GetClientID() string }); ok {
@@ -2031,9 +2037,20 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	}
 	var models []*ModelInfo
 	switch provider {
-	case "gemini":
+	case constant.Gemini:
 		models = registry.GetGeminiModels()
 		if entry := s.resolveConfigGeminiKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildGeminiConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
+		models = applyExcludedModels(models, excluded)
+	case constant.GeminiInteractions:
+		models = registry.GetGeminiModels()
+		if entry := s.resolveConfigInteractionsKey(a); entry != nil {
 			if len(entry.Models) > 0 {
 				models = buildGeminiConfigModels(entry)
 			}
@@ -2070,6 +2087,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
+		}
+		if authKind != "apikey" {
+			models = mergeClaudeFetchedModels(models, s.fetchClaudeModelsForAuth(ctx, a))
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
@@ -2125,6 +2145,14 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 		models = applyExcludedModels(models, excluded)
 	case "xai":
 		models = registry.GetXAIModels()
+		if entry := s.resolveConfigXAIKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildXAIConfigModels(entry)
+			}
+			if authKind == "apikey" {
+				excluded = entry.ExcludedModels
+			}
+		}
 		models = applyExcludedModels(models, excluded)
 	case "cursor":
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -2364,6 +2392,20 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 }
 
 func (s *Service) resolveConfigGeminiKey(auth *coreauth.Auth) *config.GeminiKey {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return s.resolveConfigGeminiKeyEntry(auth, s.cfg.GeminiKey)
+}
+
+func (s *Service) resolveConfigInteractionsKey(auth *coreauth.Auth) *config.GeminiKey {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return s.resolveConfigGeminiKeyEntry(auth, s.cfg.InteractionsKey)
+}
+
+func (s *Service) resolveConfigGeminiKeyEntry(auth *coreauth.Auth, entries []config.GeminiKey) *config.GeminiKey {
 	if auth == nil || s.cfg == nil {
 		return nil
 	}
@@ -2372,8 +2414,8 @@ func (s *Service) resolveConfigGeminiKey(auth *coreauth.Auth) *config.GeminiKey 
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.GeminiKey {
-		entry := &s.cfg.GeminiKey[i]
+	for i := range entries {
+		entry := &entries[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
@@ -2424,7 +2466,21 @@ func (s *Service) resolveConfigVertexCompatKey(auth *coreauth.Auth) *config.Vert
 }
 
 func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
-	if auth == nil || s.cfg == nil {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return resolveConfigCodexStyleKey(auth, s.cfg.CodexKey)
+}
+
+func (s *Service) resolveConfigXAIKey(auth *coreauth.Auth) *config.XAIKey {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	return resolveConfigCodexStyleKey(auth, s.cfg.XAIKey)
+}
+
+func resolveConfigCodexStyleKey(auth *coreauth.Auth, entries []config.CodexKey) *config.CodexKey {
+	if auth == nil {
 		return nil
 	}
 	var attrKey, attrBase string
@@ -2432,8 +2488,8 @@ func (s *Service) resolveConfigCodexKey(auth *coreauth.Auth) *config.CodexKey {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
 	}
-	for i := range s.cfg.CodexKey {
-		entry := &s.cfg.CodexKey[i]
+	for i := range entries {
+		entry := &entries[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
@@ -2612,6 +2668,34 @@ func matchWildcard(pattern, value string) bool {
 type modelEntry interface {
 	GetName() string
 	GetAlias() string
+	GetDisplayName() string
+}
+
+func buildConfiguredModelInfo(model modelEntry, ownedBy, modelType string, created int64, fallbackDisplayName string, userDefined bool) *ModelInfo {
+	name := strings.TrimSpace(model.GetName())
+	alias := strings.TrimSpace(model.GetAlias())
+	if alias == "" {
+		alias = name
+	}
+	if alias == "" {
+		return nil
+	}
+	displayName := strings.TrimSpace(model.GetDisplayName())
+	if displayName == "" {
+		displayName = fallbackDisplayName
+	}
+	if displayName == "" {
+		displayName = alias
+	}
+	return &ModelInfo{
+		ID:          alias,
+		Object:      "model",
+		Created:     created,
+		OwnedBy:     ownedBy,
+		Type:        modelType,
+		DisplayName: displayName,
+		UserDefined: userDefined,
+	}
 }
 
 func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []*ModelInfo {
@@ -2622,33 +2706,47 @@ func buildOpenAICompatibilityConfigModels(compat *config.OpenAICompatibility) []
 	models := make([]*ModelInfo, 0, len(compat.Models))
 	for i := range compat.Models {
 		model := compat.Models[i]
-		modelID := strings.TrimSpace(model.Alias)
-		if modelID == "" {
-			modelID = strings.TrimSpace(model.Name)
-		}
-		if modelID == "" {
-			continue
-		}
 		modelType := "openai-compatibility"
 		if model.Image {
 			modelType = registry.OpenAIImageModelType
+		}
+		info := buildConfiguredModelInfo(model, compat.Name, modelType, now, strings.TrimSpace(model.Alias), false)
+		if info == nil {
+			continue
 		}
 		thinking := model.Thinking
 		if thinking == nil && !model.Image {
 			thinking = &registry.ThinkingSupport{Levels: []string{"low", "medium", "high"}}
 		}
-		models = append(models, &ModelInfo{
-			ID:          modelID,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     compat.Name,
-			Type:        modelType,
-			DisplayName: modelID,
-			UserDefined: false,
-			Thinking:    thinking,
-		})
+		info.Thinking = thinking
+		info.SupportedInputModalities = normalizeCompatConfigModalities(model.InputModalities)
+		info.SupportedOutputModalities = normalizeCompatConfigModalities(model.OutputModalities)
+		models = append(models, info)
 	}
 	return models
+}
+
+func normalizeCompatConfigModalities(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		modality := strings.ToLower(strings.TrimSpace(item))
+		if modality == "" {
+			continue
+		}
+		if _, exists := seen[modality]; exists {
+			continue
+		}
+		seen[modality] = struct{}{}
+		out = append(out, modality)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
@@ -2661,14 +2759,12 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 	for i := range models {
 		model := models[i]
 		name := strings.TrimSpace(model.GetName())
-		alias := strings.TrimSpace(model.GetAlias())
-		if alias == "" {
-			alias = name
-		}
-		if alias == "" {
+		info := buildConfiguredModelInfo(model, ownedBy, modelType, now, name, true)
+		if info == nil {
 			continue
 		}
-		key := strings.ToLower(alias) + "|" + strings.ToLower(name)
+		alias := info.ID
+		key := strings.ToLower(alias)
 		if _, exists := seen[key]; exists {
 			continue
 		}
@@ -2677,15 +2773,9 @@ func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*M
 		if display == "" {
 			display = alias
 		}
-		info := &ModelInfo{
-			ID:          name,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     ownedBy,
-			Type:        modelType,
-			DisplayName: display,
-			UserDefined: true,
-		}
+		info.ID = name
+		info.DisplayName = display
+		info.UserDefined = true
 		if alias != name && alias != "" {
 			info.Alias = alias
 		}
@@ -2742,11 +2832,50 @@ func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
 	return buildConfigModels(entry.Models, "anthropic", "claude")
 }
 
+func buildXAIConfigModels(entry *config.XAIKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "xai", "xai")
+}
+
 func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
+
+	models := registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
+	configuredDisplayNames := make(map[string]string, len(entry.Models))
+	seenConfiguredModels := make(map[string]struct{}, len(entry.Models))
+	for i := range entry.Models {
+		model := entry.Models[i]
+		alias := strings.TrimSpace(model.Alias)
+		if alias == "" {
+			alias = strings.TrimSpace(model.Name)
+		}
+		if alias == "" {
+			continue
+		}
+		key := strings.ToLower(alias)
+		if _, exists := seenConfiguredModels[key]; exists {
+			continue
+		}
+		seenConfiguredModels[key] = struct{}{}
+
+		displayName := strings.TrimSpace(model.DisplayName)
+		if displayName != "" {
+			configuredDisplayNames[key] = displayName
+		}
+	}
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if displayName, ok := configuredDisplayNames[strings.ToLower(model.ID)]; ok {
+			model.DisplayName = displayName
+		}
+	}
+	return models
 }
 
 func buildCommandCodeConfigModels(entry *config.CommandCodeKey) []*ModelInfo {
@@ -3022,7 +3151,7 @@ func (s *Service) fetchKiroModels(a *coreauth.Auth) []*ModelInfo {
 	models = registry.MergeWithStaticMetadata(models, registry.GetKiroModels())
 	models = registry.GenerateAgenticVariants(models)
 
-	log.Infof("kiro: successfully fetched %d models from API (including agentic variants)", len(models))
+	log.Debugf("kiro: successfully fetched %d models from API (including agentic variants)", len(models))
 	return models
 }
 

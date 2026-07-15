@@ -33,6 +33,11 @@ type mistralKeyWithAuthIndex struct {
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
+type xaiKeyWithAuthIndex struct {
+	config.XAIKey
+	AuthIndex string `json:"auth-index,omitempty"`
+}
+
 type vertexCompatKeyWithAuthIndex struct {
 	config.VertexCompatKey
 	AuthIndex string `json:"auth-index,omitempty"`
@@ -44,15 +49,16 @@ type openAICompatibilityAPIKeyWithAuthIndex struct {
 }
 
 type openAICompatibilityWithAuthIndex struct {
-	Name          string                                   `json:"name"`
-	Priority      int                                      `json:"priority,omitempty"`
-	Disabled      bool                                     `json:"disabled"`
-	Prefix        string                                   `json:"prefix,omitempty"`
-	BaseURL       string                                   `json:"base-url"`
-	APIKeyEntries []openAICompatibilityAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
-	Models        []config.OpenAICompatibilityModel        `json:"models,omitempty"`
-	Headers       map[string]string                        `json:"headers,omitempty"`
-	AuthIndex     string                                   `json:"auth-index,omitempty"`
+	Name           string                                   `json:"name"`
+	Priority       int                                      `json:"priority,omitempty"`
+	Disabled       bool                                     `json:"disabled"`
+	Prefix         string                                   `json:"prefix,omitempty"`
+	BaseURL        string                                   `json:"base-url"`
+	APIKeyEntries  []openAICompatibilityAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
+	Models         []config.OpenAICompatibilityModel        `json:"models,omitempty"`
+	Headers        map[string]string                        `json:"headers,omitempty"`
+	DisableCooling bool                                     `json:"disable-cooling,omitempty"`
+	AuthIndex      string                                   `json:"auth-index,omitempty"`
 }
 
 func (h *Handler) liveAuthIndexByID() map[string]string {
@@ -106,6 +112,35 @@ func (h *Handler) geminiKeysWithAuthIndex() []geminiKeyWithAuthIndex {
 		authIndex := ""
 		if key := strings.TrimSpace(entry.APIKey); key != "" {
 			id, _ := idGen.Next("gemini:apikey", key, entry.BaseURL)
+			authIndex = liveIndexByID[id]
+		}
+		out[i] = geminiKeyWithAuthIndex{
+			GeminiKey: entry,
+			AuthIndex: authIndex,
+		}
+	}
+	return out
+}
+
+func (h *Handler) interactionsKeysWithAuthIndex() []geminiKeyWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+
+	idGen := synthesizer.NewStableIDGenerator()
+	out := make([]geminiKeyWithAuthIndex, len(h.cfg.InteractionsKey))
+	for i := range h.cfg.InteractionsKey {
+		entry := h.cfg.InteractionsKey[i]
+		authIndex := ""
+		if key := strings.TrimSpace(entry.APIKey); key != "" {
+			id, _ := idGen.Next("gemini-interactions:apikey", key, entry.BaseURL)
 			authIndex = liveIndexByID[id]
 		}
 		out[i] = geminiKeyWithAuthIndex{
@@ -232,6 +267,35 @@ func (h *Handler) mistralKeysWithAuthIndex() []mistralKeyWithAuthIndex {
 	return out
 }
 
+func (h *Handler) xaiKeysWithAuthIndex() []xaiKeyWithAuthIndex {
+	if h == nil {
+		return nil
+	}
+	liveIndexByID := h.liveAuthIndexByID()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.cfg == nil {
+		return nil
+	}
+
+	idGen := synthesizer.NewStableIDGenerator()
+	out := make([]xaiKeyWithAuthIndex, len(h.cfg.XAIKey))
+	for i := range h.cfg.XAIKey {
+		entry := h.cfg.XAIKey[i]
+		authIndex := ""
+		if key := strings.TrimSpace(entry.APIKey); key != "" {
+			id, _ := idGen.Next("xai:apikey", key, entry.BaseURL)
+			authIndex = liveIndexByID[id]
+		}
+		out[i] = xaiKeyWithAuthIndex{
+			XAIKey:    entry,
+			AuthIndex: authIndex,
+		}
+	}
+	return out
+}
+
 func (h *Handler) vertexCompatKeysWithAuthIndex() []vertexCompatKeyWithAuthIndex {
 	if h == nil {
 		return nil
@@ -282,14 +346,15 @@ func (h *Handler) openAICompatibilityWithAuthIndex() []openAICompatibilityWithAu
 		idKind := fmt.Sprintf("openai-compatibility:%s", providerName)
 
 		response := openAICompatibilityWithAuthIndex{
-			Name:      entry.Name,
-			Priority:  entry.Priority,
-			Disabled:  entry.Disabled,
-			Prefix:    entry.Prefix,
-			BaseURL:   entry.BaseURL,
-			Models:    entry.Models,
-			Headers:   entry.Headers,
-			AuthIndex: "",
+			Name:           entry.Name,
+			Priority:       entry.Priority,
+			Disabled:       entry.Disabled,
+			Prefix:         entry.Prefix,
+			BaseURL:        entry.BaseURL,
+			Models:         entry.Models,
+			Headers:        entry.Headers,
+			DisableCooling: entry.DisableCooling,
+			AuthIndex:      "",
 		}
 		if len(entry.APIKeyEntries) == 0 {
 			id, _ := idGen.Next(idKind, entry.BaseURL)

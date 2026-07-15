@@ -52,6 +52,12 @@ type AuthModelResult struct {
 	Err      error
 }
 
+// RegisteredPluginInfo describes a plugin active in the current host snapshot.
+type RegisteredPluginInfo = internalpluginhost.RegisteredPluginInfo
+
+// RegisteredPluginMenu describes a plugin-owned resource menu entry.
+type RegisteredPluginMenu = internalpluginhost.RegisteredPluginMenu
+
 // Host wraps the internal plugin host behind a public SDK surface.
 type Host struct {
 	inner *internalpluginhost.Host
@@ -79,12 +85,33 @@ func (h *Host) ShutdownAll() {
 	h.inner.ShutdownAll()
 }
 
+// PluginBusy reports whether a plugin dynamic library is loaded or being loaded.
+func (h *Host) PluginBusy(id string) bool {
+	return h != nil && h.inner != nil && h.inner.PluginBusy(id)
+}
+
+// UnloadPlugin removes one plugin from the active runtime and closes its dynamic library.
+func (h *Host) UnloadPlugin(id string) bool {
+	if h == nil || h.inner == nil {
+		return false
+	}
+	return h.inner.UnloadPlugin(id)
+}
+
 // ParseAuth lets plugin auth providers parse a credential payload.
 func (h *Host) ParseAuth(ctx context.Context, req pluginapi.AuthParseRequest) (*coreauth.Auth, bool, error) {
 	if h == nil || h.inner == nil {
 		return nil, false, nil
 	}
 	return h.inner.ParseAuth(ctx, req)
+}
+
+// ParseAuths lets plugin auth providers expand one credential payload into multiple auth records.
+func (h *Host) ParseAuths(ctx context.Context, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {
+	if h == nil || h.inner == nil {
+		return nil, false, nil
+	}
+	return h.inner.ParseAuths(ctx, req)
 }
 
 // ModelsForAuth lets plugin model providers discover auth-bound models.
@@ -118,6 +145,35 @@ func (h *Host) RefreshAuth(ctx context.Context, auth *coreauth.Auth) (*coreauth.
 	return h.inner.RefreshAuth(ctx, auth)
 }
 
+// HasAuthProvider reports whether an active plugin handles provider auth for provider.
+func (h *Host) HasAuthProvider(provider string) bool {
+	return h != nil && h.inner != nil && h.inner.HasAuthProvider(provider)
+}
+
+// StartLogin starts a provider login flow through an active auth-provider plugin.
+func (h *Host) StartLogin(ctx context.Context, provider string, baseURL string) (pluginapi.AuthLoginStartResponse, bool, error) {
+	if h == nil || h.inner == nil {
+		return pluginapi.AuthLoginStartResponse{}, false, nil
+	}
+	return h.inner.StartLogin(ctx, provider, baseURL)
+}
+
+// PollLogin polls a provider login flow through an active auth-provider plugin.
+func (h *Host) PollLogin(ctx context.Context, provider, state string, metadata ...map[string]any) (pluginapi.AuthLoginPollResponse, bool, error) {
+	if h == nil || h.inner == nil {
+		return pluginapi.AuthLoginPollResponse{}, false, nil
+	}
+	return h.inner.PollLogin(ctx, provider, state, metadata...)
+}
+
+// AuthDataToCoreAuth converts plugin auth data into a host auth record.
+func (h *Host) AuthDataToCoreAuth(data pluginapi.AuthData, path, fileName string) *coreauth.Auth {
+	if h == nil || h.inner == nil {
+		return nil
+	}
+	return h.inner.AuthDataToCoreAuth(data, path, fileName)
+}
+
 // PickAuth lets a scheduler plugin choose an auth candidate.
 func (h *Host) PickAuth(ctx context.Context, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, error) {
 	if h == nil || h.inner == nil {
@@ -129,6 +185,14 @@ func (h *Host) PickAuth(ctx context.Context, req pluginapi.SchedulerPickRequest)
 // HasScheduler reports whether any active plugin provides a scheduler.
 func (h *Host) HasScheduler() bool {
 	return h != nil && h.inner != nil && h.inner.HasScheduler()
+}
+
+// RegisteredPlugins returns active plugin metadata from the current runtime snapshot.
+func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
+	if h == nil || h.inner == nil {
+		return nil
+	}
+	return h.inner.RegisteredPlugins()
 }
 
 func runtimeConfigToInternalConfig(cfg RuntimeConfig) *internalconfig.Config {
