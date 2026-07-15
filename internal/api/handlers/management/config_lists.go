@@ -623,7 +623,7 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 	filtered := make([]config.OpenAICompatibility, 0, len(arr))
 	for i := range arr {
 		normalizeOpenAICompatibilityEntry(&arr[i])
-		if strings.TrimSpace(arr[i].BaseURL) != "" {
+		if strings.TrimSpace(arr[i].BaseURL) != "" || config.HasAnyEntryBaseURL(arr[i].APIKeyEntries) {
 			filtered = append(filtered, arr[i])
 		}
 	}
@@ -690,7 +690,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
-		if trimmed == "" {
+		if trimmed == "" && !config.HasAnyEntryBaseURL(entry.APIKeyEntries) {
 			h.cfg.OpenAICompatibility = append(h.cfg.OpenAICompatibility[:targetIndex], h.cfg.OpenAICompatibility[targetIndex+1:]...)
 			h.cfg.SanitizeOpenAICompatibility()
 			h.persistLocked(c)
@@ -1826,6 +1826,8 @@ func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
 	for i := range entry.APIKeyEntries {
 		trimmed := strings.TrimSpace(entry.APIKeyEntries[i].APIKey)
 		entry.APIKeyEntries[i].APIKey = trimmed
+		entry.APIKeyEntries[i].ProxyURL = strings.TrimSpace(entry.APIKeyEntries[i].ProxyURL)
+		entry.APIKeyEntries[i].BaseURL = strings.TrimSpace(entry.APIKeyEntries[i].BaseURL)
 		if trimmed != "" {
 			existing[trimmed] = struct{}{}
 		}

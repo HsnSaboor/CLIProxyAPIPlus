@@ -1018,13 +1018,17 @@ type OpenAICompatibility struct {
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 }
 
-// OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.
+// OpenAICompatibilityAPIKey represents an API key configuration with optional proxy and base-url override.
 type OpenAICompatibilityAPIKey struct {
 	// APIKey is the authentication key for accessing the external API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// BaseURL overrides the provider-level base-url for this API key if provided.
+	// When set, requests using this key are sent to this URL instead of the provider default.
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 }
 
 // OpenAICompatibilityModel represents a model configuration for OpenAI compatibility,
@@ -1452,13 +1456,28 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.BillingClass = normalizeBillingClass(e.BillingClass)
 		e.Headers = NormalizeHeaders(e.Headers)
-		if e.BaseURL == "" {
-			// Skip providers with no base-url; treated as removed
+		for k := range e.APIKeyEntries {
+			e.APIKeyEntries[k].APIKey = strings.TrimSpace(e.APIKeyEntries[k].APIKey)
+			e.APIKeyEntries[k].ProxyURL = strings.TrimSpace(e.APIKeyEntries[k].ProxyURL)
+			e.APIKeyEntries[k].BaseURL = strings.TrimSpace(e.APIKeyEntries[k].BaseURL)
+		}
+		if e.BaseURL == "" && !HasAnyEntryBaseURL(e.APIKeyEntries) {
+			// Skip providers with no base-url and no per-entry overrides
 			continue
 		}
 		out = append(out, e)
 	}
 	cfg.OpenAICompatibility = out
+}
+
+// HasAnyEntryBaseURL returns true if any API key entry has a non-empty base-url.
+func HasAnyEntryBaseURL(entries []OpenAICompatibilityAPIKey) bool {
+	for i := range entries {
+		if entries[i].BaseURL != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // SanitizeCommandCodeKeys removes CommandCode API key entries missing an API key.

@@ -147,7 +147,9 @@ download_and_verify() {
     local ext="tar.gz"
     [[ "$OS" == "windows" ]] && ext="zip"
 
-    local filename="CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}.${ext}"
+    # Remove 'v' prefix from VERSION for filename (e.g., v7.0.3-3 → 7.0.3-3)
+    local version_without_v="${VERSION#v}"
+    local filename="CLIProxyAPIPlus_${version_without_v}_${OS}_${ARCH}.${ext}"
     local url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/${filename}"
 
     log_info "Downloading $filename..."
@@ -191,7 +193,9 @@ extract_and_deploy() {
     local ext="tar.gz"
     [[ "$OS" == "windows" ]] && ext="zip"
 
-    local filename="CLIProxyAPIPlus_${VERSION}_${OS}_${ARCH}.${ext}"
+    # Remove 'v' prefix from VERSION for filename (e.g., v7.0.3-3 → 7.0.3-3)
+    local version_without_v="${VERSION#v}"
+    local filename="CLIProxyAPIPlus_${version_without_v}_${OS}_${ARCH}.${ext}"
 
     log_info "Backing up config..."
     if [[ -f "$PROD_DIR/config.yaml" ]]; then

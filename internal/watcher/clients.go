@@ -96,7 +96,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 				if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".json") {
 					if data, errReadFile := os.ReadFile(path); errReadFile == nil && len(data) > 0 {
 						sum := sha256.Sum256(data)
-						normalizedPath := w.normalizeAuthPath(fullPath)
+						normalizedPath := w.normalizeAuthPath(path)
 						newAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
 						// Parse and cache auth content for future diff comparisons (debug only).
 						if cacheAuthContents {
