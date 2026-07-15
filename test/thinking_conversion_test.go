@@ -816,7 +816,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 68: Budget 64000 → passthrough logic → xhigh
+		// Case 68: Budget 64000 → clamped to high (user-defined, xhigh not universally supported)
 		{
 			name:        "68",
 			from:        "gemini",
@@ -824,7 +824,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			model:       "user-defined-model(64000)",
 			inputJSON:   `{"model":"user-defined-model(64000)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField: "reasoning_effort",
-			expectValue: "xhigh",
+			expectValue: "high",
 			expectErr:   false,
 		},
 		// Case 69: Budget 0 → passthrough logic → none
@@ -871,7 +871,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 73: Budget 64000 → passthrough logic → xhigh
+		// Case 73: Budget 64000 → clamped to high (user-defined, xhigh not universally supported)
 		{
 			name:        "73",
 			from:        "claude",
@@ -879,7 +879,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			model:       "user-defined-model(64000)",
 			inputJSON:   `{"model":"user-defined-model(64000)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField: "reasoning.effort",
-			expectValue: "xhigh",
+			expectValue: "high",
 			expectErr:   false,
 		},
 		// Case 74: Budget 0 → passthrough logic → none
@@ -902,6 +902,72 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			inputJSON:   `{"model":"user-defined-model(-1)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField: "reasoning.effort",
 			expectValue: "auto",
+			expectErr:   false,
+		},
+		// Case 68a: User-defined model, suffix xhigh → clamped to high
+		{
+			name:        "68a",
+			from:        "gemini",
+			to:          "openai",
+			model:       "user-defined-model(xhigh)",
+			inputJSON:   `{"model":"user-defined-model(xhigh)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 68b: User-defined model, suffix max → clamped to high
+		{
+			name:        "68b",
+			from:        "gemini",
+			to:          "openai",
+			model:       "user-defined-model(max)",
+			inputJSON:   `{"model":"user-defined-model(max)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 73a: User-defined model, suffix xhigh → clamped to high
+		{
+			name:        "73a",
+			from:        "claude",
+			to:          "codex",
+			model:       "user-defined-model(xhigh)",
+			inputJSON:   `{"model":"user-defined-model(xhigh)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "reasoning.effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 73b: User-defined model, suffix max → clamped to high
+		{
+			name:        "73b",
+			from:        "claude",
+			to:          "codex",
+			model:       "user-defined-model(max)",
+			inputJSON:   `{"model":"user-defined-model(max)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "reasoning.effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 73c: User-defined model, suffix xhigh → kimi → clamped to high
+		{
+			name:        "73c",
+			from:        "claude",
+			to:          "kimi",
+			model:       "user-defined-model(xhigh)",
+			inputJSON:   `{"model":"user-defined-model(xhigh)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 73d: User-defined model, suffix xhigh → claude → clamped to high
+		{
+			name:        "73d",
+			from:        "openai",
+			to:          "claude",
+			model:       "user-defined-model(xhigh)",
+			inputJSON:   `{"model":"user-defined-model(xhigh)","messages":[{"role":"user","content":"hi"}]}`,
+			expectField: "output_config.effort",
+			expectValue: "high",
 			expectErr:   false,
 		},
 		// Case 76: OpenAI to Gemini budget 8192 → passthrough → 8192
@@ -1189,15 +1255,16 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "xhigh",
 			expectErr:   false,
 		},
-		// Case 116: OpenAI to gpt-5, level xhigh (out of range) → error
+		// Case 116: OpenAI to gpt-5, level xhigh (out of range) → clamped to high
 		{
 			name:        "116",
 			from:        "openai",
 			to:          "github-copilot",
 			model:       "gpt-5(xhigh)",
 			inputJSON:   `{"model":"gpt-5(xhigh)","messages":[{"role":"user","content":"hi"}]}`,
-			expectField: "",
-			expectErr:   true,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
 		},
 		// Case 117: Claude to gpt-5.1, budget 0 → none (ZeroAllowed=true)
 		{
@@ -2098,7 +2165,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 68: thinkingBudget=64000 → xhigh (passthrough)
+		// Case 68: thinkingBudget=64000 → high (clamped, user-defined model)
 		{
 			name:        "68",
 			from:        "gemini",
@@ -2106,7 +2173,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			model:       "user-defined-model",
 			inputJSON:   `{"model":"user-defined-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":64000}}}`,
 			expectField: "reasoning_effort",
-			expectValue: "xhigh",
+			expectValue: "high",
 			expectErr:   false,
 		},
 		// Case 69: thinkingBudget=0 → none
@@ -2153,7 +2220,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectValue: "medium",
 			expectErr:   false,
 		},
-		// Case 73: thinking.budget_tokens=64000 → xhigh (passthrough)
+		// Case 73: thinking.budget_tokens=64000 → high (clamped, user-defined model)
 		{
 			name:        "73",
 			from:        "claude",
@@ -2161,7 +2228,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			model:       "user-defined-model",
 			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"enabled","budget_tokens":64000}}`,
 			expectField: "reasoning.effort",
-			expectValue: "xhigh",
+			expectValue: "high",
 			expectErr:   false,
 		},
 		// Case 74: thinking.budget_tokens=0 → none
@@ -2230,6 +2297,83 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			inputJSON:   `{"model":"user-defined-model","input":[{"role":"user","content":"hi"}],"reasoning":{"effort":"medium"}}`,
 			expectField: "thinking.budget_tokens",
 			expectValue: "8192",
+			expectErr:   false,
+		},
+		// Case 79a: User-defined model, reasoning_effort=xhigh → clamped to high
+		{
+			name:        "79a",
+			from:        "openai",
+			to:          "openai",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 79b: User-defined model, reasoning_effort=max → clamped to high
+		{
+			name:        "79b",
+			from:        "openai",
+			to:          "openai",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max"}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 79c: User-defined model, reasoning.effort=xhigh → clamped to high
+		{
+			name:        "79c",
+			from:        "openai-response",
+			to:          "codex",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","input":[{"role":"user","content":"hi"}],"reasoning":{"effort":"xhigh"}}`,
+			expectField: "reasoning.effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 79d: User-defined model, reasoning.effort=max → clamped to high
+		{
+			name:        "79d",
+			from:        "openai-response",
+			to:          "codex",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","input":[{"role":"user","content":"hi"}],"reasoning":{"effort":"max"}}`,
+			expectField: "reasoning.effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 79e: User-defined model, reasoning_effort=xhigh → kimi → clamped to high
+		{
+			name:        "79e",
+			from:        "openai",
+			to:          "kimi",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 79f: User-defined model, reasoning_effort=xhigh → claude → clamped to high
+		{
+			name:        "79f",
+			from:        "openai",
+			to:          "claude",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`,
+			expectField: "output_config.effort",
+			expectValue: "high",
+			expectErr:   false,
+		},
+		// Case 79g: User-defined model, reasoning_effort=minimal → openai → clamped to low
+		{
+			name:        "79g",
+			from:        "openai",
+			to:          "openai",
+			model:       "user-defined-model",
+			inputJSON:   `{"model":"user-defined-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"minimal"}`,
+			expectField: "reasoning_effort",
+			expectValue: "low",
 			expectErr:   false,
 		},
 
@@ -2458,15 +2602,16 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectValue: "xhigh",
 			expectErr:   false,
 		},
-		// Case 116: OpenAI to gpt-5, reasoning_effort=xhigh (out of range) → error
+		// Case 116: OpenAI to gpt-5, reasoning_effort=xhigh (out of range) → clamped to high
 		{
 			name:        "116",
 			from:        "openai",
 			to:          "github-copilot",
 			model:       "gpt-5",
 			inputJSON:   `{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"xhigh"}`,
-			expectField: "",
-			expectErr:   true,
+			expectField: "reasoning_effort",
+			expectValue: "high",
+			expectErr:   false,
 		},
 		// Case 117: Claude to gpt-5.1, thinking.budget_tokens=0 → none (ZeroAllowed=true)
 		{

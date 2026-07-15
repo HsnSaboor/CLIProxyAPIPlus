@@ -127,6 +127,7 @@ func applyCompatibleKimi(body []byte, config thinking.ThinkingConfig) ([]byte, e
 		return body, nil
 	}
 
+	effort = string(thinking.ClampUserDefinedLevel(thinking.ThinkingLevel(effort)))
 	return applyReasoningEffort(body, effort)
 }
 

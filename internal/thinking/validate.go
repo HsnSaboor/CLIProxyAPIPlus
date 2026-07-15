@@ -388,6 +388,27 @@ func isSameProviderFamily(from, to string) bool {
 		(isOpenAIFamily(from) && isOpenAIFamily(to))
 }
 
+// ClampUserDefinedLevel clamps thinking levels that are not universally supported
+// by OpenAI-compatible upstreams down to the nearest universally-safe level.
+// User-defined models lack ThinkingSupport metadata, so per-model level
+// validation is impossible.
+//   - xhigh and max → high (only supported by specific OpenAI models and a few
+//     compatible providers; high works on virtually all providers)
+//   - minimal → low (only supported by OpenAI pre-5.1, OpenRouter, Fireworks;
+//     low works on virtually all providers)
+//
+// Comparison is case-insensitive to handle upstreams that send "XHigh" or "MAX".
+func ClampUserDefinedLevel(level ThinkingLevel) ThinkingLevel {
+	l := ThinkingLevel(strings.ToLower(string(level)))
+	if l == LevelXHigh || l == LevelMax {
+		return LevelHigh
+	}
+	if l == LevelMinimal {
+		return LevelLow
+	}
+	return level
+}
+
 func abs(x int) int {
 	if x < 0 {
 		return -x

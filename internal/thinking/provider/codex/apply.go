@@ -115,6 +115,7 @@ func applyCompatibleCodex(body []byte, config thinking.ThinkingConfig) ([]byte, 
 		return body, nil
 	}
 
+	effort = string(thinking.ClampUserDefinedLevel(thinking.ThinkingLevel(effort)))
 	result, _ := sjson.SetBytes(body, "reasoning.effort", effort)
 	return result, nil
 }

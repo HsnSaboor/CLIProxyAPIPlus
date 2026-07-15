@@ -246,15 +246,27 @@ func applyCompatibleClaude(body []byte, config thinking.ThinkingConfig) ([]byte,
 		return result, nil
 	case thinking.ModeLevel:
 		// For user-defined models, interpret ModeLevel as Claude adaptive thinking effort.
-		// Upstream is responsible for validating whether the target model supports it.
-		if config.Level == "" {
+		// Clamp non-universal levels (xhigh/max/minimal) to the nearest safe value
+		// since the upstream's capabilities are unknown.
+		clamped := thinking.ClampUserDefinedLevel(config.Level)
+		if clamped == "" {
 			return body, nil
 		}
 		result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
 		result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
-		result, _ = sjson.SetBytes(result, "output_config.effort", string(config.Level))
+		result, _ = sjson.SetBytes(result, "output_config.effort", string(clamped))
 		return result, nil
 	default:
+		// For user-defined models, check if budget maps to a non-universal level.
+		if level, ok := thinking.ConvertBudgetToLevel(config.Budget); ok {
+			clamped := thinking.ClampUserDefinedLevel(thinking.ThinkingLevel(level))
+			if clamped != thinking.ThinkingLevel(level) {
+				result, _ := sjson.SetBytes(body, "thinking.type", "adaptive")
+				result, _ = sjson.DeleteBytes(result, "thinking.budget_tokens")
+				result, _ = sjson.SetBytes(result, "output_config.effort", string(clamped))
+				return result, nil
+			}
+		}
 		result, _ := sjson.SetBytes(body, "thinking.type", "enabled")
 		result, _ = sjson.SetBytes(result, "thinking.budget_tokens", config.Budget)
 		result, _ = sjson.DeleteBytes(result, "output_config.effort")

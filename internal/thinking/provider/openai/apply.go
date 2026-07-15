@@ -112,6 +112,7 @@ func applyCompatibleOpenAI(body []byte, config thinking.ThinkingConfig) ([]byte,
 		return body, nil
 	}
 
+	effort = string(thinking.ClampUserDefinedLevel(thinking.ThinkingLevel(effort)))
 	result, _ := sjson.SetBytes(body, "reasoning_effort", effort)
 	return result, nil
 }
