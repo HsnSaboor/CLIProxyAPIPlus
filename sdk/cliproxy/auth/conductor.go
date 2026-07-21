@@ -1812,7 +1812,8 @@ func countRemainingProviderOptions(currentProvider string, providers []string, t
 
 func shouldPreserveAttemptBudgetForStatus(statusCode int) bool {
 	switch statusCode {
-	case http.StatusTooManyRequests, http.StatusGatewayTimeout, http.StatusServiceUnavailable:
+	case http.StatusTooManyRequests, http.StatusGatewayTimeout, http.StatusServiceUnavailable,
+		http.StatusBadGateway, http.StatusRequestTimeout, http.StatusInternalServerError:
 		return true
 	default:
 		return false
@@ -4887,6 +4888,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 400:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
+							} else if isCreditExhaustedResultError(result.Error) {
+								next := now.Add(24 * time.Hour)
+								state.NextRetryAfter = next
+								state.Quota.Exceeded = true
+								suspendReason = "credits_exhausted"
+								shouldSuspendModel = true
 							} else {
 								next := now.Add(30 * time.Minute)
 								state.NextRetryAfter = next
@@ -5410,6 +5417,24 @@ func isModelSupportError(err error) bool {
 	return isModelSupportErrorMessage(err.Error())
 }
 
+func isCreditExhaustedMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"exhausted your available credits",
+		"exhausted your credits",
+		"add a payment method to upgrade",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 func isInvalidGrantErrorMessage(message string) bool {
 	return strings.Contains(strings.ToLower(message), "invalid_grant")
 }
@@ -5445,6 +5470,17 @@ func isModelSupportResultError(err *Error) bool {
 		return false
 	}
 	return isModelSupportErrorMessage(err.Message)
+}
+
+func isCreditExhaustedResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if status != http.StatusBadRequest {
+		return false
+	}
+	return isCreditExhaustedMessage(err.Message)
 }
 
 func isCloudflareChallengeErrorMessage(message string) bool {

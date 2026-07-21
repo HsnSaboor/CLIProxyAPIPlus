@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+func setRefreshLeadFactory(t *testing.T, provider string, factory func() *time.Duration) {
+	t.Helper()
+	refreshLeadMu.Lock()
+	old := refreshLeadFactories[provider]
+	refreshLeadFactories[provider] = factory
+	refreshLeadMu.Unlock()
+	t.Cleanup(func() {
+		refreshLeadMu.Lock()
+		if old == nil {
+			delete(refreshLeadFactories, provider)
+		} else {
+			refreshLeadFactories[provider] = old
+		}
+		refreshLeadMu.Unlock()
+	})
+}
+
 func TestManager_Remove_DeletesRuntimeAuth(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	ctx := context.Background()

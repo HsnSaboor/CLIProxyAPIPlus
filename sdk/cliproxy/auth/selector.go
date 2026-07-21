@@ -340,7 +340,7 @@ func collectAvailableByPriority(auths []*Auth, model string, now time.Time) (ava
 			available[priority] = append(available[priority], candidate)
 			continue
 		}
-		if reason == blockReasonCooldown {
+		if reason == blockReasonCooldown || (reason == blockReasonOther && !next.IsZero() && next.After(now)) {
 			cooldownCount++
 			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
 				earliest = next
