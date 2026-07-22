@@ -1021,6 +1021,10 @@ type OpenAICompatibility struct {
 
 	// DisableCooling disables auth/model cooldown scheduling for this provider when true.
 	DisableCooling bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
+
+	// SupportsPromptCaching enables Anthropic-style cache_control injection for
+	// OpenAI-compatible providers whose backend honors it (e.g. Databricks Claude).
+	SupportsPromptCaching bool `yaml:"supports-prompt-caching,omitempty" json:"supports-prompt-caching,omitempty"`
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy and base-url override.

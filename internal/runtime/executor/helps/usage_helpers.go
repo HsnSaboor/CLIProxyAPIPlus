@@ -588,7 +588,9 @@ func hasOpenAIStyleUsageTokenFields(usageNode gjson.Result) bool {
 		usageNode.Get("input_tokens_details.cache_write_tokens").Exists() ||
 		usageNode.Get("input_tokens_details.cache_creation_tokens").Exists() ||
 		usageNode.Get("completion_tokens_details.reasoning_tokens").Exists() ||
-		usageNode.Get("output_tokens_details.reasoning_tokens").Exists()
+		usageNode.Get("output_tokens_details.reasoning_tokens").Exists() ||
+		usageNode.Get("cache_read_input_tokens").Exists() ||
+		usageNode.Get("cache_creation_input_tokens").Exists()
 }
 
 func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
@@ -609,6 +611,13 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 	if !cached.Exists() {
 		cached = usageNode.Get("input_tokens_details.cached_tokens")
 	}
+	// Some OpenAI-compatible providers (e.g. Databricks-hosted Claude) return
+	// Anthropic-style top-level cache fields even though the rest of the usage
+	// object is OpenAI-shaped (prompt_tokens/completion_tokens). Fall back to
+	// these when the nested OpenAI-style fields are absent.
+	if !cached.Exists() {
+		cached = usageNode.Get("cache_read_input_tokens")
+	}
 	if cached.Exists() {
 		detail.CachedTokens = cached.Int()
 		detail.CacheReadTokens = cached.Int()
@@ -619,6 +628,7 @@ func parseOpenAIStyleUsageNode(usageNode gjson.Result) usage.Detail {
 		"input_tokens_details.cache_write_tokens",
 		"prompt_tokens_details.cache_creation_tokens",
 		"prompt_tokens_details.cache_write_tokens",
+		"cache_creation_input_tokens",
 	)
 	if cacheCreation.Exists() {
 		detail.CacheCreationTokens = cacheCreation.Int()

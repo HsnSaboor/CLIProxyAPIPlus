@@ -162,6 +162,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		translated = applyNVIDIAMaxTokensReduction(translated)
 	}
 	translated = stripOpenAICompatProviderUnsupportedFields(e.provider, compatCfg, translated)
+	if compatCfg != nil && compatCfg.SupportsPromptCaching {
+		if countOpenAICacheControls(translated) == 0 {
+			translated = ensureOpenAICacheControl(translated)
+		}
+		translated = enforceOpenAICacheControlLimit(translated, 4)
+	}
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -406,6 +412,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		translated = applyNVIDIAMaxTokensReduction(translated)
 	}
 	translated = stripOpenAICompatProviderUnsupportedFields(e.provider, compatCfg, translated)
+	if compatCfg != nil && compatCfg.SupportsPromptCaching {
+		if countOpenAICacheControls(translated) == 0 {
+			translated = ensureOpenAICacheControl(translated)
+		}
+		translated = enforceOpenAICacheControlLimit(translated, 4)
+	}
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.

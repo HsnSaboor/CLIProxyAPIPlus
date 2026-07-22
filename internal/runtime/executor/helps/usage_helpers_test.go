@@ -97,6 +97,50 @@ func TestParseOpenAIUsageNormalizesCacheCreationAlias(t *testing.T) {
 	}
 }
 
+// TestParseOpenAIUsageDatabricksAnthropicStyleCacheFields covers OpenAI-compatible
+// providers that are actually Claude under the hood (e.g. Databricks-hosted Claude
+// via the mlflow/v1 gateway). These return an OpenAI-shaped usage object
+// (prompt_tokens/completion_tokens) but report cache stats using Anthropic's
+// top-level cache_read_input_tokens/cache_creation_input_tokens fields instead of
+// OpenAI's nested prompt_tokens_details.cached_tokens.
+func TestParseOpenAIUsageDatabricksAnthropicStyleCacheFields(t *testing.T) {
+	t.Run("cache read", func(t *testing.T) {
+		data := []byte(`{"usage":{"prompt_tokens":5928,"completion_tokens":13,"total_tokens":5941,"cache_read_input_tokens":5905,"cache_creation_input_tokens":0}}`)
+		detail := ParseOpenAIUsage(data)
+		if detail.InputTokens != 5928 {
+			t.Fatalf("input tokens = %d, want 5928", detail.InputTokens)
+		}
+		if detail.CachedTokens != 5905 {
+			t.Fatalf("cached tokens = %d, want 5905", detail.CachedTokens)
+		}
+		if detail.CacheReadTokens != 5905 {
+			t.Fatalf("cache read tokens = %d, want 5905", detail.CacheReadTokens)
+		}
+		if detail.CacheCreationTokens != 0 {
+			t.Fatalf("cache creation tokens = %d, want 0", detail.CacheCreationTokens)
+		}
+	})
+
+	t.Run("cache creation", func(t *testing.T) {
+		data := []byte(`{"usage":{"prompt_tokens":5928,"completion_tokens":13,"total_tokens":5941,"cache_read_input_tokens":0,"cache_creation_input_tokens":5905}}`)
+		detail := ParseOpenAIUsage(data)
+		if detail.CacheCreationTokens != 5905 {
+			t.Fatalf("cache creation tokens = %d, want 5905", detail.CacheCreationTokens)
+		}
+		if detail.CachedTokens != 0 {
+			t.Fatalf("cached tokens = %d, want 0", detail.CachedTokens)
+		}
+	})
+
+	t.Run("nested OpenAI-style fields still take precedence when present", func(t *testing.T) {
+		data := []byte(`{"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":50},"cache_read_input_tokens":999}}`)
+		detail := ParseOpenAIUsage(data)
+		if detail.CachedTokens != 50 {
+			t.Fatalf("cached tokens = %d, want 50 (nested OpenAI-style field should win)", detail.CachedTokens)
+		}
+	})
+}
+
 func TestParseOpenAIUsageIgnoresNullUsage(t *testing.T) {
 	data := []byte(`{"usage":null}`)
 	detail := ParseOpenAIUsage(data)
