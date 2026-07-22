@@ -13,9 +13,15 @@ type geminiKeyWithAuthIndex struct {
 	AuthIndex string `json:"auth-index,omitempty"`
 }
 
+type claudeKeyAPIKeyWithAuthIndex struct {
+	config.ClaudeKeyAPIKey
+	AuthIndex string `json:"auth-index,omitempty"`
+}
+
 type claudeKeyWithAuthIndex struct {
 	config.ClaudeKey
-	AuthIndex string `json:"auth-index,omitempty"`
+	APIKeyEntries []claudeKeyAPIKeyWithAuthIndex `json:"api-key-entries,omitempty"`
+	AuthIndex     string                         `json:"auth-index,omitempty"`
 }
 
 type codexKeyWithAuthIndex struct {
@@ -167,15 +173,31 @@ func (h *Handler) claudeKeysWithAuthIndex() []claudeKeyWithAuthIndex {
 	out := make([]claudeKeyWithAuthIndex, len(h.cfg.ClaudeKey))
 	for i := range h.cfg.ClaudeKey {
 		entry := h.cfg.ClaudeKey[i]
-		authIndex := ""
-		if key := strings.TrimSpace(entry.APIKey); key != "" {
-			id, _ := idGen.Next("claude:apikey", key, entry.BaseURL)
-			authIndex = liveIndexByID[id]
-		}
-		out[i] = claudeKeyWithAuthIndex{
+		base := strings.TrimSpace(entry.BaseURL)
+		response := claudeKeyWithAuthIndex{
 			ClaudeKey: entry,
-			AuthIndex: authIndex,
 		}
+		if len(entry.APIKeyEntries) == 0 {
+			if key := strings.TrimSpace(entry.APIKey); key != "" {
+				id, _ := idGen.Next("claude:apikey", key, base)
+				response.AuthIndex = liveIndexByID[id]
+			}
+		} else {
+			response.APIKeyEntries = make([]claudeKeyAPIKeyWithAuthIndex, len(entry.APIKeyEntries))
+			for j := range entry.APIKeyEntries {
+				sub := entry.APIKeyEntries[j]
+				subBase := strings.TrimSpace(sub.BaseURL)
+				if subBase == "" {
+					subBase = base
+				}
+				id, _ := idGen.Next("claude:apikey", strings.TrimSpace(sub.APIKey), subBase, strings.TrimSpace(sub.ProxyURL))
+				response.APIKeyEntries[j] = claudeKeyAPIKeyWithAuthIndex{
+					ClaudeKeyAPIKey: sub,
+					AuthIndex:       liveIndexByID[id],
+				}
+			}
+		}
+		out[i] = response
 	}
 	return out
 }

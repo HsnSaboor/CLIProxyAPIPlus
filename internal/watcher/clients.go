@@ -388,7 +388,13 @@ func BuildAPIKeyClients(cfg *config.Config) (int, int, int, int, int, int, int, 
 		vertexCompatAPIKeyCount += len(cfg.VertexCompatAPIKey)
 	}
 	if len(cfg.ClaudeKey) > 0 {
-		claudeAPIKeyCount += len(cfg.ClaudeKey)
+		for _, claudeConfig := range cfg.ClaudeKey {
+			if n := len(claudeConfig.APIKeyEntries); n > 0 {
+				claudeAPIKeyCount += n
+				continue
+			}
+			claudeAPIKeyCount++
+		}
 	}
 	if len(cfg.CodexKey) > 0 {
 		codexAPIKeyCount += len(cfg.CodexKey)

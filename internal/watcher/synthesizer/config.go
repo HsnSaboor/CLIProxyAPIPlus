@@ -123,7 +123,10 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeyEntries(ctx *SynthesisContext, en
 	return out
 }
 
-// synthesizeClaudeKeys creates Auth entries for Claude API keys.
+// synthesizeClaudeKeys creates Auth entries for Claude API keys. When a
+// ClaudeKey provider defines APIKeyEntries, each entry becomes its own pooled
+// Auth credential (mirroring OpenAICompatibility's multi-account pooling);
+// otherwise the single top-level APIKey/BaseURL fields are used as before.
 func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*coreauth.Auth {
 	cfg := ctx.Config
 	now := ctx.Now
@@ -132,37 +135,84 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 	out := make([]*coreauth.Auth, 0, len(cfg.ClaudeKey))
 	for i := range cfg.ClaudeKey {
 		ck := cfg.ClaudeKey[i]
+		prefix := strings.TrimSpace(ck.Prefix)
+		base := strings.TrimSpace(ck.BaseURL)
+
+		buildAttrs := func(key, entryBase, source string) map[string]string {
+			attrs := map[string]string{
+				"source":  source,
+				"api_key": key,
+			}
+			if ck.Priority != 0 {
+				attrs["priority"] = strconv.Itoa(ck.Priority)
+			}
+			if ck.BillingClass != "" {
+				attrs["billing_class"] = string(ck.BillingClass)
+			}
+			if entryBase != "" {
+				attrs["base_url"] = entryBase
+			}
+			if ck.RebuildMidSystemMessage {
+				attrs["rebuild_mid_system_message"] = "true"
+			}
+			if hash := diff.ComputeClaudeModelsHash(ck.Models); hash != "" {
+				attrs["models_hash"] = hash
+			}
+			addConfigHeadersToAttrs(ck.Headers, attrs)
+			return attrs
+		}
+		buildMetadata := func() map[string]any {
+			metadata := map[string]any{}
+			if ck.DisableCooling {
+				metadata["disable_cooling"] = true
+			}
+			return metadata
+		}
+
+		createdEntries := 0
+		for j := range ck.APIKeyEntries {
+			entry := &ck.APIKeyEntries[j]
+			key := strings.TrimSpace(entry.APIKey)
+			if key == "" {
+				continue
+			}
+			proxyURL := strings.TrimSpace(entry.ProxyURL)
+			entryBase := strings.TrimSpace(entry.BaseURL)
+			if entryBase == "" {
+				entryBase = base
+			}
+			id, token := idGen.Next("claude:apikey", key, entryBase, proxyURL)
+			attrs := buildAttrs(key, entryBase, fmt.Sprintf("config:claude[%s]", token))
+			a := &coreauth.Auth{
+				ID:         id,
+				Provider:   "claude",
+				Label:      "claude-apikey",
+				Prefix:     prefix,
+				Status:     coreauth.StatusActive,
+				ProxyURL:   proxyURL,
+				Attributes: attrs,
+				Metadata:   buildMetadata(),
+				CreatedAt:  now,
+				UpdatedAt:  now,
+			}
+			ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+			if len(a.Metadata) == 0 {
+				a.Metadata = nil
+			}
+			out = append(out, a)
+			createdEntries++
+		}
+		if createdEntries > 0 {
+			continue
+		}
+
+		// Fallback: legacy single-key shape (no APIKeyEntries).
 		key := strings.TrimSpace(ck.APIKey)
 		if key == "" {
 			continue
 		}
-		prefix := strings.TrimSpace(ck.Prefix)
-		base := strings.TrimSpace(ck.BaseURL)
 		id, token := idGen.Next("claude:apikey", key, base)
-		attrs := map[string]string{
-			"source":  fmt.Sprintf("config:claude[%s]", token),
-			"api_key": key,
-		}
-		metadata := map[string]any{}
-		if ck.DisableCooling {
-			metadata["disable_cooling"] = true
-		}
-		if ck.Priority != 0 {
-			attrs["priority"] = strconv.Itoa(ck.Priority)
-		}
-		if ck.BillingClass != "" {
-			attrs["billing_class"] = string(ck.BillingClass)
-		}
-		if base != "" {
-			attrs["base_url"] = base
-		}
-		if ck.RebuildMidSystemMessage {
-			attrs["rebuild_mid_system_message"] = "true"
-		}
-		if hash := diff.ComputeClaudeModelsHash(ck.Models); hash != "" {
-			attrs["models_hash"] = hash
-		}
-		addConfigHeadersToAttrs(ck.Headers, attrs)
+		attrs := buildAttrs(key, base, fmt.Sprintf("config:claude[%s]", token))
 		proxyURL := strings.TrimSpace(ck.ProxyURL)
 		a := &coreauth.Auth{
 			ID:         id,
@@ -172,7 +222,7 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
-			Metadata:   metadata,
+			Metadata:   buildMetadata(),
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}

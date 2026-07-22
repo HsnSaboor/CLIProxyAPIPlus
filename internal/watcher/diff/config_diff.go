@@ -214,6 +214,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if strings.TrimSpace(o.APIKey) != strings.TrimSpace(n.APIKey) {
 				changes = append(changes, fmt.Sprintf("claude[%d].api-key: updated", i))
 			}
+			if len(o.APIKeyEntries) != len(n.APIKeyEntries) {
+				changes = append(changes, fmt.Sprintf("claude[%d].api-key-entries count: %d -> %d", i, len(o.APIKeyEntries), len(n.APIKeyEntries)))
+			}
 			if !equalStringMap(o.Headers, n.Headers) {
 				changes = append(changes, fmt.Sprintf("claude[%d].headers: updated", i))
 			}

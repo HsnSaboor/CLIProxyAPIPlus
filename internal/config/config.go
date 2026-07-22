@@ -645,6 +645,13 @@ type ClaudeKey struct {
 	// BillingClass classifies this credential for threshold-based routing policies.
 	BillingClass BillingClass `yaml:"billing-class,omitempty" json:"billing-class,omitempty"`
 
+	// APIKeyEntries defines multiple API keys with optional per-key proxy/base-url
+	// overrides, allowing a single Claude provider block to pool many credentials
+	// (e.g. multiple Databricks accounts) the same way OpenAICompatibility does.
+	// When set, each entry becomes its own pooled Auth credential; APIKey/BaseURL/
+	// ProxyURL above act as defaults for entries that omit their own values.
+	APIKeyEntries []ClaudeKeyAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
+
 	// Models defines upstream model names and aliases for request routing.
 	Models []ClaudeModel `yaml:"models" json:"models"`
 
@@ -671,6 +678,22 @@ type ClaudeKey struct {
 
 func (k ClaudeKey) GetAPIKey() string  { return k.APIKey }
 func (k ClaudeKey) GetBaseURL() string { return k.BaseURL }
+
+// ClaudeKeyAPIKey represents a single pooled API key entry within a ClaudeKey
+// provider block, with optional per-key proxy and base-url overrides. Mirrors
+// OpenAICompatibilityAPIKey so multiple Claude-protocol credentials (e.g.
+// Databricks anthropic-native accounts) can be pooled under one provider entry.
+type ClaudeKeyAPIKey struct {
+	// APIKey is the authentication key for accessing the external Claude-protocol API.
+	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// ProxyURL overrides the global proxy setting for this API key if provided.
+	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// BaseURL overrides the provider-level base-url for this API key if provided.
+	// When set, requests using this key are sent to this URL instead of the provider default.
+	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
+}
 
 // ClaudeModel describes a mapping between an alias and the actual upstream model name.
 type ClaudeModel struct {
@@ -1607,7 +1630,22 @@ func (cfg *Config) SanitizeClaudeKeys() {
 		entry.BillingClass = normalizeBillingClass(entry.BillingClass)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
+		for k := range entry.APIKeyEntries {
+			entry.APIKeyEntries[k].APIKey = strings.TrimSpace(entry.APIKeyEntries[k].APIKey)
+			entry.APIKeyEntries[k].ProxyURL = strings.TrimSpace(entry.APIKeyEntries[k].ProxyURL)
+			entry.APIKeyEntries[k].BaseURL = strings.TrimSpace(entry.APIKeyEntries[k].BaseURL)
+		}
 	}
+}
+
+// HasAnyClaudeEntryBaseURL returns true if any Claude API key entry has a non-empty base-url.
+func HasAnyClaudeEntryBaseURL(entries []ClaudeKeyAPIKey) bool {
+	for i := range entries {
+		if entries[i].BaseURL != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // SanitizeKiroKeys trims whitespace from Kiro credential fields.

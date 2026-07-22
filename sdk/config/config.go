@@ -24,6 +24,7 @@ type CodexKey = internalconfig.CodexKey
 type XAIKey = internalconfig.XAIKey
 type XAIModel = internalconfig.XAIModel
 type ClaudeKey = internalconfig.ClaudeKey
+type ClaudeKeyAPIKey = internalconfig.ClaudeKeyAPIKey
 type CommandCodeKey = internalconfig.CommandCodeKey
 type CommandCodeModel = internalconfig.CommandCodeModel
 type MistralKey = internalconfig.MistralKey

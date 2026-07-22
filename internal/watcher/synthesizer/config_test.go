@@ -295,6 +295,100 @@ func TestConfigSynthesizer_ClaudeKeys_SkipsEmptyAndHeaders(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_ClaudeKeys_APIKeyEntries(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			ClaudeKey: []config.ClaudeKey{
+				{
+					Prefix:  "databricks-claude",
+					BaseURL: "https://dbc-default.cloud.databricks.com/ai-gateway/anthropic",
+					Models: []config.ClaudeModel{
+						{Name: "databricks-claude-sonnet-5", Alias: "sonnet"},
+					},
+					APIKeyEntries: []config.ClaudeKeyAPIKey{
+						{APIKey: "dapi-account-1", BaseURL: "https://dbc-account-1.cloud.databricks.com/ai-gateway/anthropic"},
+						{APIKey: "dapi-account-2"}, // no per-entry base-url, should fall back to provider-level BaseURL
+					},
+				},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 2 {
+		t.Fatalf("expected 2 pooled auths (one per api-key-entry), got %d", len(auths))
+	}
+
+	byKey := map[string]*coreauth.Auth{}
+	for _, a := range auths {
+		byKey[a.Attributes["api_key"]] = a
+	}
+
+	entry1, ok := byKey["dapi-account-1"]
+	if !ok {
+		t.Fatal("expected an auth entry for dapi-account-1")
+	}
+	if entry1.Provider != "claude" {
+		t.Errorf("expected provider claude, got %s", entry1.Provider)
+	}
+	if entry1.Prefix != "databricks-claude" {
+		t.Errorf("expected prefix databricks-claude, got %s", entry1.Prefix)
+	}
+	if got := entry1.Attributes["base_url"]; got != "https://dbc-account-1.cloud.databricks.com/ai-gateway/anthropic" {
+		t.Errorf("expected per-entry base_url override, got %s", got)
+	}
+
+	entry2, ok := byKey["dapi-account-2"]
+	if !ok {
+		t.Fatal("expected an auth entry for dapi-account-2")
+	}
+	if got := entry2.Attributes["base_url"]; got != "https://dbc-default.cloud.databricks.com/ai-gateway/anthropic" {
+		t.Errorf("expected fallback to provider-level base_url, got %s", got)
+	}
+
+	// IDs must be distinct so both accounts are pooled as separate credentials.
+	if entry1.ID == entry2.ID {
+		t.Errorf("expected distinct auth IDs for pooled entries, got same ID %s for both", entry1.ID)
+	}
+}
+
+func TestConfigSynthesizer_ClaudeKeys_APIKeyEntries_SkipsEmptyKeys(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			ClaudeKey: []config.ClaudeKey{
+				{
+					BaseURL: "https://api.anthropic.com",
+					APIKeyEntries: []config.ClaudeKeyAPIKey{
+						{APIKey: ""},
+						{APIKey: "   "},
+						{APIKey: "valid-pooled-key"},
+					},
+				},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth (empty entries skipped), got %d", len(auths))
+	}
+	if auths[0].Attributes["api_key"] != "valid-pooled-key" {
+		t.Errorf("expected api_key valid-pooled-key, got %s", auths[0].Attributes["api_key"])
+	}
+}
+
 func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 	synth := NewConfigSynthesizer()
 	ctx := &SynthesisContext{

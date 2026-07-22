@@ -661,6 +661,9 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
 	case "claude":
+		if proxyStr := resolveClaudeAPIKeyProxyURL(cfg, auth); proxyStr != "" {
+			return proxyStr
+		}
 		if entry := resolveAPIKeyConfig(cfg.ClaudeKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
 		}
@@ -671,6 +674,32 @@ func proxyURLFromAPIKeyConfig(cfg *config.Config, auth *coreauth.Auth) string {
 	case "xai":
 		if entry := resolveAPIKeyConfig(cfg.XAIKey, auth); entry != nil {
 			return strings.TrimSpace(entry.ProxyURL)
+		}
+	}
+	return ""
+}
+
+// resolveClaudeAPIKeyProxyURL scans nested ClaudeKey.APIKeyEntries for a
+// matching api_key attribute and returns its per-entry proxy-url override,
+// mirroring resolveOpenAICompatAPIKeyProxyURL's nested-entries lookup.
+func resolveClaudeAPIKeyProxyURL(cfg *config.Config, auth *coreauth.Auth) string {
+	if cfg == nil || auth == nil {
+		return ""
+	}
+	attrKey := ""
+	if auth.Attributes != nil {
+		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
+	}
+	if attrKey == "" {
+		return ""
+	}
+	for i := range cfg.ClaudeKey {
+		entry := &cfg.ClaudeKey[i]
+		for j := range entry.APIKeyEntries {
+			sub := &entry.APIKeyEntries[j]
+			if strings.EqualFold(strings.TrimSpace(sub.APIKey), attrKey) {
+				return strings.TrimSpace(sub.ProxyURL)
+			}
 		}
 	}
 	return ""

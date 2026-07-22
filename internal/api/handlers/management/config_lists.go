@@ -472,15 +472,16 @@ func (h *Handler) PutClaudeKeys(c *gin.Context) {
 }
 func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	type claudeKeyPatch struct {
-		APIKey                  *string               `json:"api-key"`
-		Prefix                  *string               `json:"prefix"`
-		BaseURL                 *string               `json:"base-url"`
-		ProxyURL                *string               `json:"proxy-url"`
-		BillingClass            *string               `json:"billing-class"`
-		Models                  *[]config.ClaudeModel `json:"models"`
-		Headers                 *map[string]string    `json:"headers"`
-		ExcludedModels          *[]string             `json:"excluded-models"`
-		RebuildMidSystemMessage *bool                 `json:"rebuild-mid-system-message"`
+		APIKey                  *string                   `json:"api-key"`
+		Prefix                  *string                   `json:"prefix"`
+		BaseURL                 *string                   `json:"base-url"`
+		ProxyURL                *string                   `json:"proxy-url"`
+		BillingClass            *string                   `json:"billing-class"`
+		APIKeyEntries           *[]config.ClaudeKeyAPIKey `json:"api-key-entries"`
+		Models                  *[]config.ClaudeModel     `json:"models"`
+		Headers                 *map[string]string        `json:"headers"`
+		ExcludedModels          *[]string                 `json:"excluded-models"`
+		RebuildMidSystemMessage *bool                     `json:"rebuild-mid-system-message"`
 	}
 	var body struct {
 		Index *int            `json:"index"`
@@ -527,6 +528,9 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 	}
 	if body.Value.BillingClass != nil {
 		entry.BillingClass = config.BillingClass(normalizeBillingClassValue(*body.Value.BillingClass))
+	}
+	if body.Value.APIKeyEntries != nil {
+		entry.APIKeyEntries = append([]config.ClaudeKeyAPIKey(nil), (*body.Value.APIKeyEntries)...)
 	}
 	if body.Value.Models != nil {
 		entry.Models = append([]config.ClaudeModel(nil), (*body.Value.Models)...)
@@ -1860,6 +1864,11 @@ func normalizeClaudeKey(entry *config.ClaudeKey) {
 	entry.BillingClass = config.BillingClass(normalizeBillingClassValue(string(entry.BillingClass)))
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
 	entry.ExcludedModels = config.NormalizeExcludedModels(entry.ExcludedModels)
+	for i := range entry.APIKeyEntries {
+		entry.APIKeyEntries[i].APIKey = strings.TrimSpace(entry.APIKeyEntries[i].APIKey)
+		entry.APIKeyEntries[i].ProxyURL = strings.TrimSpace(entry.APIKeyEntries[i].ProxyURL)
+		entry.APIKeyEntries[i].BaseURL = strings.TrimSpace(entry.APIKeyEntries[i].BaseURL)
+	}
 	if len(entry.Models) == 0 {
 		return
 	}

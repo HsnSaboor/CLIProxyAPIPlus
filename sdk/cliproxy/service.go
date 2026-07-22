@@ -2376,11 +2376,28 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 			if strings.EqualFold(cfgKey, attrKey) && strings.EqualFold(cfgBase, attrBase) {
 				return entry
 			}
+			for j := range entry.APIKeyEntries {
+				sub := &entry.APIKeyEntries[j]
+				subBase := strings.TrimSpace(sub.BaseURL)
+				if subBase == "" {
+					subBase = cfgBase
+				}
+				if strings.EqualFold(strings.TrimSpace(sub.APIKey), attrKey) && strings.EqualFold(subBase, attrBase) {
+					return entry
+				}
+			}
 			continue
 		}
 		if attrKey != "" && strings.EqualFold(cfgKey, attrKey) {
 			if cfgBase == "" || strings.EqualFold(cfgBase, attrBase) {
 				return entry
+			}
+		}
+		if attrKey != "" {
+			for j := range entry.APIKeyEntries {
+				if strings.EqualFold(strings.TrimSpace(entry.APIKeyEntries[j].APIKey), attrKey) {
+					return entry
+				}
 			}
 		}
 		if attrKey == "" && attrBase != "" && strings.EqualFold(cfgBase, attrBase) {
@@ -2392,6 +2409,11 @@ func (s *Service) resolveConfigClaudeKey(auth *coreauth.Auth) *config.ClaudeKey 
 			entry := &s.cfg.ClaudeKey[i]
 			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
 				return entry
+			}
+			for j := range entry.APIKeyEntries {
+				if strings.EqualFold(strings.TrimSpace(entry.APIKeyEntries[j].APIKey), attrKey) {
+					return entry
+				}
 			}
 		}
 	}
