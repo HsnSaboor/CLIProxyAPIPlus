@@ -1993,7 +1993,14 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	}
 	geminiAPIKeyCount := len(cfg.GeminiKey)
 	interactionsAPIKeyCount := len(cfg.InteractionsKey)
-	claudeAPIKeyCount := len(cfg.ClaudeKey)
+	claudeAPIKeyCount := 0
+	for i := range cfg.ClaudeKey {
+		if n := len(cfg.ClaudeKey[i].APIKeyEntries); n > 0 {
+			claudeAPIKeyCount += n
+			continue
+		}
+		claudeAPIKeyCount++
+	}
 	codexAPIKeyCount := len(cfg.CodexKey)
 	xaiAPIKeyCount := len(cfg.XAIKey)
 	vertexAICompatCount := len(cfg.VertexCompatAPIKey)
