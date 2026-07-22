@@ -18,7 +18,7 @@ CLI向けのOpenAI/Gemini/Claude/Codex/Grok互換APIインターフェースを�
     </tr>
     <tr>
         <td align="center"><a href="https://www.kimi.com/code/?aff=cliproxyapi"><img src="./assets/logo/kimi.svg" alt="Kimi" width="28" height="28" /></a></td>
-        <td>Kimiシリーズモデル（Kimi K2.7 Code、Kimi K2.6など）。<a href="https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart">Kimi K2.7 Code</a>は、コーディングと複雑なソフトウェアエンジニアリング向けに構築されたオープンソースのエージェント型モデルで、実世界の長期間ワークフローにおけるエンドツーエンド成功率を高めます。K2.6と比較して、thinkingトークンを約30%削減します。CLIProxyAPIはOAuthまたは互換APIインターフェース経由でKimiをサポートします。<a href="https://www.kimi.com/code/?aff=cliproxyapi">Kimi Codeサブスクリプション</a>を試すか、<a href="https://platform.kimi.ai/?aff=cliproxyapi">Kimi Open Platform</a>でAPIキーを取得してください。Kimiのオープンソースコミュニティへの貢献に感謝します！</td>
+        <td>Kimiシリーズモデル（Kimi K3、Kimi K2.7 Codeなど）。<a href="https://platform.kimi.ai/docs/guide/kimi-k3-quickstart">Kimi K3</a>は、Moonshot AIで最も高性能なモデルであり、世界初のオープンな3兆パラメータ級モデルです。2.8兆のパラメータ、ネイティブな視覚機能、100万トークンのコンテキストウィンドウを備え、長期間にわたるコーディング、知識作業、推論向けに構築されています。CLIProxyAPIはOAuthまたは互換APIインターフェース経由でKimiをサポートします。<a href="https://www.kimi.com/code/?aff=cliproxyapi">Kimi Codeサブスクリプション</a>を試すか、<a href="https://platform.kimi.ai/?aff=cliproxyapi">Kimi Open Platform</a>でAPIキーを取得してください。CLIProxyAPIとオープンソースコミュニティを支援してくださるKimiに感謝します！</td>
     </tr>
     <tr>
         <td align="center"><a href="https://platform.openai.com/docs/guide/gpt-5.6"><img src="./assets/logo/openai.svg" alt="OpenAI" width="28" height="28" /></a></td>

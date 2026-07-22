@@ -232,7 +232,9 @@ func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Aut
 
 func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, []byte, http.Header, error) {
 	token, _ := xaiCreds(auth)
-	baseURL := xaiChatBaseURL(auth)
+	// Compact must not use xaiChatBaseURL: CLI chat-proxy returns 404 for
+	// /responses/compact and a 404 cools down the whole xAI auth pool.
+	baseURL := xaiCompactBaseURL(auth)
 	logXAIResolvedBaseURL(ctx, baseURL)
 
 	prepared, err := e.prepareResponsesRequestTo(ctx, req, opts, false, sdktranslator.FormatOpenAIResponse)
@@ -252,7 +254,9 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	applyXAIChatHeaders(httpReq, auth, token, false, prepared.sessionID)
+	// Official API / custom compact endpoints use standard API headers, not CLI
+	// chat-proxy identity headers (which applyXAIChatHeaders may still attach for OAuth chat).
+	applyXAIHeaders(httpReq, auth, token, false, prepared.sessionID)
 	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -497,13 +501,14 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 		endpointPath = xaiDefaultImageEndpointPath
 	}
 
+	payload := normalizeXAIImageRefs(req.Payload)
 	url := strings.TrimSuffix(baseURL, "/") + endpointPath
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(req.Payload))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return resp, err
 	}
 	applyXAIHeaders(httpReq, auth, token, false, "")
-	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), req.Payload)
+	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), payload)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
@@ -543,15 +548,16 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 	}
 	logXAIResolvedBaseURL(ctx, baseURL)
 
+	payload := normalizeXAIImageRefs(req.Payload)
 	method := http.MethodPost
 	endpointPath := xaiVideosGenerationsPath
-	var body io.Reader = bytes.NewReader(req.Payload)
+	var body io.Reader = bytes.NewReader(payload)
 
 	switch path := xaiVideoEndpointPath(opts); path {
 	case xaiVideosGenerationsPath, xaiVideosEditsPath, xaiVideosExtensionsPath:
 		endpointPath = path
 	default:
-		if requestID := strings.TrimSpace(gjson.GetBytes(req.Payload, "request_id").String()); requestID != "" {
+		if requestID := strings.TrimSpace(gjson.GetBytes(payload, "request_id").String()); requestID != "" {
 			method = http.MethodGet
 			endpointPath = xaiVideosPath + "/" + url.PathEscape(requestID)
 			body = nil
@@ -572,7 +578,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 			httpReq.Header.Set("x-idempotency-key", key)
 		}
 	}
-	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Header.Clone(), req.Payload)
+	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Header.Clone(), payload)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
@@ -898,8 +904,8 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", stream)
+	body = helps.SetStringIfDifferent(body, "model", baseModel)
+	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
@@ -908,7 +914,8 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	// Collect before normalizeXAITools flattens namespace wrappers so keys match
 	// the post-restore (namespace, short-name) shape used by the response filter.
 	clientDeclaredTools := collectXAIClientDeclaredToolKeys(body)
-	body = NormalizeXAITools(body)
+	body = normalizeXAITools(body)
+	body = promoteXAIAdditionalTools(body)
 	// Drop choices that point at tools removed by normalizeXAITools before we
 	// inject native x_search, so a surviving allowed_tools / forced choice is not
 	// left pointing at a deleted tool once only x_search remains.
@@ -927,13 +934,14 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body = sanitizeXAIInputEncryptedContent(body)
 	body = normalizeCodexInstructions(body)
 	body = sanitizeXAIResponsesBody(body, baseModel)
+	body = normalizeXAIImageRefs(body)
 
 	sessionID, errSession := xaiResolveComposerSessionID(ctx, req, opts, baseModel)
 	if errSession != nil {
 		return nil, errSession
 	}
 	if sessionID != "" {
-		body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
+		body = helps.SetStringIfDifferent(body, "prompt_cache_key", sessionID)
 	}
 
 	return &xaiPreparedRequest{
@@ -1030,8 +1038,9 @@ func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
 // is false (including its OAuth default), empty or official default base_url is
 // rewritten to the CLI chat-proxy endpoint; an explicit non-default base_url is
 // still honored.
-// Websocket transport intentionally does not use this helper: cli-chat-proxy only
-// accepts HTTP POST and returns 405 for websocket upgrades.
+// Websocket and compact transports intentionally do not use this helper:
+// cli-chat-proxy only accepts HTTP POST chat and does not implement
+// /responses/compact (404) or websocket upgrades (405).
 func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
 	_, baseURL := xaiCreds(auth)
 	if xaiUsingAPI(auth) {
@@ -1044,6 +1053,18 @@ func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
 		return baseURL
 	}
 	return xaiauth.CLIChatProxyBaseURL
+}
+
+// xaiCompactBaseURL returns the base URL for xAI /responses/compact requests.
+// Compact must stay on the official API (or an explicit non-CLI-proxy base_url).
+// Reusing xaiChatBaseURL would pin OAuth traffic to cli-chat-proxy, which returns
+// 404 for /responses/compact and then cools down the auth pool as not_found.
+func xaiCompactBaseURL(auth *cliproxyauth.Auth) string {
+	_, baseURL := xaiCreds(auth)
+	if baseURL == "" || xaiIsCLIChatProxyBaseURL(baseURL) {
+		return xaiauth.DefaultAPIBaseURL
+	}
+	return baseURL
 }
 
 func xaiNormalizeBaseURL(baseURL string) string {
@@ -1130,7 +1151,7 @@ func xaiResolveComposerSessionID(ctx context.Context, req cliproxyexecutor.Reque
 	if !xaiRequiresIsolatedConversation(baseModel) {
 		return "", nil
 	}
-	cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, req.Model, req.Payload, opts.Headers)
+	cached, ok, errCache := helps.ClaudeCodePromptCache(ctx, baseModel, req.Payload, opts.Headers)
 	if errCache != nil {
 		return "", errCache
 	}
@@ -1170,6 +1191,92 @@ func xaiImageEndpointPath(opts cliproxyexecutor.Options) string {
 		return xaiImagesGenerationsPath
 	}
 	return xaiDefaultImageEndpointPath
+}
+
+// normalizeXAIImageRefs rewrites OpenAI-style image object fields to the xAI
+// image API shape before the payload is sent upstream:
+//
+//	{"image":{"image_url":"https://..."}} → {"image":{"url":"https://..."}}
+//
+// Applies to image / images / reference_images anywhere in the JSON tree,
+// including nested objects and array items. Does not rewrite chat content
+// parts shaped as {"type":"image_url","image_url":{...}}.
+func normalizeXAIImageRefs(body []byte) []byte {
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var payload any
+	if errDecode := decoder.Decode(&payload); errDecode != nil {
+		return body
+	}
+
+	if !normalizeXAIImageRefsValue(payload) {
+		return body
+	}
+	normalized, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return body
+	}
+	return normalized
+}
+
+func normalizeXAIImageRefsValue(value any) bool {
+	changed := false
+	switch node := value.(type) {
+	case map[string]any:
+		for key, child := range node {
+			switch key {
+			case "image":
+				changed = normalizeXAIImageRef(child) || changed
+			case "images", "reference_images":
+				if refs, ok := child.([]any); ok {
+					for _, ref := range refs {
+						changed = normalizeXAIImageRef(ref) || changed
+					}
+				}
+			}
+			changed = normalizeXAIImageRefsValue(child) || changed
+		}
+	case []any:
+		for _, child := range node {
+			changed = normalizeXAIImageRefsValue(child) || changed
+		}
+	}
+	return changed
+}
+
+func normalizeXAIImageRef(value any) bool {
+	ref, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+
+	originalURL, _ := ref["url"].(string)
+	url := strings.TrimSpace(originalURL)
+	imageURL, hasImageURL := ref["image_url"]
+	if url == "" {
+		switch imageURL := imageURL.(type) {
+		case string:
+			url = strings.TrimSpace(imageURL)
+		case map[string]any:
+			url, _ = imageURL["url"].(string)
+			url = strings.TrimSpace(url)
+		}
+	}
+	if url == "" {
+		return false
+	}
+	if url == originalURL && !hasImageURL {
+		return false
+	}
+
+	// Always emit the xAI field name and drop the OpenAI alias.
+	ref["url"] = url
+	delete(ref, "image_url")
+	return true
 }
 
 func xaiIsVideoRequest(opts cliproxyexecutor.Options) bool {
@@ -1212,15 +1319,6 @@ func xaiMetadataString(meta map[string]any, key string) string {
 }
 
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
-	name := strings.ToLower(strings.TrimSpace(thinking.ParseSuffix(model).ModelName))
-	if strings.HasPrefix(name, "grok-4.3") {
-		// Force reasoning effort to medium for grok-4.3 per user requirement.
-		body, _ = sjson.SetBytes(body, "reasoning.effort", "medium")
-		body, _ = sjson.DeleteBytes(body, "presence_penalty")
-		body, _ = sjson.DeleteBytes(body, "frequency_penalty")
-		body, _ = sjson.DeleteBytes(body, "stop")
-		return body
-	}
 	if !xaiSupportsReasoningEffort(model) {
 		if gjson.GetBytes(body, "reasoning.effort").Exists() {
 			log.Debugf("xai: stripping reasoning.effort for model %s (no thinking levels in model registry)", model)
@@ -1317,27 +1415,24 @@ func pruneXAIAllowedToolsChoice(body []byte, available map[xaiToolChoiceKey]stru
 		body, _ = sjson.DeleteBytes(body, "tool_choice")
 		return body
 	}
-	filtered := []byte(`[]`)
+	allowedItems := allowed.Array()
+	filtered := make([][]byte, 0, len(allowedItems))
 	changed := false
-	for _, tool := range allowed.Array() {
+	for _, tool := range allowedItems {
 		if !xaiToolChoiceMatchesAvailable(tool, available) {
 			changed = true
 			continue
 		}
-		updated, errSet := sjson.SetRawBytes(filtered, "-1", []byte(tool.Raw))
-		if errSet != nil {
-			return body
-		}
-		filtered = updated
+		filtered = append(filtered, []byte(tool.Raw))
 	}
 	if !changed {
 		return body
 	}
-	if len(gjson.ParseBytes(filtered).Array()) == 0 {
+	if len(filtered) == 0 {
 		body, _ = sjson.DeleteBytes(body, "tool_choice")
 		return body
 	}
-	body, _ = sjson.SetRawBytes(body, "tool_choice.tools", filtered)
+	body, _ = sjson.SetRawBytes(body, "tool_choice.tools", helps.JoinRawJSONArray(filtered))
 	return body
 }
 
@@ -1398,8 +1493,7 @@ func xaiToolChoiceMatchesAvailable(choice gjson.Result, available map[xaiToolCho
 	return ok
 }
 
-// NormalizeXAITools flattens namespace tools and enforces the xAI 200-tool cap.
-func NormalizeXAITools(body []byte) []byte {
+func normalizeXAITools(body []byte) []byte {
 	if !gjson.ValidBytes(body) {
 		return body
 	}
@@ -1441,10 +1535,69 @@ func NormalizeXAITools(body []byte) []byte {
 	return body
 }
 
+// promoteXAIAdditionalTools moves Responses Lite tool declarations to the
+// top-level tools array because xAI does not accept additional_tools input items.
+func promoteXAIAdditionalTools(body []byte) []byte {
+	if !gjson.ValidBytes(body) {
+		return body
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+
+	inputItems := input.Array()
+	remainingInput := make([]json.RawMessage, 0, len(inputItems))
+	promotedTools := make([]json.RawMessage, 0)
+	for _, item := range inputItems {
+		if item.Get("type").String() != "additional_tools" {
+			remainingInput = append(remainingInput, json.RawMessage(item.Raw))
+			continue
+		}
+		for _, tool := range item.Get("tools").Array() {
+			promotedTools = append(promotedTools, json.RawMessage(tool.Raw))
+		}
+	}
+	if len(remainingInput) == len(inputItems) {
+		return body
+	}
+
+	rawInput, errMarshalInput := json.Marshal(remainingInput)
+	if errMarshalInput != nil {
+		return body
+	}
+	updated, errSetInput := sjson.SetRawBytes(body, "input", rawInput)
+	if errSetInput != nil {
+		return body
+	}
+	if len(promotedTools) == 0 {
+		return updated
+	}
+
+	topLevelTools := gjson.GetBytes(updated, "tools")
+	tools := make([]json.RawMessage, 0, len(topLevelTools.Array())+len(promotedTools))
+	if topLevelTools.IsArray() {
+		for _, tool := range topLevelTools.Array() {
+			tools = append(tools, json.RawMessage(tool.Raw))
+		}
+	}
+	tools = append(tools, promotedTools...)
+	rawTools, errMarshalTools := json.Marshal(tools)
+	if errMarshalTools != nil {
+		return body
+	}
+	updated, errSetTools := sjson.SetRawBytes(updated, "tools", rawTools)
+	if errSetTools != nil {
+		return body
+	}
+	return updated
+}
+
 func normalizeXAIToolArray(tools gjson.Result) ([]byte, bool, bool) {
+	toolItems := tools.Array()
+	filtered := make([][]byte, 0, len(toolItems))
 	changed := false
-	filtered := []byte(`[]`)
-	for _, tool := range tools.Array() {
+	for _, tool := range toolItems {
 		toolType := tool.Get("type").String()
 		if toolType == xaiNamespaceToolType {
 			changed = true
@@ -1456,14 +1609,9 @@ func normalizeXAIToolArray(tools gjson.Result) ([]byte, bool, bool) {
 						return nil, false, false
 					}
 					changed = changed || nestedChanged
-					if len(nestedRaw) == 0 {
-						continue
+					if len(nestedRaw) > 0 {
+						filtered = append(filtered, nestedRaw)
 					}
-					updated, errSet := sjson.SetRawBytes(filtered, "-1", nestedRaw)
-					if errSet != nil {
-						return nil, false, false
-					}
-					filtered = updated
 				}
 			}
 			continue
@@ -1473,34 +1621,18 @@ func normalizeXAIToolArray(tools gjson.Result) ([]byte, bool, bool) {
 			return nil, false, false
 		}
 		changed = changed || toolChanged
-		if len(raw) == 0 {
-			continue
+		if len(raw) > 0 {
+			filtered = append(filtered, raw)
 		}
-		updated, errSet := sjson.SetRawBytes(filtered, "-1", raw)
-		if errSet != nil {
-			return nil, false, false
-		}
-		filtered = updated
 	}
-	// xAI limit: max 200 tools (https://docs.x.ai/docs/guides/function-calling)
-	// cap to avoid "Maximum tools limit reached. 247 tools..." error
-	// Always enforce the cap regardless of whether namespace normalization occurred.
-	toolsArr := gjson.GetBytes(filtered, "@this").Array()
-	if len(toolsArr) > 200 {
-		capped := []byte(`[]`)
-		for i := 0; i < 200 && i < len(toolsArr); i++ {
-			updated, _ := sjson.SetRawBytes(capped, "-1", []byte(toolsArr[i].Raw))
-			capped = updated
-		}
-		filtered = capped
-		log.Warnf("xai: capped tools from %d to 200 to satisfy xAI limit", len(toolsArr))
-		changed = true
+	if !changed {
+		return nil, false, true
 	}
-	return filtered, changed, true
+	return helps.JoinRawJSONArray(filtered), true, true
 }
 
 // normalizeXAIToolChoiceForTools drops tool_choice and parallel_tool_calls
-// when tools are absent or empty (including after NormalizeXAITools filtering).
+// when tools are absent or empty (including after normalizeXAITools filtering).
 // xAI rejects payloads that include tool_choice without any tools defined.
 // Existence checks avoid unnecessary sjson parse/copy passes.
 func normalizeXAIToolChoiceForTools(body []byte) []byte {
@@ -1584,11 +1716,25 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 	if toolType == xaiToolSearchType || toolType == xaiImageGenerationToolType {
 		return nil, true, true
 	}
+	if toolType == xaiCustomToolType && tool.Get("name").String() == "apply_patch" {
+		return nil, true, true
+	}
+
 	raw := []byte(tool.Raw)
-	if toolType == xaiCustomToolType {
-		if tool.Get("name").String() == "apply_patch" {
-			return nil, true, true
+	schemaTool := tool
+	if toolType == xaiFunctionToolType || toolType == xaiCustomToolType {
+		updatedTool, schemaChanged, ok := normalizeXAIObjectRootUnionBranchTypes(raw)
+		if !ok {
+			return nil, false, false
 		}
+		raw = updatedTool
+		if schemaChanged {
+			schemaTool = gjson.ParseBytes(raw)
+			changed = true
+			log.Debugf("xai: added object types to root union branches for tool %s.%s", namespaceName, tool.Get("name").String())
+		}
+	}
+	if toolType == xaiCustomToolType {
 		updatedTool, errSet := sjson.SetBytes(raw, "type", xaiFunctionToolType)
 		if errSet != nil {
 			return nil, false, false
@@ -1605,7 +1751,7 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 		raw = updatedTool
 		changed = true
 	}
-	if toolType == xaiFunctionToolType && !tool.Get("parameters").Exists() {
+	if toolType == xaiFunctionToolType && !schemaTool.Get("parameters").Exists() {
 		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(`{"type":"object","properties":{}}`))
 		if errSet != nil {
 			return nil, false, false
@@ -1615,7 +1761,7 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 	}
 	// Simplify the Codex Desktop automation schema and root unions that xAI
 	// rejects because function parameters must resolve exclusively to objects.
-	if toolType == xaiFunctionToolType && xaiFunctionParametersNeedSimplification(tool, namespaceName) {
+	if toolType == xaiFunctionToolType && xaiFunctionParametersNeedSimplification(schemaTool, namespaceName) {
 		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(xaiSafeFunctionParameters))
 		if errSet != nil {
 			return nil, false, false
@@ -2119,6 +2265,57 @@ func restoreXAINamespaceToolCallAtPath(data []byte, path string, refs map[string
 	return updated
 }
 
+// normalizeXAIObjectRootUnionBranchTypes makes untyped root union branches
+// explicitly object-only when the parameter root already permits only objects.
+// This preserves the original schema semantics while satisfying xAI validation.
+func normalizeXAIObjectRootUnionBranchTypes(tool []byte) ([]byte, bool, bool) {
+	parameters := gjson.GetBytes(tool, "parameters")
+	rootType := parameters.Get("type")
+	if rootType.Type != gjson.String || rootType.String() != "object" {
+		return tool, false, true
+	}
+
+	original := tool
+	changed := false
+	for _, unionName := range []string{"anyOf", "oneOf"} {
+		union := parameters.Get(unionName)
+		if !union.IsArray() {
+			continue
+		}
+		for index, branch := range union.Array() {
+			if !branch.IsObject() || branch.Get("type").Exists() {
+				continue
+			}
+			updated, errSet := sjson.SetBytes(tool, fmt.Sprintf("parameters.%s.%d.type", unionName, index), "object")
+			if errSet != nil {
+				return original, false, false
+			}
+			tool = updated
+			changed = true
+		}
+	}
+	return tool, changed, true
+}
+
+func xaiSchemaTypeIsObjectOnly(schemaType gjson.Result) bool {
+	if schemaType.Type == gjson.String {
+		return strings.EqualFold(strings.TrimSpace(schemaType.String()), "object")
+	}
+	if !schemaType.IsArray() {
+		return false
+	}
+	types := schemaType.Array()
+	if len(types) == 0 {
+		return false
+	}
+	for _, schemaTypeItem := range types {
+		if schemaTypeItem.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(schemaTypeItem.String()), "object") {
+			return false
+		}
+	}
+	return true
+}
+
 // xaiFunctionParametersNeedSimplification reports whether a function tool, or
 // a custom tool normalized to a function, has a schema that xAI cannot accept.
 func xaiFunctionParametersNeedSimplification(tool gjson.Result, namespaceName string) bool {
@@ -2144,26 +2341,8 @@ func xaiFunctionParametersNeedSimplification(tool gjson.Result, namespaceName st
 			continue
 		}
 		for _, branch := range union.Array() {
-			branchType := branch.Get("type")
-			if branchType.Type == gjson.String {
-				if !strings.EqualFold(strings.TrimSpace(branchType.String()), "object") {
-					return true
-				}
-				continue
-			}
-			if !branchType.IsArray() {
-				// Without an explicit object type, the branch may accept non-object
-				// values even when it only declares object-specific keywords.
+			if !xaiSchemaTypeIsObjectOnly(branch.Get("type")) {
 				return true
-			}
-			allowedTypes := branchType.Array()
-			if len(allowedTypes) == 0 {
-				return true
-			}
-			for _, allowedType := range allowedTypes {
-				if allowedType.Type != gjson.String || !strings.EqualFold(strings.TrimSpace(allowedType.String()), "object") {
-					return true
-				}
 			}
 		}
 	}
@@ -2266,6 +2445,14 @@ func normalizeXAIInputReasoningItems(body []byte) []byte {
 		contentPath := fmt.Sprintf("input.%d.content", i)
 		if content := gjson.GetBytes(updated, contentPath); content.Exists() && content.Type == gjson.Null {
 			updatedBody, errDel := sjson.DeleteBytes(updated, contentPath)
+			if errDel != nil {
+				return body
+			}
+			updated = updatedBody
+		}
+		encryptedContentPath := fmt.Sprintf("input.%d.encrypted_content", i)
+		if encryptedContent := gjson.GetBytes(updated, encryptedContentPath); encryptedContent.Exists() && encryptedContent.Type == gjson.Null {
+			updatedBody, errDel := sjson.DeleteBytes(updated, encryptedContentPath)
 			if errDel != nil {
 				return body
 			}

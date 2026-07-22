@@ -170,12 +170,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
-	// xAI provider: enforce 200 tools cap (https://docs.x.ai/docs/guides/function-calling)
-	// Defensive: applies if xAI auth routes through OpenAICompatExecutor (e.g., compat_name set)
-	if e.provider == "xai" {
-		translated = NormalizeXAITools(translated)
-	}
-
 	// Ensure all tool-related id fields are JSON strings (some clients send
 	// numeric or null ids which upstream providers reject).
 	translated = normalizeToolResultIDsToString(translated)
@@ -415,14 +409,8 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	translated = helps.SetBoolIfDifferent(translated, "stream_options.include_usage", true)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
-
-	// xAI provider: enforce 200 tools cap (https://docs.x.ai/docs/guides/function-calling)
-	// Defensive: applies if xAI auth routes through OpenAICompatExecutor (e.g., compat_name set)
-	if e.provider == "xai" {
-		translated = NormalizeXAITools(translated)
-	}
 
 	// Ensure all tool-related id fields are JSON strings (some clients send
 	// numeric or null ids which upstream providers reject).
@@ -734,10 +722,10 @@ func prepareOpenAICompatImagesPayload(payload []byte, model string, contentType 
 	contentType = strings.TrimSpace(contentType)
 	if json.Valid(payload) {
 		if model != "" {
-			payload, _ = sjson.SetBytes(payload, "model", model)
+			payload = helps.SetStringIfDifferent(payload, "model", model)
 		}
 		if stream {
-			payload, _ = sjson.SetBytes(payload, "stream", true)
+			payload = helps.SetBoolIfDifferent(payload, "stream", true)
 		} else {
 			payload, _ = sjson.DeleteBytes(payload, "stream")
 		}
@@ -901,8 +889,7 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	if len(payload) == 0 || model == "" {
 		return payload
 	}
-	payload, _ = sjson.SetBytes(payload, "model", model)
-	return payload
+	return helps.SetStringIfDifferent(payload, "model", model)
 }
 
 // isMiMoModel reports whether the model name (after alias resolution) refers to a

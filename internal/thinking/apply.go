@@ -377,6 +377,13 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
 	}
 
 	config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
+	// Clamp level-mode configs to the model's declared supported levels. The
+	// user-defined path skips ValidateConfig, so an unsupported level (e.g.
+	// "xhigh" on a low/medium/high model like minimax-m3) would otherwise reach
+	// the upstream verbatim and be rejected as an invalid reasoning enum.
+	if config.Mode == ModeLevel && modelInfo != nil && modelInfo.Thinking != nil && len(modelInfo.Thinking.Levels) > 0 {
+		config.Level = clampLevel(config.Level, modelInfo, toFormat)
+	}
 	log.WithFields(log.Fields{
 		"provider": toFormat,
 		"model":    modelID,
@@ -425,8 +432,7 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 	case "codex", "xai":
 		return extractCodexConfig(body)
 	case "kimi":
-		// Kimi uses OpenAI-compatible reasoning_effort format
-		return extractOpenAIConfig(body)
+		return extractKimiConfig(body)
 	default:
 		return ThinkingConfig{}
 	}
@@ -688,6 +694,50 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 	}
 
 	return ThinkingConfig{}
+}
+
+// extractKimiConfig extracts Kimi's native thinking object while retaining
+// reasoning_effort as a legacy input fallback.
+//
+// Native fields take precedence over reasoning_effort. In particular,
+// thinking.type="enabled" without an explicit effort means "use the upstream
+// default" and therefore returns an empty config so ApplyThinking preserves the
+// request unchanged instead of interpreting it as CPA's ModeAuto.
+func extractKimiConfig(body []byte) ThinkingConfig {
+	thinkingType := gjson.GetBytes(body, "thinking.type")
+	if thinkingType.Exists() {
+		switch strings.ToLower(strings.TrimSpace(thinkingType.String())) {
+		case "disabled":
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		case "enabled":
+			if !gjson.GetBytes(body, "thinking.effort").Exists() {
+				return ThinkingConfig{}
+			}
+		}
+	}
+
+	if effort := gjson.GetBytes(body, "thinking.effort"); effort.Exists() {
+		value := strings.ToLower(strings.TrimSpace(effort.String()))
+		switch value {
+		case "":
+			return ThinkingConfig{}
+		case "none":
+			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		case "auto":
+			return ThinkingConfig{Mode: ModeAuto, Budget: -1}
+		default:
+			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
+		}
+	}
+
+	// An explicit native thinking object without an effort should be left for
+	// the Kimi upstream to interpret and must not be overridden by the legacy
+	// field.
+	if thinkingType.Exists() {
+		return ThinkingConfig{}
+	}
+
+	return extractOpenAIConfig(body)
 }
 
 // extractCodexConfig extracts thinking configuration from Codex format request body.
