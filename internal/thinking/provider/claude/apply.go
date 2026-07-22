@@ -28,6 +28,27 @@ func init() {
 	thinking.RegisterProvider("claude", NewApplier())
 }
 
+// stripOpenAIReasoningEffort removes the OpenAI-shaped "reasoning_effort"
+// field left over from an earlier claude->openai request translation step
+// (e.g. openai_compat_executor.go translating a native /v1/messages request
+// before routing Claude-family models back through this "claude" applier via
+// thinkingFormatFor). Claude's wire format has no "reasoning_effort" field;
+// some upstreams (e.g. Databricks-hosted Claude Sonnet 5) reject it outright
+// with "reasoning_effort: Extra inputs are not permitted" (HTTP 400) if left
+// in the body alongside the thinking/output_config fields this applier sets.
+func stripOpenAIReasoningEffort(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	if !gjson.GetBytes(body, "reasoning_effort").Exists() {
+		return body
+	}
+	if updated, err := sjson.DeleteBytes(body, "reasoning_effort"); err == nil {
+		return updated
+	}
+	return body
+}
+
 // Apply applies thinking configuration to Claude request body.
 //
 // IMPORTANT: This method expects config to be pre-validated by thinking.ValidateConfig.
@@ -70,6 +91,7 @@ func init() {
 //	  }
 //	}
 func (a *Applier) Apply(body []byte, config thinking.ThinkingConfig, modelInfo *registry.ModelInfo) ([]byte, error) {
+	body = stripOpenAIReasoningEffort(body)
 	if thinking.IsUserDefinedModel(modelInfo) {
 		return applyCompatibleClaude(body, config)
 	}

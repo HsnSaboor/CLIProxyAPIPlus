@@ -124,6 +124,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// caller explicitly set thinking.display.
 	if isClaudeFamilyModel(baseModel) {
 		translated = ensureClaudeThinkingDisplay(translated)
+		translated = stripLeakedReasoningEffortForClaude(translated)
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
@@ -374,6 +375,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// caller explicitly set thinking.display.
 	if isClaudeFamilyModel(baseModel) {
 		translated = ensureClaudeThinkingDisplay(translated)
+		translated = stripLeakedReasoningEffortForClaude(translated)
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
@@ -954,6 +956,39 @@ func isMistralProvider(provider string) bool {
 // reimplemented here.
 func isClaudeFamilyModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "claude")
+}
+
+// stripLeakedReasoningEffortForClaude removes the OpenAI-shaped
+// "reasoning_effort" field from a request body that is about to be routed to
+// a Claude-protocol-shaped upstream (e.g. Databricks-hosted Claude Sonnet 5)
+// via thinkingFormatFor's "claude" ProviderApplier.
+//
+// Root cause: thinking.ApplyThinking is called here with fromFormat="claude"
+// (this executor's entry protocol) and toFormat="claude" (from
+// thinkingFormatFor, for Claude-family models). Because fromFormat==toFormat,
+// ApplyThinking's internal fallback to try extracting thinking config from
+// the OTHER format never fires -- but by this point `translated` has ALREADY
+// been converted claude->openai a few lines above (TranslateRequest), so it
+// contains "reasoning_effort", not a "thinking" object. extractClaudeConfig
+// finds no "thinking.type" in this OpenAI-shaped body, returns an empty
+// config, and ApplyThinking passes the body through unmodified --
+// "reasoning_effort" rides along untouched into the upstream request.
+// Databricks (and any other genuinely-Claude-protocol upstream reached this
+// way) rejects it outright: "reasoning_effort: Extra inputs are not
+// permitted" (HTTP 400). Strip it here, after ApplyThinking has run, since
+// this is the one place with full context that the body is OpenAI-shaped but
+// about to be sent to a Claude-shaped upstream.
+func stripLeakedReasoningEffortForClaude(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	if !gjson.GetBytes(body, "reasoning_effort").Exists() {
+		return body
+	}
+	if updated, err := sjson.DeleteBytes(body, "reasoning_effort"); err == nil {
+		return updated
+	}
+	return body
 }
 
 // thinkingFormatFor returns the thinking-provider format to use for

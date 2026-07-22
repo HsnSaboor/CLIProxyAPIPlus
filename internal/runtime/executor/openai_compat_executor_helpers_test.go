@@ -258,6 +258,42 @@ func TestThinkingFormatFor(t *testing.T) {
 	}
 }
 
+func TestStripLeakedReasoningEffortForClaude(t *testing.T) {
+	t.Run("removes reasoning_effort when present", func(t *testing.T) {
+		input := `{"model":"databricks-claude-sonnet-5","messages":[],"reasoning_effort":"xhigh"}`
+		got := stripLeakedReasoningEffortForClaude([]byte(input))
+		if gjson.GetBytes(got, "reasoning_effort").Exists() {
+			t.Fatalf("reasoning_effort should be removed, got %s", got)
+		}
+		if model := gjson.GetBytes(got, "model").String(); model != "databricks-claude-sonnet-5" {
+			t.Fatalf("model = %q, want databricks-claude-sonnet-5; payload=%s", model, got)
+		}
+	})
+
+	t.Run("no-op when reasoning_effort absent", func(t *testing.T) {
+		input := `{"model":"databricks-claude-sonnet-5","messages":[],"thinking":{"type":"adaptive"}}`
+		got := stripLeakedReasoningEffortForClaude([]byte(input))
+		if string(got) != input {
+			t.Errorf("got %q, want unchanged %q", got, input)
+		}
+	})
+
+	t.Run("empty body unchanged", func(t *testing.T) {
+		got := stripLeakedReasoningEffortForClaude([]byte(""))
+		if string(got) != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+
+	t.Run("invalid json unchanged", func(t *testing.T) {
+		input := "not json"
+		got := stripLeakedReasoningEffortForClaude([]byte(input))
+		if string(got) != input {
+			t.Errorf("got %q, want unchanged %q", got, input)
+		}
+	})
+}
+
 func TestStripOpenAICompatProviderUnsupportedFields_Kimi(t *testing.T) {
 	payload := []byte(`{"model":"kimi-k2.5","messages":[],"reasoning_effort":"high","reasoning":{"enabled":true},"reasoningSummary":"auto","include":["reasoning"],"verbosity":"detailed"}`)
 	compat := &config.OpenAICompatibility{Name: "kimi", BaseURL: "https://api.moonshot.cn/v1"}
