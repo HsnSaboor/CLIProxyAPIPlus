@@ -5459,6 +5459,54 @@ func isModelSupportError(err error) bool {
 	return isModelSupportErrorMessage(err.Error())
 }
 
+// isPromptTooLongErrorMessage reports whether an upstream error message
+// indicates the request's prompt/context exceeds the model's context window.
+// This is a property of the REQUEST CONTENT, not the selected credential --
+// it will fail identically on every credential in the pool (same account,
+// different account, same provider, different provider serving the same
+// model), so retrying it across the credential pool is guaranteed to fail
+// every single time while burning the full retry/fallback budget. Observed
+// verbatim from Databricks-hosted Claude Sonnet 5: "prompt is too long:
+// 1232443 tokens > 1000000 maximum". Treating this as request-invalid makes
+// the proxy fail fast (return the real error to the caller immediately)
+// instead of exhausting all ~100+ pooled credentials over several minutes
+// before finally giving up.
+func isPromptTooLongErrorMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	patterns := [...]string{
+		"prompt is too long",
+		"context_length_exceeded",
+		"context length exceeded",
+		"maximum context length",
+		"exceeds the model's context",
+		"exceeds context window",
+		"exceeds the maximum",
+		"input is too long",
+		"input length exceeds",
+		"too many tokens",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPromptTooLongError(err error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromError(err)
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	return isPromptTooLongErrorMessage(err.Error())
+}
+
 // isCreditExhaustedMessage reports whether an upstream error message
 // indicates the account/workspace has run out of billing credits. Observed
 // verbatim in production against Databricks-hosted model-provider-service
@@ -5841,6 +5889,12 @@ func isRequestInvalidError(err error) bool {
 	}
 	if isModelSupportError(err) {
 		return false
+	}
+	if isPromptTooLongError(err) {
+		// The request's content (not the credential) exceeds the model's
+		// context window; every credential in the pool will reject it
+		// identically, so fail fast instead of exhausting the fallback chain.
+		return true
 	}
 	status := statusCodeFromError(err)
 	switch status {

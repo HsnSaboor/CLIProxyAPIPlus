@@ -2745,3 +2745,110 @@ func TestManager_PlainBadRequest400_DoesNotSetQuotaExceeded(t *testing.T) {
 		t.Fatalf("NextRetryAfter = %v, want ~30m from now", state.NextRetryAfter)
 	}
 }
+
+func TestIsPromptTooLongErrorMessage(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"databricks_wording", `{"error_code":"BAD_REQUEST","message":"prompt is too long: 1232443 tokens > 1000000 maximum"}`, true},
+		{"openai_context_length_exceeded", "This model's maximum context length is 128000 tokens. However, your messages resulted in 200000 tokens (context_length_exceeded)", true},
+		{"generic_too_many_tokens", "too many tokens in request", true},
+		{"unrelated_400", "invalid_request_error: The requested model is not supported.", false},
+		{"case_insensitive", "PROMPT IS TOO LONG: 5000000 tokens > 1000000 maximum", true},
+		{"whitespace_only", "   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPromptTooLongErrorMessage(tc.message); got != tc.want {
+				t.Fatalf("isPromptTooLongErrorMessage(%q) = %v, want %v", tc.message, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsPromptTooLongError(t *testing.T) {
+	tooLongMsg := "prompt is too long: 1232443 tokens > 1000000 maximum"
+	cases := []struct {
+		name string
+		err  *Error
+		want bool
+	}{
+		{"nil_error", nil, false},
+		{"400_too_long", &Error{HTTPStatus: http.StatusBadRequest, Message: tooLongMsg}, true},
+		{"422_too_long", &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: tooLongMsg}, true},
+		{"400_unrelated_message", &Error{HTTPStatus: http.StatusBadRequest, Message: "bad request"}, false},
+		{"401_too_long_wrong_status", &Error{HTTPStatus: http.StatusUnauthorized, Message: tooLongMsg}, false},
+		{"500_too_long_wrong_status", &Error{HTTPStatus: http.StatusInternalServerError, Message: tooLongMsg}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPromptTooLongError(tc.err); got != tc.want {
+				t.Fatalf("isPromptTooLongError(%+v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestManager_PromptTooLong400_FailsFastWithoutExhaustingPool verifies that a
+// "prompt is too long" 400 error returns immediately to the caller without
+// falling back to (and burning retry budget against) every other credential
+// in the pool. Every credential would reject the identical oversized prompt
+// identically, so fanning out across the pool is pure wasted latency -- this
+// guards against the regression observed in production where a single
+// oversized request exhausted a 120-credential pool over ~5 minutes before
+// finally failing.
+func TestManager_PromptTooLong400_FailsFastWithoutExhaustingPool(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	tooLongErr := &Error{
+		HTTPStatus: http.StatusBadRequest,
+		Message:    `{"error_code":"BAD_REQUEST","message":"prompt is too long: 1232443 tokens > 1000000 maximum"}`,
+	}
+	executor := &authFallbackExecutor{
+		id: "databricks-claude",
+		executeErrors: map[string]error{
+			"aa-auth": tooLongErr,
+			"bb-auth": tooLongErr,
+			"cc-auth": tooLongErr,
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "databricks-claude-sonnet-5"
+	auths := []*Auth{
+		{ID: "aa-auth", Provider: "databricks-claude"},
+		{ID: "bb-auth", Provider: "databricks-claude"},
+		{ID: "cc-auth", Provider: "databricks-claude"},
+	}
+
+	reg := registry.GetGlobalRegistry()
+	for _, a := range auths {
+		reg.RegisterClient(a.ID, "databricks-claude", []*registry.ModelInfo{{ID: model}})
+	}
+	t.Cleanup(func() {
+		for _, a := range auths {
+			reg.UnregisterClient(a.ID)
+		}
+	})
+	for _, a := range auths {
+		if _, errRegister := m.Register(context.Background(), a); errRegister != nil {
+			t.Fatalf("register auth %s: %v", a.ID, errRegister)
+		}
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	_, errExecute := m.Execute(context.Background(), []string{"databricks-claude"}, request, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatalf("expected execute to fail fast with the prompt-too-long error, got success")
+	}
+	if !strings.Contains(errExecute.Error(), "prompt is too long") {
+		t.Fatalf("execute error = %v, want it to surface the prompt-too-long message", errExecute)
+	}
+
+	calls := executor.ExecuteCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 execute call (fail fast, no fallback fan-out), got %d: %v", len(calls), calls)
+	}
+}
