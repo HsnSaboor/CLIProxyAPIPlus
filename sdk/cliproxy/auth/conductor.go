@@ -1812,8 +1812,16 @@ func countRemainingProviderOptions(currentProvider string, providers []string, t
 
 func shouldPreserveAttemptBudgetForStatus(statusCode int) bool {
 	switch statusCode {
+	// 429/503/504/502/408 are protocol-level signals that are transient and
+	// not tied to the specific request content, so they don't consume the
+	// attempt budget while other providers remain untried (see
+	// countRemainingProviderOptions). 500 is deliberately excluded: unlike
+	// the others, a 500 can reflect a permanent, request-specific upstream
+	// bug that will repeat on every retry, so it should count against the
+	// attempt budget like any other failure to avoid unbounded retry loops
+	// against a persistently-broken provider.
 	case http.StatusTooManyRequests, http.StatusGatewayTimeout, http.StatusServiceUnavailable,
-		http.StatusBadGateway, http.StatusRequestTimeout, http.StatusInternalServerError:
+		http.StatusBadGateway, http.StatusRequestTimeout:
 		return true
 	default:
 		return false
@@ -4889,42 +4897,34 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else if isCreditExhaustedResultError(result.Error) {
-								next := now.Add(24 * time.Hour)
-								state.NextRetryAfter = next
-								state.Quota.Exceeded = true
-								suspendReason = "credits_exhausted"
+								suspendReason = applyQuotaCooldown(state, now, 24*time.Hour, "credits_exhausted")
 								shouldSuspendModel = true
 							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "bad_request"
+								suspendReason = applyCooldown(state, now, 30*time.Minute, "bad_request")
 								shouldSuspendModel = true
 							}
 						case 401:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "unauthorized"
+								suspendReason = applyCooldown(state, now, 30*time.Minute, "unauthorized")
 								shouldSuspendModel = true
 							}
 						case 402, 403:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
+							} else if isCreditExhaustedResultError(result.Error) {
+								suspendReason = applyQuotaCooldown(state, now, 24*time.Hour, "credits_exhausted")
+								shouldSuspendModel = true
 							} else {
-								next := now.Add(30 * time.Minute)
-								state.NextRetryAfter = next
-								suspendReason = "payment_required"
+								suspendReason = applyCooldown(state, now, 30*time.Minute, "payment_required")
 								shouldSuspendModel = true
 							}
 						case 404:
 							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
-								next := now.Add(12 * time.Hour)
-								state.NextRetryAfter = next
-								suspendReason = "not_found"
+								suspendReason = applyCooldown(state, now, 12*time.Hour, "not_found")
 								shouldSuspendModel = true
 							}
 						case 429:
@@ -5417,6 +5417,16 @@ func isModelSupportError(err error) bool {
 	return isModelSupportErrorMessage(err.Error())
 }
 
+// isCreditExhaustedMessage reports whether an upstream error message
+// indicates the account/workspace has run out of billing credits. Observed
+// verbatim in production against Databricks-hosted model-provider-service
+// 400 responses (e.g. Databricks-brokered Anthropic/OpenAI credit pools):
+// "You have exhausted your available credits ... add a payment method to
+// upgrade." Since this is upstream-provider wording rather than a stable
+// error code, treat any future non-match as a silent no-op (falls through
+// to the generic bad_request/payment_required cooldown) rather than a hard
+// failure — if the wording drifts, this should be re-verified against real
+// upstream responses and the patterns updated here.
 func isCreditExhaustedMessage(message string) bool {
 	lower := strings.ToLower(strings.TrimSpace(message))
 	if lower == "" {
@@ -5433,6 +5443,35 @@ func isCreditExhaustedMessage(message string) bool {
 		}
 	}
 	return false
+}
+
+// applyCooldown sets state.NextRetryAfter to now+duration. It does not touch
+// state.Quota: for these failure classes (bad_request/unauthorized/
+// payment_required/not_found) the credential is not "quota exceeded" in the
+// billing/rate-limit sense — isAuthBlockedForModel uses Quota.Exceeded to
+// distinguish blockReasonCooldown (routes through the 429/model_cooldown
+// response, which tells clients "wait and retry") from blockReasonOther
+// (routes through auth_unavailable/503). Setting Quota.Exceeded here would
+// misclassify a permanently broken credential as a transient cooldown.
+// Returns reason for convenience so callers can assign it to suspendReason
+// inline.
+func applyCooldown(state *ModelState, now time.Time, duration time.Duration, reason string) string {
+	state.NextRetryAfter = now.Add(duration)
+	return reason
+}
+
+// applyQuotaCooldown is like applyCooldown but also marks state.Quota as
+// exceeded with the given reason, matching the convention used by the
+// 429/Cloudflare branches. Use this only for failure classes that genuinely
+// represent a recoverable quota/billing condition (e.g. credits_exhausted),
+// not for permanent-looking failures like unauthorized/not_found.
+func applyQuotaCooldown(state *ModelState, now time.Time, duration time.Duration, reason string) string {
+	next := now.Add(duration)
+	state.NextRetryAfter = next
+	state.Quota.Exceeded = true
+	state.Quota.Reason = reason
+	state.Quota.NextRecoverAt = next
+	return reason
 }
 
 func isInvalidGrantErrorMessage(message string) bool {
@@ -5472,12 +5511,18 @@ func isModelSupportResultError(err *Error) bool {
 	return isModelSupportErrorMessage(err.Message)
 }
 
+// isCreditExhaustedResultError reports whether err represents a credit/billing
+// exhaustion failure. Accepts 400 (observed verbatim from Databricks-hosted
+// model-provider-service responses) as well as the standard HTTP billing
+// status codes 402 Payment Required and 403 Forbidden, since different
+// providers surface the same underlying condition under different codes.
 func isCreditExhaustedResultError(err *Error) bool {
 	if err == nil {
 		return false
 	}
-	status := statusCodeFromResult(err)
-	if status != http.StatusBadRequest {
+	switch statusCodeFromResult(err) {
+	case http.StatusBadRequest, http.StatusPaymentRequired, http.StatusForbidden:
+	default:
 		return false
 	}
 	return isCreditExhaustedMessage(err.Message)
@@ -5621,6 +5666,14 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 	switch statusCode {
 	case 400:
+		if !disableCooling && isCreditExhaustedResultError(resultErr) {
+			auth.StatusMessage = "credits_exhausted"
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "credits_exhausted"
+			auth.Quota.NextRecoverAt = now.Add(24 * time.Hour)
+			auth.NextRetryAfter = auth.Quota.NextRecoverAt
+			break
+		}
 		auth.StatusMessage = "bad_request"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
@@ -5635,6 +5688,14 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.NextRetryAfter = now.Add(30 * time.Minute)
 		}
 	case 402, 403:
+		if !disableCooling && isCreditExhaustedResultError(resultErr) {
+			auth.StatusMessage = "credits_exhausted"
+			auth.Quota.Exceeded = true
+			auth.Quota.Reason = "credits_exhausted"
+			auth.Quota.NextRecoverAt = now.Add(24 * time.Hour)
+			auth.NextRetryAfter = auth.Quota.NextRecoverAt
+			break
+		}
 		auth.StatusMessage = "payment_required"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}

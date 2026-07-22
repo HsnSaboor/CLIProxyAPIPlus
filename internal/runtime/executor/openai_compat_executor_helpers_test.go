@@ -123,6 +123,139 @@ func TestNormalizeDeltaContentArray(t *testing.T) {
 			t.Errorf("content = %q, want %q", s, "hello world")
 		}
 	})
+
+	// Anthropic-style reasoning blocks nest visible text under
+	// summary[].text rather than a direct "text" field. Reasoning text must
+	// be preserved via delta.reasoning_content (matching the convention
+	// already used by codebuddy/github_copilot/kimi/mistral/iflow
+	// executors) rather than silently dropped, while delta.content must
+	// still become a plain string to satisfy OpenAI streaming schema
+	// validation (e.g. OpenCode/Claude Code reject an array here).
+	t.Run("reasoning block with nested summary extracted to reasoning_content", func(t *testing.T) {
+		input := `data: {"choices":[{"delta":{"content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking about it"}]},{"type":"text","text":"the answer"}]}}]}`
+		got := normalizeDeltaContentArray([]byte(input))
+		jsonPart := got[len("data: "):]
+		var obj struct {
+			Choices []struct {
+				Delta struct {
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(jsonPart, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		var content string
+		if err := json.Unmarshal(obj.Choices[0].Delta.Content, &content); err != nil {
+			t.Fatalf("content not string: %v", err)
+		}
+		if content != "the answer" {
+			t.Errorf("content = %q, want %q", content, "the answer")
+		}
+		if obj.Choices[0].Delta.ReasoningContent != "thinking about it" {
+			t.Errorf("reasoning_content = %q, want %q", obj.Choices[0].Delta.ReasoningContent, "thinking about it")
+		}
+	})
+
+	t.Run("reasoning-only chunk has empty content string and populated reasoning_content", func(t *testing.T) {
+		input := `data: {"choices":[{"delta":{"content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"step one"}]}]}}]}`
+		got := normalizeDeltaContentArray([]byte(input))
+		jsonPart := got[len("data: "):]
+		var obj struct {
+			Choices []struct {
+				Delta struct {
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(jsonPart, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		var content string
+		if err := json.Unmarshal(obj.Choices[0].Delta.Content, &content); err != nil {
+			t.Fatalf("content not string: %v", err)
+		}
+		if content != "" {
+			t.Errorf("content = %q, want empty string", content)
+		}
+		if obj.Choices[0].Delta.ReasoningContent != "step one" {
+			t.Errorf("reasoning_content = %q, want %q", obj.Choices[0].Delta.ReasoningContent, "step one")
+		}
+	})
+
+	t.Run("thinking type alias also extracted to reasoning_content", func(t *testing.T) {
+		input := `data: {"choices":[{"delta":{"content":[{"type":"thinking","text":"pondering"},{"type":"text","text":"done"}]}}]}`
+		got := normalizeDeltaContentArray([]byte(input))
+		jsonPart := got[len("data: "):]
+		var obj struct {
+			Choices []struct {
+				Delta struct {
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(jsonPart, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if obj.Choices[0].Delta.ReasoningContent != "pondering" {
+			t.Errorf("reasoning_content = %q, want %q", obj.Choices[0].Delta.ReasoningContent, "pondering")
+		}
+	})
+
+	t.Run("reasoning block with empty text omits reasoning_content field", func(t *testing.T) {
+		// Claude Sonnet 5's default thinking.display="omitted" returns
+		// reasoning blocks with an empty text/summary (only the encrypted
+		// signature is populated). No reasoning_content field should be
+		// added in that case.
+		input := `data: {"choices":[{"delta":{"content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"","signature":"abc"}]},{"type":"text","text":"answer"}]}}]}`
+		got := normalizeDeltaContentArray([]byte(input))
+		jsonPart := got[len("data: "):]
+		if gjson.GetBytes(jsonPart, "choices.0.delta.reasoning_content").Exists() {
+			t.Errorf("reasoning_content should be absent when reasoning text is empty, got %s", jsonPart)
+		}
+	})
+}
+
+func TestIsClaudeFamilyModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"databricks-claude-sonnet-5", true},
+		{"claude-opus-4-6", true},
+		{"CLAUDE-3-5-SONNET", true},
+		{"gpt-5", false},
+		{"", false},
+		{"deepseek-v4", false},
+	}
+	for _, tc := range cases {
+		if got := isClaudeFamilyModel(tc.model); got != tc.want {
+			t.Errorf("isClaudeFamilyModel(%q) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestThinkingFormatFor(t *testing.T) {
+	cases := []struct {
+		name          string
+		defaultFormat string
+		model         string
+		want          string
+	}{
+		{"claude model routes to claude format", "openai", "databricks-claude-sonnet-5", "claude"},
+		{"non-claude model keeps default format", "openai", "gpt-5", "openai"},
+		{"empty model keeps default format", "openai", "", "openai"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := thinkingFormatFor(tc.defaultFormat, tc.model); got != tc.want {
+				t.Errorf("thinkingFormatFor(%q, %q) = %q, want %q", tc.defaultFormat, tc.model, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestStripOpenAICompatProviderUnsupportedFields_Kimi(t *testing.T) {

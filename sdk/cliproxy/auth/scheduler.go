@@ -906,7 +906,7 @@ func (m *modelScheduler) availabilitySummaryLocked(predicate func(*scheduledAuth
 		if entry == nil || entry.auth == nil {
 			continue
 		}
-		if entry.state != scheduledStateCooldown && entry.state != scheduledStateBlocked {
+		if entry.state != scheduledStateCooldown {
 			continue
 		}
 		cooldownCount++

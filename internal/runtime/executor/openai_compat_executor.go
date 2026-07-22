@@ -115,9 +115,15 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
 
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), thinkingFormatFor(to.String(), baseModel), e.Identifier())
 	if err != nil {
 		return resp, err
+	}
+	// Claude adaptive thinking defaults to an empty (omitted) reasoning text;
+	// default display to "summarized" so reasoning text is visible unless the
+	// caller explicitly set thinking.display.
+	if isClaudeFamilyModel(baseModel) {
+		translated = ensureClaudeThinkingDisplay(translated)
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
@@ -127,12 +133,6 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	// Provider-specific request transformations
 	// Resolve conflicts between "reasoning" object and "reasoning_effort" string
 	translated = resolveReasoningEffortConflict(translated)
-	// Claude-family models (e.g. Databricks-hosted Claude Sonnet 5) reject
-	// OpenAI-style reasoning_effort outright; convert to Claude's adaptive
-	// thinking + output_config.effort format, then default display to
-	// "summarized" so reasoning text is visible.
-	translated = convertReasoningEffortToClaudeThinking(baseModel, translated)
-	translated = applyClaudeAdaptiveThinkingDisplay(baseModel, translated)
 	translated = normalizeMistralReasoningEffort(baseModel, translated)
 	translated = omitMiniMaxM3ThinkingType(baseModel, translated)
 	if isMiMoModel(baseModel) {
@@ -365,9 +365,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
-	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), to.String(), e.Identifier())
+	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), thinkingFormatFor(to.String(), baseModel), e.Identifier())
 	if err != nil {
 		return nil, err
+	}
+	// Claude adaptive thinking defaults to an empty (omitted) reasoning text;
+	// default display to "summarized" so reasoning text is visible unless the
+	// caller explicitly set thinking.display.
+	if isClaudeFamilyModel(baseModel) {
+		translated = ensureClaudeThinkingDisplay(translated)
 	}
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
@@ -377,12 +383,6 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// Provider-specific request transformations
 	// Resolve conflicts between "reasoning" object and "reasoning_effort" string
 	translated = resolveReasoningEffortConflict(translated)
-	// Claude-family models (e.g. Databricks-hosted Claude Sonnet 5) reject
-	// OpenAI-style reasoning_effort outright; convert to Claude's adaptive
-	// thinking + output_config.effort format, then default display to
-	// "summarized" so reasoning text is visible.
-	translated = convertReasoningEffortToClaudeThinking(baseModel, translated)
-	translated = applyClaudeAdaptiveThinkingDisplay(baseModel, translated)
 	translated = normalizeMistralReasoningEffort(baseModel, translated)
 	translated = omitMiniMaxM3ThinkingType(baseModel, translated)
 	if isMiMoModel(baseModel) {
@@ -948,112 +948,32 @@ func isMistralProvider(provider string) bool {
 // isClaudeFamilyModel reports whether the model name refers to an Anthropic
 // Claude model (e.g. served via Databricks/Bedrock/Vertex-compatible endpoints).
 // Matching pattern: model name contains "claude" (case-insensitive).
+//
+// This is a narrow pre-filter only: the actual thinking-config translation is
+// delegated to the registry-aware "claude" ProviderApplier (see
+// internal/thinking/provider/claude/apply.go) via thinkingFormatFor, not
+// reimplemented here.
 func isClaudeFamilyModel(model string) bool {
 	return strings.Contains(strings.ToLower(model), "claude")
 }
 
-// convertReasoningEffortToClaudeThinking rewrites OpenAI-style reasoning_effort
-// into Claude's adaptive thinking format for Claude-family models served
-// through the OpenAI-compatible executor.
-//
-// The thinking system's provider applier is selected by wire protocol
-// ("openai"), not by the underlying model family, so requests targeting
-// Claude models (e.g. Databricks-hosted Claude Sonnet 5) end up with a
-// top-level "reasoning_effort" field. Claude Sonnet 5 / Opus 4.7+ reject
-// that field outright ("reasoning_effort: Extra inputs are not permitted",
-// HTTP 400), which previously caused every credential in the pool to be
-// exhausted via retries before the request ultimately failed or hung.
-//
-// Anthropic's adaptive-thinking models expect effort via a top-level
-// output_config.effort string alongside thinking.type: "adaptive".
-func convertReasoningEffortToClaudeThinking(baseModel string, body []byte) []byte {
-	if len(body) == 0 || !gjson.ValidBytes(body) || !isClaudeFamilyModel(baseModel) {
-		return body
+// thinkingFormatFor returns the thinking-provider format to use for
+// thinking.ApplyThinking. The OpenAI-compatible executor's wire protocol is
+// always OpenAI, so reasoning_effort would normally be routed to the OpenAI
+// ProviderApplier. Claude-family models (e.g. Databricks-hosted Claude
+// Sonnet 5) reject the OpenAI-shaped reasoning_effort field outright
+// ("reasoning_effort: Extra inputs are not permitted", HTTP 400), which
+// previously exhausted every credential in the pool via retries before the
+// request ultimately failed or hung. Routing these models to the "claude"
+// format instead dispatches to the already-registered, registry-aware
+// Claude ProviderApplier, which correctly produces
+// thinking.type=adaptive + output_config.effort (with level-support/budget
+// clamping) instead of hand-rolling a second implementation here.
+func thinkingFormatFor(defaultFormat, baseModel string) string {
+	if isClaudeFamilyModel(baseModel) {
+		return "claude"
 	}
-	effort := gjson.GetBytes(body, "reasoning_effort")
-	if !effort.Exists() {
-		return body
-	}
-	out, err := sjson.DeleteBytes(body, "reasoning_effort")
-	if err != nil {
-		return body
-	}
-	mapped := claudeOutputEffortFromLevel(effort.String())
-	if mapped == "" {
-		return out
-	}
-	if mapped == "none" {
-		next, errSet := sjson.SetBytes(out, "thinking.type", "disabled")
-		if errSet == nil {
-			out = next
-		}
-		return out
-	}
-	if thinkingType := gjson.GetBytes(out, "thinking.type").String(); thinkingType == "" {
-		if next, errSet := sjson.SetBytes(out, "thinking.type", "adaptive"); errSet == nil {
-			out = next
-		}
-	}
-	if next, errSet := sjson.SetBytes(out, "output_config.effort", mapped); errSet == nil {
-		out = next
-	}
-	return out
-}
-
-// claudeOutputEffortFromLevel maps OpenAI-style reasoning_effort strings to
-// Claude's output_config.effort scale (low/medium/high/xhigh/max), preserving
-// the distinct xhigh level rather than collapsing it into max.
-func claudeOutputEffortFromLevel(level string) string {
-	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "none":
-		return "none"
-	case "minimal":
-		return "low"
-	case "low", "medium", "high", "xhigh", "max":
-		return strings.ToLower(strings.TrimSpace(level))
-	case "auto":
-		return "high"
-	default:
-		return ""
-	}
-}
-
-// applyClaudeAdaptiveThinkingDisplay ensures Claude-family requests using
-// adaptive thinking (the default on Claude Sonnet 5 / Opus 4.7+) receive
-// visible reasoning text instead of the empty-text "omitted" default.
-//
-// Anthropic's adaptive-thinking models default thinking.display to "omitted",
-// which returns thinking blocks with an empty text field (only the encrypted
-// signature is populated). Cost and latency are identical either way -- the
-// only behavioral difference is whether reasoning text is visible in the
-// response. Since callers of this proxy generally want to see the reasoning,
-// default display to "summarized" unless the caller explicitly set it.
-func applyClaudeAdaptiveThinkingDisplay(baseModel string, body []byte) []byte {
-	if len(body) == 0 || !gjson.ValidBytes(body) || !isClaudeFamilyModel(baseModel) {
-		return body
-	}
-	if gjson.GetBytes(body, "thinking.display").Exists() {
-		return body
-	}
-	thinkingType := gjson.GetBytes(body, "thinking.type").String()
-	if thinkingType == "disabled" {
-		return body
-	}
-	out := body
-	var err error
-	if thinkingType == "" {
-		// No thinking field at all: Claude Sonnet 5 / Opus 4.7+ default to
-		// adaptive thinking implicitly. Make it explicit so display can be set.
-		out, err = sjson.SetBytes(out, "thinking.type", "adaptive")
-		if err != nil {
-			return body
-		}
-	}
-	out, err = sjson.SetBytes(out, "thinking.display", "summarized")
-	if err != nil {
-		return body
-	}
-	return out
+	return defaultFormat
 }
 
 // normalizeMistralReasoningEffort forces reasoning_effort to "high" for models

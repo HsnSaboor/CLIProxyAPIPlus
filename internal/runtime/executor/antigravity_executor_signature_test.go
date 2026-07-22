@@ -22,6 +22,19 @@ func testGeminiSignaturePayload() string {
 	return base64.StdEncoding.EncodeToString(payload)
 }
 
+// testFakeClaudeSignature returns a base64 string with a valid Claude
+// thinking-signature prefix (decodes to a leading 0x12 byte, satisfying the
+// "prefix_cleanup" stage's E/R-prefix check) but garbage protobuf content
+// that fails the deeper single-layer signature inspection performed at the
+// "strict_bypass" stage. This is distinct from invalidClaudeThinkingPayload's
+// malformed-base64 case (which fails to decode at all) and mirrors
+// malformedClaudeTreeSignatureForClaudeExecutorTest's pattern. Used to
+// verify the signature sanitizer strips invalid thinking blocks under
+// strict bypass without leaking the raw signature value into debug logs.
+func testFakeClaudeSignature() string {
+	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
+}
+
 func testAntigravityAuth(baseURL string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
 		Attributes: map[string]string{

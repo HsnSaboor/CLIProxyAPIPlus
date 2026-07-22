@@ -289,8 +289,6 @@ func assertNonSchemaRequestPreserved(t *testing.T, body map[string]any) {
 func buildRequestBodyFromPayload(t *testing.T, modelName string) map[string]any {
 	t.Helper()
 
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{}
 	payload := []byte(`{
 		"request": {
 			"tools": [
@@ -329,7 +327,8 @@ func buildRequestBodyFromPayload(t *testing.T, modelName string) map[string]any 
 				}
 			]
 		}
-	}`))
+	}`)
+	return buildRequestBodyFromRawPayload(t, modelName, payload)
 }
 
 func buildRequestBodyFromRawPayload(t *testing.T, modelName string, payload []byte) map[string]any {

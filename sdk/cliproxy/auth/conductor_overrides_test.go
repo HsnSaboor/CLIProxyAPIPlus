@@ -2159,3 +2159,184 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
 	}
 }
+
+func TestIsCreditExhaustedMessage(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"unrelated_400", "invalid_request_error: The requested model is not supported.", false},
+		{"databricks_wording", `{"error_code":"BAD_REQUEST","message":"You have exhausted your available credits. Please add a payment method to upgrade."}`, true},
+		{"exhausted_credits_short", "you have exhausted your credits for this workspace", true},
+		{"add_payment_method_only", "Add a payment method to upgrade your plan.", true},
+		{"case_insensitive", "EXHAUSTED YOUR AVAILABLE CREDITS", true},
+		{"whitespace_only", "   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCreditExhaustedMessage(tc.message); got != tc.want {
+				t.Fatalf("isCreditExhaustedMessage(%q) = %v, want %v", tc.message, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsCreditExhaustedResultError(t *testing.T) {
+	creditMsg := "You have exhausted your available credits. Add a payment method to upgrade."
+	cases := []struct {
+		name string
+		err  *Error
+		want bool
+	}{
+		{"nil_error", nil, false},
+		{"400_credit_message", &Error{HTTPStatus: http.StatusBadRequest, Message: creditMsg}, true},
+		{"402_credit_message", &Error{HTTPStatus: http.StatusPaymentRequired, Message: creditMsg}, true},
+		{"403_credit_message", &Error{HTTPStatus: http.StatusForbidden, Message: creditMsg}, true},
+		{"400_unrelated_message", &Error{HTTPStatus: http.StatusBadRequest, Message: "bad request"}, false},
+		{"401_credit_message_wrong_status", &Error{HTTPStatus: http.StatusUnauthorized, Message: creditMsg}, false},
+		{"404_credit_message_wrong_status", &Error{HTTPStatus: http.StatusNotFound, Message: creditMsg}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isCreditExhaustedResultError(tc.err); got != tc.want {
+				t.Fatalf("isCreditExhaustedResultError(%+v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestManager_CreditExhausted400_FallsBackAndCoolsDown24Hours verifies that a
+// 400 response carrying credit-exhaustion wording (as observed from
+// Databricks-hosted model-provider-service responses) results in a 24h
+// cooldown with Quota.Exceeded/Reason/NextRecoverAt set, distinct from the
+// generic 30-minute bad_request cooldown applied to other 400 errors.
+func TestManager_CreditExhausted400_FallsBackAndCoolsDown24Hours(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "databricks-claude",
+		executeErrors: map[string]error{
+			"aa-exhausted-auth": &Error{
+				HTTPStatus: http.StatusBadRequest,
+				Message:    `{"error_code":"BAD_REQUEST","message":"You have exhausted your available credits. Please add a payment method to upgrade."}`,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "databricks-claude-sonnet-5"
+	exhaustedAuth := &Auth{ID: "aa-exhausted-auth", Provider: "databricks-claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "databricks-claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(exhaustedAuth.ID, "databricks-claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "databricks-claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(exhaustedAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), exhaustedAuth); errRegister != nil {
+		t.Fatalf("register exhausted auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	resp, errExecute := m.Execute(context.Background(), []string{"databricks-claude"}, request, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("execute error = %v, want success (fallback to good auth)", errExecute)
+	}
+	if string(resp.Payload) != goodAuth.ID {
+		t.Fatalf("execute payload = %q, want %q", string(resp.Payload), goodAuth.ID)
+	}
+
+	updated, ok := m.GetByID(exhaustedAuth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected exhausted auth to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %q", model)
+	}
+	if !state.Unavailable {
+		t.Fatalf("expected exhausted auth model state to be unavailable")
+	}
+	if !state.Quota.Exceeded {
+		t.Fatalf("expected credits_exhausted to set Quota.Exceeded")
+	}
+	if state.Quota.Reason != "credits_exhausted" {
+		t.Fatalf("Quota.Reason = %q, want %q", state.Quota.Reason, "credits_exhausted")
+	}
+	wantEarliest := time.Now().Add(23 * time.Hour)
+	wantLatest := time.Now().Add(25 * time.Hour)
+	if state.NextRetryAfter.Before(wantEarliest) || state.NextRetryAfter.After(wantLatest) {
+		t.Fatalf("NextRetryAfter = %v, want ~24h from now", state.NextRetryAfter)
+	}
+	if state.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("expected Quota.NextRecoverAt to be set for credits_exhausted")
+	}
+}
+
+// TestManager_PlainBadRequest400_DoesNotSetQuotaExceeded verifies the
+// non-credit-exhausted 400 path (generic bad_request) does not mark
+// Quota.Exceeded, preserving the distinction between a permanently-broken
+// request and a genuinely recoverable billing condition. This guards against
+// a regression where applyCooldown accidentally sets Quota.Exceeded for
+// non-quota failure classes.
+func TestManager_PlainBadRequest400_DoesNotSetQuotaExceeded(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusBadRequest,
+				Message:    "invalid_request_error: unsupported parameter combination",
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), badAuth); errRegister != nil {
+		t.Fatalf("register bad auth: %v", errRegister)
+	}
+	if _, errRegister := m.Register(context.Background(), goodAuth); errRegister != nil {
+		t.Fatalf("register good auth: %v", errRegister)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	if _, errExecute := m.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{}); errExecute != nil {
+		t.Fatalf("execute error = %v, want success (fallback to good auth)", errExecute)
+	}
+
+	updated, ok := m.GetByID(badAuth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	state := updated.ModelStates[model]
+	if state == nil {
+		t.Fatalf("expected model state for %q", model)
+	}
+	if state.Quota.Exceeded {
+		t.Fatalf("expected plain bad_request to leave Quota.Exceeded unset")
+	}
+	wantEarliest := time.Now().Add(29 * time.Minute)
+	wantLatest := time.Now().Add(31 * time.Minute)
+	if state.NextRetryAfter.Before(wantEarliest) || state.NextRetryAfter.After(wantLatest) {
+		t.Fatalf("NextRetryAfter = %v, want ~30m from now", state.NextRetryAfter)
+	}
+}
