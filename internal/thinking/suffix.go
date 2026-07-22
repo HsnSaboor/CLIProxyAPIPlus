@@ -9,6 +9,32 @@ import (
 	"strings"
 )
 
+// contextMarkerSuffix is a proxy-local model-name marker some clients (e.g.
+// Claude Code, when configured with a large ANTHROPIC_DEFAULT_*_MODEL /
+// CLAUDE_CODE_MAX_CONTEXT_TOKENS combination) append to signal "use the long
+// context window variant" — e.g. "sonnet[1m]". No upstream provider accepts
+// this bracketed syntax as part of a model ID, so it must never be forwarded
+// upstream. ParseSuffix strips it unconditionally before parenthesis parsing
+// so every caller (provider routing in sdk/api/handlers/handlers.go, and
+// every executor's baseModel/upstreamModel derivation) sees the marker-free
+// name. It is intentionally a no-op for routing/thinking-config purposes:
+// the proxy does not currently vary behavior based on the marker's presence,
+// it only guarantees the marker is dropped rather than causing an
+// "unknown provider" failure or leaking into the outgoing request.
+const contextMarkerSuffix = "[1m]"
+
+// stripContextMarkerSuffix removes a trailing "[1m]" context-window marker
+// from a model name, case-insensitively, if present.
+func stripContextMarkerSuffix(model string) string {
+	if len(model) < len(contextMarkerSuffix) {
+		return model
+	}
+	if strings.EqualFold(model[len(model)-len(contextMarkerSuffix):], contextMarkerSuffix) {
+		return model[:len(model)-len(contextMarkerSuffix)]
+	}
+	return model
+}
+
 // ParseSuffix extracts thinking suffix from a model name.
 //
 // The suffix format is: model-name(value)
@@ -16,6 +42,14 @@ import (
 //   - "claude-sonnet-4-5(16384)" -> ModelName="claude-sonnet-4-5", RawSuffix="16384"
 //   - "gpt-5.2(high)" -> ModelName="gpt-5.2", RawSuffix="high"
 //   - "gemini-2.5-pro" -> ModelName="gemini-2.5-pro", HasSuffix=false
+//   - "sonnet[1m]" -> ModelName="sonnet", HasSuffix=false (context marker stripped)
+//   - "claude-sonnet-4-5[1m](16384)" -> ModelName="claude-sonnet-4-5", RawSuffix="16384"
+//     (context marker stripped, then parenthesis suffix parsed as usual)
+//
+// The "[1m]" context-window marker is a proxy-local convention: it is
+// recognized and discarded here so it never reaches provider-routing lookups
+// or upstream requests, but it does not currently alter thinking/model
+// resolution behavior beyond being removed.
 //
 // This function only extracts the suffix; it does not validate or interpret
 // the suffix content. Use ParseNumericSuffix, ParseLevelSuffix, etc. for
@@ -24,16 +58,16 @@ func ParseSuffix(model string) SuffixResult {
 	// Find the last opening parenthesis
 	lastOpen := strings.LastIndex(model, "(")
 	if lastOpen == -1 {
-		return SuffixResult{ModelName: model, HasSuffix: false}
+		return SuffixResult{ModelName: stripContextMarkerSuffix(model), HasSuffix: false}
 	}
 
 	// Check if the string ends with a closing parenthesis
 	if !strings.HasSuffix(model, ")") {
-		return SuffixResult{ModelName: model, HasSuffix: false}
+		return SuffixResult{ModelName: stripContextMarkerSuffix(model), HasSuffix: false}
 	}
 
 	// Extract components
-	modelName := model[:lastOpen]
+	modelName := stripContextMarkerSuffix(model[:lastOpen])
 	rawSuffix := model[lastOpen+1 : len(model)-1]
 
 	return SuffixResult{
