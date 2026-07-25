@@ -101,6 +101,30 @@ func TestNormalizeDeltaContentArray(t *testing.T) {
 		}
 	})
 
+	t.Run("databricks claude reasoning chunk", func(t *testing.T) {
+		input := `data: {"model":"us.anthropic.claude-sonnet-5","choices":[{"delta":{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"I","signature":""}]}]},"index":0,"finish_reason":null}],"usage":{"cache_read_input_tokens":0,"completion_tokens":null,"prompt_tokens":17377,"total_tokens":null,"cache_creation_input_tokens":0},"object":"chat.completion.chunk","id":"msg_bdrk_57ts4eso3t75mdv2epluzemadhg25vmn376xdrfyrg2bll226oaa","created":1784996516}`
+		got := normalizeDeltaContentArray([]byte(input))
+		t.Logf("GOT: %s", string(got))
+		if gjson.GetBytes(got, "choices.0.delta.content").Type == gjson.JSON {
+			t.Fatalf("content should be normalized to string, got: %s", got)
+		}
+	})
+
+	t.Run("databricks claude reasoning chunk without data prefix", func(t *testing.T) {
+		input := `{"model":"us.anthropic.claude-sonnet-5","choices":[{"delta":{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"I","signature":""}]}]},"index":0,"finish_reason":null}],"usage":{"cache_read_input_tokens":0,"completion_tokens":null,"prompt_tokens":17377,"total_tokens":null,"cache_creation_input_tokens":0},"object":"chat.completion.chunk","id":"msg_bdrk_57ts4eso3t75mdv2epluzemadhg25vmn376xdrfyrg2bll226oaa","created":1784996516}`
+		got := normalizeDeltaContentArray([]byte(input))
+		t.Logf("GOT: %s", string(got))
+		if gjson.GetBytes(got, "choices.0.delta.content").Type == gjson.JSON {
+			t.Fatalf("content should be normalized to string, got: %s", got)
+		}
+		if gjson.GetBytes(got, "choices.0.delta.content").String() != "" {
+			t.Fatalf("content should be empty string, got: %s", gjson.GetBytes(got, "choices.0.delta.content").String())
+		}
+		if gjson.GetBytes(got, "choices.0.delta.reasoning_content").String() != "I" {
+			t.Fatalf("reasoning_content should be 'I', got: %s", gjson.GetBytes(got, "choices.0.delta.reasoning_content").String())
+		}
+	})
+
 	t.Run("multiple text parts in one choice joined", func(t *testing.T) {
 		input := `data: {"choices":[{"delta":{"content":[{"type":"text","text":"hello"},{"type":"text","text":" world"}]}}]}`
 		got := normalizeDeltaContentArray([]byte(input))

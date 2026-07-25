@@ -1169,12 +1169,13 @@ func normalizeDeltaContentArray(line []byte) []byte {
 	if len(trimmed) == 0 {
 		return line
 	}
-	// Leave non-data lines unchanged
-	if !bytes.HasPrefix(trimmed, []byte("data:")) {
-		return line
+	hasDataPrefix := bytes.HasPrefix(trimmed, []byte("data:"))
+	var jsonTrimmed []byte
+	if hasDataPrefix {
+		jsonTrimmed = bytes.TrimSpace(trimmed[len("data:"):])
+	} else {
+		jsonTrimmed = trimmed
 	}
-	jsonPart := trimmed[len("data:"):]
-	jsonTrimmed := bytes.TrimSpace(jsonPart)
 	// Leave [DONE] unchanged
 	if string(jsonTrimmed) == "[DONE]" {
 		return line
@@ -1233,8 +1234,11 @@ func normalizeDeltaContentArray(line []byte) []byte {
 	if !modified {
 		return line
 	}
-	prefix := "data: "
-	return append([]byte(prefix), out...)
+	if hasDataPrefix {
+		prefix := "data: "
+		return append([]byte(prefix), out...)
+	}
+	return out
 }
 
 // reasoningItemText extracts visible reasoning text from a single content
