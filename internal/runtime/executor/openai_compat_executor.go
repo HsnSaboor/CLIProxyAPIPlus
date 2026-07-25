@@ -532,10 +532,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, bytes.Clone(trimmedLine), &param, claudeInputTokens)
 			for i := range chunks {
 				payload := normalizeDeltaContentArray(chunks[i])
-				log.WithFields(log.Fields{
-					"raw_chunk": string(chunks[i]),
-					"payload":   string(payload),
-				}).Debug("openai_compat streaming chunk debug log")
+				log.Debugf("openai_compat streaming chunk: raw_chunk=%s | payload=%s", string(chunks[i]), string(payload))
 				select {
 				case out <- cliproxyexecutor.StreamChunk{Payload: payload}:
 				case <-ctx.Done():
