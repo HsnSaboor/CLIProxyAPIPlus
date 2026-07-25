@@ -167,9 +167,9 @@ git_sync() {
     if [[ "$CREATE_RELEASE" == "1" ]]; then
         log_info "Creating release tag..."
         local latest_tag new_tag base_version patch_num
-        latest_tag=$(git tag -l 'v*.*.*-*' --sort=-v:refname | head -1)
+        latest_tag=$(git tag -l 'v*.*.*-*' --sort=-v:refname | { head -1; true; })
         if [[ -z "$latest_tag" ]]; then
-            latest_tag=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)
+            latest_tag=$(git tag -l 'v*.*.*' --sort=-v:refname | { head -1; true; })
             if [[ -n "$latest_tag" ]]; then
                 new_tag="${latest_tag}-1"
             fi

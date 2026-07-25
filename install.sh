@@ -149,7 +149,7 @@ download_and_verify() {
 
     # Remove 'v' prefix from VERSION for filename (e.g., v7.0.3-3 → 7.0.3-3)
     local version_without_v="${VERSION#v}"
-    local filename="CLIProxyAPIPlus_${version_without_v}_${OS}_${ARCH}.${ext}"
+    local filename="CLIProxyAPI_${version_without_v}_${OS}_${ARCH}.${ext}"
     local url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/${filename}"
 
     log_info "Downloading $filename..."
@@ -195,7 +195,7 @@ extract_and_deploy() {
 
     # Remove 'v' prefix from VERSION for filename (e.g., v7.0.3-3 → 7.0.3-3)
     local version_without_v="${VERSION#v}"
-    local filename="CLIProxyAPIPlus_${version_without_v}_${OS}_${ARCH}.${ext}"
+    local filename="CLIProxyAPI_${version_without_v}_${OS}_${ARCH}.${ext}"
 
     log_info "Backing up config..."
     if [[ -f "$PROD_DIR/config.yaml" ]]; then
@@ -330,9 +330,9 @@ show_status() {
     echo "Auth Dir:    $AUTH_DIR"
 
     local version_line
-    version_line=$(grep "CLIProxyAPIPlus" "$CACHE_DIR/checksums.txt" 2>/dev/null | head -1)
+    version_line=$(grep "CLIProxyAPI_" "$CACHE_DIR/checksums.txt" 2>/dev/null | head -1)
     if [[ -n "$version_line" ]]; then
-        echo "Version:    $(echo "$version_line" | sed 's/.*CLIProxyAPIPlus_\([0-9-]*\).*/\1/')"
+        echo "Version:    $(echo "$version_line" | sed 's/.*CLIProxyAPI_\([0-9-]*\).*/\1/')"
     fi
 
     [[ -f "$PROD_DIR/cli-proxy-api" ]] && echo "Binary:      Present" || echo "Binary:      Missing"
