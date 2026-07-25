@@ -297,6 +297,39 @@ func TestStripLeakedReasoningEffortForClaude(t *testing.T) {
 	})
 }
 
+func TestPromoteOptionsReasoningEffort(t *testing.T) {
+	t.Run("promotes options.reasoningEffort to reasoning_effort", func(t *testing.T) {
+		input := `{"model":"claude-sonnet-5","options":{"reasoningEffort":"xhigh","textVerbosity":"low"}}`
+		got := promoteOptionsReasoningEffort([]byte(input))
+		if val := gjson.GetBytes(got, "reasoning_effort").String(); val != "xhigh" {
+			t.Fatalf("reasoning_effort should be promoted to xhigh, got %s", got)
+		}
+	})
+
+	t.Run("no-op when options.reasoningEffort absent", func(t *testing.T) {
+		input := `{"model":"claude-sonnet-5","options":{"textVerbosity":"low"}}`
+		got := promoteOptionsReasoningEffort([]byte(input))
+		if string(got) != input {
+			t.Errorf("got %q, want unchanged %q", got, input)
+		}
+	})
+
+	t.Run("empty body unchanged", func(t *testing.T) {
+		got := promoteOptionsReasoningEffort([]byte(""))
+		if string(got) != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+
+	t.Run("invalid json unchanged", func(t *testing.T) {
+		input := "not json"
+		got := promoteOptionsReasoningEffort([]byte(input))
+		if string(got) != input {
+			t.Errorf("got %q, want unchanged %q", got, input)
+		}
+	})
+}
+
 func TestStripOpenAICompatProviderUnsupportedFields_Kimi(t *testing.T) {
 	payload := []byte(`{"model":"kimi-k2.5","messages":[],"reasoning_effort":"high","reasoning":{"enabled":true},"reasoningSummary":"auto","include":["reasoning"],"verbosity":"detailed"}`)
 	compat := &config.OpenAICompatibility{Name: "kimi", BaseURL: "https://api.moonshot.cn/v1"}

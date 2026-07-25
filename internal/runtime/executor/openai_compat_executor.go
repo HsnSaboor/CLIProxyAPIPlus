@@ -113,7 +113,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, opts.Stream)
+	originalTranslated = promoteOptionsReasoningEffort(originalTranslated)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, opts.Stream)
+	translated = promoteOptionsReasoningEffort(translated)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), thinkingFormatFor(to.String(), baseModel), e.Identifier())
 	if err != nil {
@@ -364,7 +366,9 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
+	originalTranslated = promoteOptionsReasoningEffort(originalTranslated)
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	translated = promoteOptionsReasoningEffort(translated)
 
 	translated, err = thinking.ApplyThinking(translated, req.Model, from.String(), thinkingFormatFor(to.String(), baseModel), e.Identifier())
 	if err != nil {
@@ -1352,6 +1356,22 @@ func normalizeToolResultIDsToString(body []byte) []byte {
 	}
 
 	return out
+}
+
+func promoteOptionsReasoningEffort(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	effort := gjson.GetBytes(body, "options.reasoningEffort")
+	if effort.Exists() {
+		val := effort.String()
+		if val != "" {
+			if updated, err := sjson.SetBytes(body, "reasoning_effort", val); err == nil {
+				return updated
+			}
+		}
+	}
+	return body
 }
 
 type statusErr struct {
