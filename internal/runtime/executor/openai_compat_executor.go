@@ -982,13 +982,16 @@ func stripLeakedReasoningEffortForClaude(body []byte) []byte {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return body
 	}
-	if !gjson.GetBytes(body, "reasoning_effort").Exists() {
-		return body
+	fields := []string{"options", "reasoning", "reasoningSummary", "include", "verbosity", "interleaved", "reasoning_effort"}
+	out := body
+	for _, field := range fields {
+		if gjson.GetBytes(out, field).Exists() {
+			if updated, err := sjson.DeleteBytes(out, field); err == nil {
+				out = updated
+			}
+		}
 	}
-	if updated, err := sjson.DeleteBytes(body, "reasoning_effort"); err == nil {
-		return updated
-	}
-	return body
+	return out
 }
 
 // thinkingFormatFor returns the thinking-provider format to use for

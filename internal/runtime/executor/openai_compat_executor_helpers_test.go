@@ -260,10 +260,13 @@ func TestThinkingFormatFor(t *testing.T) {
 
 func TestStripLeakedReasoningEffortForClaude(t *testing.T) {
 	t.Run("removes reasoning_effort when present", func(t *testing.T) {
-		input := `{"model":"databricks-claude-sonnet-5","messages":[],"reasoning_effort":"xhigh"}`
+		input := `{"model":"databricks-claude-sonnet-5","messages":[],"options":{"reasoningEffort":"xhigh"},"reasoning_effort":"xhigh","reasoningSummary":"auto","include":["reasoning"],"verbosity":"detailed","interleaved":true}`
 		got := stripLeakedReasoningEffortForClaude([]byte(input))
-		if gjson.GetBytes(got, "reasoning_effort").Exists() {
-			t.Fatalf("reasoning_effort should be removed, got %s", got)
+		fields := []string{"options", "reasoning", "reasoningSummary", "include", "verbosity", "interleaved", "reasoning_effort"}
+		for _, f := range fields {
+			if gjson.GetBytes(got, f).Exists() {
+				t.Fatalf("field %s should be removed, got %s", f, got)
+			}
 		}
 		if model := gjson.GetBytes(got, "model").String(); model != "databricks-claude-sonnet-5" {
 			t.Fatalf("model = %q, want databricks-claude-sonnet-5; payload=%s", model, got)
