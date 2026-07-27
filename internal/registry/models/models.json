@@ -120,6 +120,28 @@
       }
     },
     {
+      "id": "claude-opus-5",
+      "object": "model",
+      "created": 1784038800,
+      "owned_by": "anthropic",
+      "type": "claude",
+      "display_name": "Claude Opus 5",
+      "description": "Latest premium model combining maximum intelligence with practical performance",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "zero_allowed": true,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
       "id": "claude-sonnet-5",
       "object": "model",
       "created": 1782777600,
@@ -2227,35 +2249,25 @@
       }
     },
     {
-      "id": "gemini-2.5-flash",
+      "id": "gemini-3.6-flash-high",
       "object": "model",
       "owned_by": "antigravity",
       "type": "antigravity",
-      "display_name": "Gemini 2.5 Flash",
-      "name": "gemini-2.5-flash",
-      "description": "Gemini 2.5 Flash",
+      "display_name": "Gemini 3.6 Flash",
+      "name": "gemini-3.6-flash-high",
+      "description": "Gemini 3.6 Flash (High)",
       "context_length": 1048576,
-      "max_completion_tokens": 65535,
+      "max_completion_tokens": 65536,
       "thinking": {
-        "max": 24576,
-        "zero_allowed": true,
-        "dynamic_allowed": true
-      }
-    },
-    {
-      "id": "gemini-2.5-flash-lite",
-      "object": "model",
-      "owned_by": "antigravity",
-      "type": "antigravity",
-      "display_name": "Gemini 2.5 Flash Lite",
-      "name": "gemini-2.5-flash-lite",
-      "description": "Gemini 2.5 Flash Lite",
-      "context_length": 1048576,
-      "max_completion_tokens": 65535,
-      "thinking": {
-        "max": 24576,
-        "zero_allowed": true,
-        "dynamic_allowed": true
+        "min": 1,
+        "max": 65535,
+        "dynamic_allowed": true,
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ]
       }
     },
     {
